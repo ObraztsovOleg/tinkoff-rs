@@ -13,6 +13,7 @@ pub mod tcs;
 
 use tonic::{client::Grpc, service::{interceptor::InterceptedService, Interceptor}, transport::{self, Channel, ClientTlsConfig}, Status};
 use tcs::MarketDataRequest;
+use secrecy::{ExposeSecret, Secret};
 
 pub type TSResult<T> = std::result::Result<T, TSError>;
 
@@ -61,12 +62,12 @@ impl From<tonic::Status> for TSError {
 
 #[derive(Debug)]
 pub struct ServiceManager {
-    token: String
+    token: Secret<String>
 }
 
 #[derive(Clone)]
 pub struct DefaultInterceptor {
-    token: String,
+    token: Secret<String>,
 }
 
 impl Interceptor for DefaultInterceptor {
@@ -75,7 +76,7 @@ impl Interceptor for DefaultInterceptor {
 
         req.metadata_mut().append(
             "authorization",
-            format!("bearer {}", self.token).parse().unwrap()
+            format!("bearer {}", self.token.expose_secret()).parse().unwrap()
         );
         req.metadata_mut().append(
             "x-tracking-id",
@@ -107,7 +108,7 @@ impl SandboxInvestment {
 }
 
 pub trait Service: Sized {
-    fn create_service(token: String) -> TSResult<Self>;
+    fn create_service(token: Secret<String>) -> TSResult<Self>;
 }
 
 
@@ -115,7 +116,7 @@ macro_rules! impl_service {
     ([$(($type:ident, $address:expr)),*]) => {
         $(
             impl Service for $type {
-                fn create_service(token: String) -> TSResult<Self> {
+                fn create_service(token: Secret<String>) -> TSResult<Self> {
                     let tls = ClientTlsConfig::new().with_native_roots();
 
                     let channel = Channel::from_static($address)
