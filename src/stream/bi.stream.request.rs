@@ -14,19 +14,19 @@ impl BiStreamRequest<MarketDataRequest> for MarketDataRequest {
     fn set_subscription_action(&mut self, action: SubscriptionAction) {
         if let Some(payload) = &mut self.payload {
             match payload {
-                Payload::SubscribeCandlesRequest(ref mut candles_request) => {
+                Payload::SubscribeCandlesRequest(candles_request) => {
                     candles_request.subscription_action = action as i32;
                 }
-                Payload::SubscribeOrderBookRequest(ref mut order_book_request) => {
+                Payload::SubscribeOrderBookRequest(order_book_request) => {
                     order_book_request.subscription_action = action as i32;
                 }
-                Payload::SubscribeTradesRequest(ref mut trades_request) => {
+                Payload::SubscribeTradesRequest(trades_request) => {
                     trades_request.subscription_action = action as i32;
                 }
-                Payload::SubscribeInfoRequest(ref mut info_request) => {
+                Payload::SubscribeInfoRequest(info_request) => {
                     info_request.subscription_action = action as i32;
                 }
-                Payload::SubscribeLastPriceRequest(ref mut last_price_request) => {
+                Payload::SubscribeLastPriceRequest(last_price_request) => {
                     last_price_request.subscription_action = action as i32;
                 }
                 _ => {
