@@ -1,4 +1,4 @@
-use crate::{tcs::{instruments_service_client::InstrumentsServiceClient, market_data_service_client::MarketDataServiceClient, operations_service_client::OperationsServiceClient, orders_service_client::OrdersServiceClient, signal_service_client::SignalServiceClient, stop_orders_service_client::StopOrdersServiceClient, users_service_client::UsersServiceClient, AssetRequest, AssetResponse, AssetsRequest, AssetsResponse, BondResponse, BondsResponse, Brand, BrokerReportRequest, BrokerReportResponse, CancelOrderRequest, CancelOrderResponse, CancelStopOrderRequest, CancelStopOrderResponse, CurrenciesResponse, CurrencyResponse, EditFavoritesRequest, EditFavoritesResponse, EtfResponse, EtfsResponse, FilterOptionsRequest, FindInstrumentRequest, FindInstrumentResponse, FutureResponse, FuturesResponse, GetAccountsRequest, GetAccountsResponse, GetAccruedInterestsRequest, GetAccruedInterestsResponse, GetAssetFundamentalsRequest, GetAssetFundamentalsResponse, GetAssetReportsRequest, GetAssetReportsResponse, GetBondCouponsRequest, GetBondCouponsResponse, GetBondEventsRequest, GetBondEventsResponse, GetBrandRequest, GetBrandsRequest, GetBrandsResponse, GetCandlesRequest, GetCandlesResponse, GetClosePricesRequest, GetClosePricesResponse, GetConsensusForecastsRequest, GetConsensusForecastsResponse, GetCountriesRequest, GetCountriesResponse, GetDividendsForeignIssuerRequest, GetDividendsForeignIssuerResponse, GetDividendsRequest, GetDividendsResponse, GetFavoritesRequest, GetFavoritesResponse, GetForecastRequest, GetForecastResponse, GetFuturesMarginRequest, GetFuturesMarginResponse, GetInfoRequest, GetInfoResponse, GetLastPricesRequest, GetLastPricesResponse, GetLastTradesRequest, GetLastTradesResponse, GetMarginAttributesRequest, GetMarginAttributesResponse, GetMaxLotsRequest, GetMaxLotsResponse, GetOperationsByCursorRequest, GetOperationsByCursorResponse, GetOrderBookRequest, GetOrderBookResponse, GetOrderPriceRequest, GetOrderPriceResponse, GetOrderStateRequest, GetOrdersRequest, GetOrdersResponse, GetSignalsRequest, GetSignalsResponse, GetStopOrdersRequest, GetStopOrdersResponse, GetStrategiesRequest, GetStrategiesResponse, GetTechAnalysisRequest, GetTechAnalysisResponse, GetTradingStatusRequest, GetTradingStatusResponse, GetTradingStatusesRequest, GetTradingStatusesResponse, GetUserTariffRequest, GetUserTariffResponse, IndicativesRequest, IndicativesResponse, InstrumentRequest, InstrumentResponse, InstrumentsRequest, OptionResponse, OptionsResponse, OrderState, PortfolioRequest, PortfolioResponse, PositionsRequest, PositionsResponse, PostOrderAsyncRequest, PostOrderAsyncResponse, PostOrderRequest, PostOrderResponse, PostStopOrderRequest, PostStopOrderResponse, ReplaceOrderRequest, ShareResponse, SharesResponse, TradingSchedulesRequest, TradingSchedulesResponse, WithdrawLimitsRequest, WithdrawLimitsResponse}, Investment, TSResult};
+use crate::{tcs::{instruments_service_client::InstrumentsServiceClient, market_data_service_client::MarketDataServiceClient, operations_service_client::OperationsServiceClient, orders_service_client::OrdersServiceClient, signal_service_client::SignalServiceClient, stop_orders_service_client::StopOrdersServiceClient, users_service_client::UsersServiceClient, AssetRequest, AssetResponse, AssetsRequest, AssetsResponse, BondResponse, BondsResponse, Brand, BrokerReportRequest, BrokerReportResponse, CancelOrderRequest, CancelOrderResponse, CancelStopOrderRequest, CancelStopOrderResponse, CurrenciesResponse, CurrencyResponse, EditFavoritesRequest, EditFavoritesResponse, EtfResponse, EtfsResponse, FilterOptionsRequest, FindInstrumentRequest, FindInstrumentResponse, FutureResponse, FuturesResponse, GetAccountsRequest, GetAccountsResponse, GetAccruedInterestsRequest, GetAccruedInterestsResponse, GetAssetFundamentalsRequest, GetAssetFundamentalsResponse, GetAssetReportsRequest, GetAssetReportsResponse, GetBondCouponsRequest, GetBondCouponsResponse, GetBondEventsRequest, GetBondEventsResponse, GetBrandRequest, GetBrandsRequest, GetBrandsResponse, GetCandlesRequest, GetCandlesResponse, GetClosePricesRequest, GetClosePricesResponse, GetConsensusForecastsRequest, GetConsensusForecastsResponse, GetCountriesRequest, GetCountriesResponse, GetDividendsForeignIssuerRequest, GetDividendsForeignIssuerResponse, GetDividendsRequest, GetDividendsResponse, GetFavoritesRequest, GetFavoritesResponse, GetForecastRequest, GetForecastResponse, GetFuturesMarginRequest, GetFuturesMarginResponse, GetInfoRequest, GetInfoResponse, GetLastPricesRequest, GetLastPricesResponse, GetLastTradesRequest, GetLastTradesResponse, GetMarginAttributesRequest, GetMarginAttributesResponse, GetMarketValuesRequest, GetMarketValuesResponse, GetMaxLotsRequest, GetMaxLotsResponse, GetOperationsByCursorRequest, GetOperationsByCursorResponse, GetOrderBookRequest, GetOrderBookResponse, GetOrderPriceRequest, GetOrderPriceResponse, GetOrderStateRequest, GetOrdersRequest, GetOrdersResponse, GetSignalsRequest, GetSignalsResponse, GetStopOrdersRequest, GetStopOrdersResponse, GetStrategiesRequest, GetStrategiesResponse, GetTechAnalysisRequest, GetTechAnalysisResponse, GetTradingStatusRequest, GetTradingStatusResponse, GetTradingStatusesRequest, GetTradingStatusesResponse, GetUserTariffRequest, GetUserTariffResponse, IndicativesRequest, IndicativesResponse, InstrumentRequest, InstrumentResponse, InstrumentsRequest, OptionResponse, OptionsResponse, OrderState, PortfolioRequest, PortfolioResponse, PositionsRequest, PositionsResponse, PostOrderAsyncRequest, PostOrderAsyncResponse, PostOrderRequest, PostOrderResponse, PostStopOrderRequest, PostStopOrderResponse, ReplaceOrderRequest, ShareResponse, SharesResponse, TradingSchedulesRequest, TradingSchedulesResponse, WithdrawLimitsRequest, WithdrawLimitsResponse}, Investment, TSResult};
 
 #[derive(Clone, Debug)]
 pub enum PointRequest {
@@ -65,7 +65,8 @@ pub enum PointRequest {
     StopOrders(GetStopOrdersRequest),
     CancelStopOrder(CancelStopOrderRequest),
     Strategies(GetStrategiesRequest),
-    Signals(GetSignalsRequest)
+    Signals(GetSignalsRequest),
+    MarketValues(GetMarketValuesRequest)
 }
 
 #[derive(Clone, Debug)]
@@ -133,7 +134,8 @@ pub enum PointResponse {
     StopOrders(GetStopOrdersResponse),
     CancelStopOrder(CancelStopOrderResponse),
     Strategies(GetStrategiesResponse),
-    Signals(GetSignalsResponse)
+    Signals(GetSignalsResponse),
+    MarketValues(GetMarketValuesResponse)
 }
 
 impl PointRequest {
@@ -392,6 +394,11 @@ impl PointRequest {
             PointRequest::OperationsByCursor(req) => Ok(
                 PointResponse::OperationsByCursor(
                     OperationsServiceClient::from(service.into_inner()).get_operations_by_cursor(req).await?.into_inner()
+                )
+            ),
+            PointRequest::MarketValues(req) => Ok(
+                PointResponse::MarketValues(
+                    MarketDataServiceClient::from(service.into_inner()).get_market_values(req).await?.into_inner()
                 )
             ),
             PointRequest::Candles(req) => Ok(

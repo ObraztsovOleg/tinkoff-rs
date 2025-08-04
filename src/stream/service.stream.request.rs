@@ -13,7 +13,7 @@ impl OrderStateStreamRequest {
     pub fn order_state(accounts: Vec<String>) -> Self {
         OrderStateStreamRequest {
             accounts: accounts,
-            ping_delay_ms: Some(120000)
+            ping_delay_millis: Some(120000),
         }
     }
 }
@@ -108,7 +108,8 @@ impl MarketDataServerSideStreamRequest {
                         figi: figi.to_string(),
                         instrument_id: "figi".to_string(),
                     }],
-                    trade_source: TradeSourceType::TradeSourceAll as i32
+                    trade_source: TradeSourceType::TradeSourceAll as i32,
+                    with_open_interest: true,
                 }
             ),
             subscribe_info_request: None,

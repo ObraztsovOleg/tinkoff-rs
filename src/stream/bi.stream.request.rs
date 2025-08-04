@@ -98,7 +98,8 @@ impl MarketDataRequest {
                         figi: figi.to_string(),
                         instrument_id: "figi".to_string(),
                     }],
-                    trade_source: TradeSourceType::TradeSourceAll as i32
+                    trade_source: TradeSourceType::TradeSourceAll as i32,
+                    with_open_interest: true,
                 }
             ))
         }
