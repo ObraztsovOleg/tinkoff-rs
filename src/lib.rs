@@ -11,7 +11,7 @@ pub mod service_stream_request;
 #[path = "tcs.rs"]
 pub mod tcs;
 
-use tonic::{client::Grpc, service::{interceptor::InterceptedService, Interceptor}, transport::{self, Channel, ClientTlsConfig}, Status};
+use tonic::{async_trait, client::Grpc, service::{interceptor::InterceptedService, Interceptor}, transport::{self, Channel, ClientTlsConfig}, Status};
 use tcs::MarketDataRequest;
 use secrecy::{ExposeSecret, Secret};
 
@@ -107,21 +107,23 @@ impl SandboxInvestment {
     }
 }
 
+#[async_trait]
 pub trait Service: Sized {
-    fn create_service(token: Secret<String>) -> TSResult<Self>;
+    async fn create_service(token: Secret<String>) -> TSResult<Self>;
 }
 
 
 macro_rules! impl_service {
     ([$(($type:ident, $address:expr)),*]) => {
         $(
+            #[async_trait]
             impl Service for $type {
-                fn create_service(token: Secret<String>) -> TSResult<Self> {
+                async fn create_service(token: Secret<String>) -> TSResult<Self> {
                     let tls = ClientTlsConfig::new().with_native_roots();
 
                     let channel = Channel::from_static($address)
                         .tls_config(tls)?
-                        .connect_lazy();
+                        .connect().await?;
 
                     Ok(
                         $type::from(Grpc::new(InterceptedService::new(
