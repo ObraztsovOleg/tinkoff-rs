@@ -1,0 +1,49 @@
+contour = "sandbox"
+account_id = "REPLACE_WITH_DEDICATED_SANDBOX_ACCOUNT_ID"
+strategy_id = "example-short-term-reversal-ensemble-v2"
+app_name = "YourName.tinkoff-rs.strategies"
+database_connections = 5
+
+[risk]
+budget_rub = "30000.00"
+daily_loss_percent = "5.0"
+max_drawdown_percent = "25.0"
+
+# At least ten liquid stocks; this high-turnover strategy is experimental.
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_01"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_02"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_03"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_04"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_05"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_06"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_07"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_08"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_09"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_10"
+group = "tradable"
+
+[[strategies]]
+signal_weight = "1.0"
+kind = "short-term-reversal"
+benchmark_uid = "REPLACE_WITH_LIQUID_MOEX_BENCHMARK_UID"
+lookback_days = 5
+quantile_percent = 20

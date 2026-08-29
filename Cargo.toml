@@ -1,30 +1,74 @@
 [package]
 name = "tinkoff-rs"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "A typed T-Invest SDK and broker-neutral trading bot runtime"
+repository = "https://github.com/ObraztsovOleg/tinkoff-rs"
+
+[features]
+default = ["bot"]
+postgres = ["engine", "dep:sqlx"]
+engine = []
+strategies = ["engine"]
+cli = [
+    "engine",
+    "postgres",
+    "strategies",
+    "dep:clap",
+    "dep:toml",
+    "dep:tracing-subscriber",
+]
+bot = ["cli", "strategies", "postgres"]
 
 [dependencies]
-tonic = { version = "0.12.3", features = ["tls", "tls-native-roots"] }
-prost = "0.13.4"
-prost-types = "0.13.4"
-tokio = { version = "1.43.0", features = ["full"] }
-tokio-stream = { version = "0.1.17" }
+async-trait = "0.1.89"
+chrono = { version = "0.4.42", features = ["serde"] }
+clap = { version = "4.5.47", features = ["derive", "env"], optional = true }
 futures = "0.3.31"
-log = "0.4.25"
-env_logger = "0.11.6"
-uuid = { version = "1.13.1", features = ["v4"] }
-flume = "0.11.1"
-ndarray = "0.16.1"
-nalgebra = "0.33.2"
-serde = { version = "1.0.217", features = ["derive"] }
-serde_json = "1.0.138"
-serde_urlencoded = "0.7"
-bytes = "1"
-reqwest = { version = "0.12.12", features = ["json"] }
-axum = "0.8.1"
-async-channel = "2.3.1"
-derive_more = { version = "2.0.1", features = ["from", "into"] }
-secrecy = { version = "0.8.0", features = ["serde"] }
+prost = "0.13.5"
+prost-types = "0.13.5"
+rand = "0.8.5"
+rust_decimal = { version = "1.37.2", features = ["serde-with-str"] }
+secrecy = "0.8.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+sqlx = { version = "0.8.6", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "migrate",
+    "macros",
+    "uuid",
+    "chrono",
+    "rust_decimal",
+    "json",
+], optional = true }
+thiserror = "2.0.16"
+tokio = { version = "1.47.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.17", features = ["net"] }
+toml = { version = "0.9.5", optional = true }
+tonic = { version = "0.12.3", features = ["tls", "tls-native-roots"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"], optional = true }
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 [build-dependencies]
+protoc-bin-vendored = "3.2.0"
 tonic-build = "0.12.3"
+
+[[bin]]
+name = "tinkoff-bot"
+path = "src/bin/tinkoff-bot.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "portfolio-strategy-demo"
+path = "examples/portfolio-strategy-demo.rs"
+required-features = ["engine"]
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+too_many_lines = "allow"

@@ -1,0 +1,6 @@
+repository_url = "https://opensource.tbank.ru/invest/invest-contracts"
+archive_url = "https://opensource.tbank.ru/invest/invest-contracts/-/archive/master/invest-contracts-master.tar.gz"
+archive_sha256 = "8a77b48a4e73e110acc7132bb9843ffd0006a309dbec4fd677e8917604a737f9"
+imported_at = "2026-08-25"
+archive_internal_path = "invest-contracts-master/src/docs/contracts"
+rpc_count = 107

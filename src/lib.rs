@@ -1,141 +1,65 @@
-#[path = "stream/bi.stream.manager.rs"]
-pub mod bi_stream_manager;
-#[path = "point/point.manager.rs"]
-pub mod point_manager;
-#[path = "stream/bi.stream.request.rs"]
-pub mod bi_stream_request;
-#[path = "stream/service.stream.manager.rs"]
-pub mod service_stream_manager;
-#[path = "stream/service.stream.request.rs"]
-pub mod service_stream_request;
-#[path = "tcs.rs"]
-pub mod tcs;
+//! Типизированный SDK для T-Invest API и portfolio-target runtime для Sandbox.
+//!
+//! # Как читать проект
+//!
+//! Основной поток данных устроен так:
+//!
+//! ```text
+//! T-Invest gRPC
+//!     -> api (соединение и generated clients)
+//!     -> broker (удобные capability-интерфейсы)
+//!     -> stream (котировки и переподключение)
+//!     -> engine::PortfolioEngine
+//!     -> engine::TargetPortfolio
+//!     -> engine::TargetPlanner + RiskManager
+//!     -> engine::BatchExecutor
+//!     -> broker::Trading
+//!     -> T-Invest gRPC
+//! ```
+//!
+//! Модуль [`domain`] находится в центре архитектуры: стратегии и исполнитель
+//! работают с его типами, а не с protobuf. Готовый торговый runtime намеренно
+//! поддерживает только T-Invest Sandbox и запускает один ансамбль из одной или
+//! нескольких стратегий на счёт.
+//!
+//! # Безопасное разделение контуров
+//!
+//! Sandbox и production представлены разными Rust-типами. [`broker::ProductionBroker`]
+//! даёт production-доступ только для чтения. Чтобы получить реализацию
+//! [`broker::Trading`], вызывающий код должен отдельно создать
+//! [`broker::LiveTradingPermit`] и [`broker::ProductionTrading`]. Это делает
+//! случайную отправку реальной заявки сложнее уже на этапе компиляции.
+//!
+//! Для знакомства начните с `examples/portfolio-strategy-demo.rs`: пример не открывает
+//! соединение и не отправляет заявки.
 
-use tonic::{client::Grpc, service::{interceptor::InterceptedService, Interceptor}, transport::{self, Channel, ClientTlsConfig}, Status};
-use tcs::MarketDataRequest;
-use secrecy::{ExposeSecret, Secret};
+pub mod api;
+pub mod broker;
+pub mod domain;
+pub mod error;
+pub mod proto;
+pub mod response;
+pub mod retry;
+pub mod stream;
 
-pub type TSResult<T> = std::result::Result<T, TSError>;
+#[cfg(feature = "engine")]
+pub mod engine;
 
-#[derive(Debug)]
-pub enum TSError {
-    TransportError(transport::Error),
-    TransportIndividualError(reqwest::Error),
-    StatusError(tonic::Status),
-    SendError(flume::SendError<MarketDataRequest>),
-    InfoError(String),
-    ChannelSendError(String)
-}
-impl From<transport::Error> for TSError {
-    fn from(e: transport::Error) -> Self {
-        TSError::TransportError(e)
-    }
-}
+#[cfg(feature = "engine")]
+pub mod storage;
 
-impl From<reqwest::Error> for TSError {
-    fn from(e: reqwest::Error) -> Self {
-        TSError::TransportIndividualError(e)
-    }
-}
-impl From<flume::SendError<MarketDataRequest>> for TSError {
-    fn from(e: flume::SendError<MarketDataRequest>) -> Self {
-        TSError::SendError(e)
-    }
-}
-impl From<String> for TSError {
-    fn from(e: String) -> Self {
-        TSError::InfoError(e)
-    }
-}
+#[cfg(feature = "strategies")]
+pub mod strategies;
+mod transport;
 
-impl<T> From<async_channel::SendError<T>> for TSError {
-    fn from(error: async_channel::SendError<T>) -> Self {
-        TSError::ChannelSendError(format!("Failed to send data to channel: {}", error))
-    }
-}
+pub use api::{
+    ProductionApi, ProductionApiBuilder, ProductionRawApi, SandboxApi, SandboxApiBuilder,
+    SandboxRawApi,
+};
+pub use error::{Error, Result};
+pub use response::{ApiMetadata, ApiResponse, RateLimit};
 
-impl From<tonic::Status> for TSError {
-    fn from(e: tonic::Status) -> Self {
-        TSError::StatusError(e)
-    }
-}
-
-#[derive(Debug)]
-pub struct ServiceManager {
-    token: Secret<String>
-}
-
-#[derive(Clone)]
-pub struct DefaultInterceptor {
-    token: Secret<String>,
-}
-
-impl Interceptor for DefaultInterceptor {
-    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
-        let mut req = request;
-
-        req.metadata_mut().append(
-            "authorization",
-            format!("bearer {}", self.token.expose_secret()).parse().unwrap()
-        );
-        req.metadata_mut().append(
-            "x-tracking-id",
-            uuid::Uuid::new_v4().to_string().parse().unwrap(),
-        );
-        req.metadata_mut()
-            .append("x-app-name", "obrol.tinkoff".parse().unwrap());
-
-        Ok(req)
-    }
-}
-
-
-#[derive(derive_more::From, Clone)]
-pub struct Investment(Grpc<InterceptedService<Channel, DefaultInterceptor>>);
-#[derive(derive_more::From, Clone)]
-pub struct SandboxInvestment(Grpc<InterceptedService<Channel, DefaultInterceptor>>);
-
-impl Investment {
-    pub fn into_inner(self) -> Grpc<InterceptedService<Channel, DefaultInterceptor>> {
-        self.0
-    }
-}
-
-impl SandboxInvestment {
-    pub fn into_inner(self) -> Grpc<InterceptedService<Channel, DefaultInterceptor>> {
-        self.0
-    }
-}
-
-pub trait Service: Sized {
-    fn create_service(token: Secret<String>) -> TSResult<Self>;
-}
-
-
-macro_rules! impl_service {
-    ([$(($type:ident, $address:expr)),*]) => {
-        $(
-            impl Service for $type {
-                fn create_service(token: Secret<String>) -> TSResult<Self> {
-                    let tls = ClientTlsConfig::new().with_native_roots();
-
-                    let channel = Channel::from_static($address)
-                        .tls_config(tls)?
-                        .connect_lazy();
-
-                    Ok(
-                        $type::from(Grpc::new(InterceptedService::new(
-                            channel,
-                            DefaultInterceptor { token: token }
-                        )))
-                    )
-                }
-            }
-        )*
-    };
-}
-
-impl_service!([
-    (Investment, "https://invest-public-api.tinkoff.ru:443"),
-    (SandboxInvestment, "https://sandbox-invest-public-api.tinkoff.ru:443")
-]);
+/// Официальный gRPC endpoint реального торгового контура.
+pub const PRODUCTION_ENDPOINT: &str = "https://invest-public-api.tbank.ru:443";
+/// Официальный gRPC endpoint изолированной песочницы.
+pub const SANDBOX_ENDPOINT: &str = "https://sandbox-invest-public-api.tbank.ru:443";

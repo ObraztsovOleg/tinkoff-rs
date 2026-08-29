@@ -1,0 +1,25 @@
+contour = "sandbox"
+account_id = "REPLACE_WITH_DEDICATED_SANDBOX_ACCOUNT_ID"
+strategy_id = "example-range-breakout-ensemble-v2"
+app_name = "YourName.tinkoff-rs.strategies"
+database_connections = 5
+
+[risk]
+budget_rub = "30000.00"
+daily_loss_percent = "5.0"
+max_drawdown_percent = "25.0"
+
+# Minimum: one instrument; two are shown for diversification.
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_01"
+group = "tradable"
+
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_02"
+group = "tradable"
+
+[[strategies]]
+signal_weight = "1.0"
+kind = "range-breakout"
+lookback_days = 50
+filter_percent = "1.0"

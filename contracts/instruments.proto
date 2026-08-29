@@ -67,6 +67,12 @@ service InstrumentsService {/*Методы сервиса предназначе
   //Shares — список акций
   rpc Shares (InstrumentsRequest) returns (SharesResponse);
 
+  //DfaBy — получить цифровой актив по его идентификатору
+  rpc DfaBy (InstrumentRequest) returns (DfaResponse);
+
+  //Dfas — список цифровых активов
+  rpc Dfas (DfasRequest) returns (DfasResponse);
+
   //Indicatives — индикативные инструменты — индексы, товары и другие
   rpc Indicatives(IndicativesRequest) returns (IndicativesResponse);
 
@@ -139,6 +145,9 @@ service InstrumentsService {/*Методы сервиса предназначе
 
   //StructuredNotes — список структурных нот
   rpc StructuredNotes(InstrumentsRequest) returns (StructuredNotesResponse);
+
+  //News — получение актуальных новостей
+  rpc News(NewsRequest) returns (NewsResponse);
 }
 
 //Запрос расписания торгов.
@@ -182,7 +191,7 @@ message TradingDay {
 
 //Запрос получения инструмента по идентификатору.
 message InstrumentRequest {
-  InstrumentIdType id_type = 1 [(google.api.field_behavior) = REQUIRED]; // Тип идентификатора инструмента. Возможные значения — `figi`, `ticker`. [Подробнее об идентификации инструментов](./faq_identification/).
+  InstrumentIdType id_type = 1 [(google.api.field_behavior) = REQUIRED]; // Тип идентификатора инструмента. Возможные значения — `figi`, `ticker`. [Подробнее об идентификации инструментов](/invest/intro/intro/faq_identification).
   optional string class_code = 2; // Идентификатор `class_code`. Обязательный, если `id_type = ticker`.
   string id = 3 [(google.api.field_behavior) = REQUIRED]; // Идентификатор запрашиваемого инструмента.
 }
@@ -196,6 +205,13 @@ message InstrumentsRequest {
 message FilterOptionsRequest {
   optional string basic_asset_uid = 1; //Идентификатор базового актива опциона.  Обязательный параметр.
   optional string basic_asset_position_uid = 2; //Идентификатор позиции базового актива опциона.
+  optional string basic_instrument_id = 3; //Идентификатор базового инструмента, принимает значение принимает значения figi, instrument_uid или ticker+"_"+classCode.
+}
+
+//Запрос получения актуальных новостей
+message NewsRequest {
+  optional int64 cursor = 1; //Идентификатор элемента, с которого начать формировать ответ.
+  optional int32 limit = 2; //Лимит количества новостей в ответе. По умолчанию 1000.
 }
 
 //Информация об облигации.
@@ -213,7 +229,7 @@ message GetBondCouponsRequest {
   string figi = 1 [deprecated = true]; //FIGI-идентификатор инструмента.
   optional google.protobuf.Timestamp from = 2; //Начало запрашиваемого периода по UTC. Фильтрация по `coupon_date` — дата выплаты купона.
   optional google.protobuf.Timestamp to = 3; //Окончание запрашиваемого периода по UTC. Фильтрация по `coupon_date` — дата выплаты купона.
-  string instrument_id = 4 [(google.api.field_behavior) = REQUIRED]; //Идентификатор инструмента — `figi` или `instrument_uid`.
+  string instrument_id = 4 [(google.api.field_behavior) = REQUIRED]; //Идентификатор инструмента. Принимает значение `figi`, `instrument_uid` или `ticker + '_' + class_code`.
 }
 
 //Купоны по облигации.
@@ -241,7 +257,7 @@ message GetBondEventsRequest {
 message GetBondEventsResponse {
   repeated BondEvent events = 1;
   message BondEvent {
-    string instrument_id = 2; // Идентификатор инструмента.
+    string instrument_id = 2; // Идентификатор инструмента. Принимает значение `figi`, `instrument_uid` или `ticker + '_' + class_code`.
     int32 event_number = 3; // Номер события для данного типа события.
     google.protobuf.Timestamp event_date = 4; // Дата события.
     GetBondEventsRequest.EventType event_type = 5; // Тип события.
@@ -438,6 +454,43 @@ message StructuredNotesResponse {
   repeated StructuredNote instruments = 1; //Массив структурных нот.
 }
 
+//Данные по актуальным новостям.
+message NewsResponse {
+  bool has_next = 1; //Признак, есть ли еще новости.
+  optional int64 next_cursor = 2; //Следующий курсор.
+  repeated NewsItem items = 3; //Массив новостей.
+}
+
+//Объект новости.
+message NewsItem {
+  int64 id = 1; //Уникальный идентификатор новости.
+  string source = 2; //Источник новости.
+  string title = 3; //Заголовок новости.
+  string content = 4; //Содержание новости.
+  optional string summary = 5; //Обобщенная информация.
+  repeated Table tables = 6; //Табличные данные.
+  repeated NewsInstrument instrument_id = 7; //Инструменты из новости.
+  bool priority = 8; //Флаг, указывающий, важная ли новость.
+  google.protobuf.Timestamp ts = 9;//Время новости.
+}
+
+//Объект табличных данных.
+message Table {
+  string table = 1; //Таблица.
+}
+
+//Объект инструмента из новости.
+message NewsInstrument {
+  NewsInstrumentInfo instrument = 1; //Информация по инструменту.
+}
+
+//Объект информации по инструменту из новости.
+message NewsInstrumentInfo {
+  string instrument_uid = 1; //Уникальный идентификатор инструмента.
+  string ticker = 2; //Тикер инструмента.
+  string class_code = 3; //Класс-код (секция торгов).
+}
+
 //Объект передачи информации об облигации.
 message Bond {
   string figi = 1; //FIGI-идентификатор инструмента.
@@ -502,7 +555,7 @@ message Bond {
   RiskLevel risk_level = 63; //Уровень риска.
   BrandData brand = 64; // Информация о бренде.
   BondType bond_type = 65; // Тип облигации.
-  google.protobuf.Timestamp call_date = 69;  // Дата погашения облигации.
+  google.protobuf.Timestamp call_date = 69;  // Дата оферты.
 
   Quotation dlong_client = 90; //Ставка риска в лонг с учетом текущего уровня риска портфеля клиента. [Подробнее про ставки риска](https://www.tbank.ru/invest/help/brokerage/account/margin/about/#q5).
   Quotation dshort_client = 91; //Ставка риска в шорт с учетом текущего уровня риска портфеля клиента. [Подробнее про ставки риска](https://www.tbank.ru/invest/help/brokerage/account/margin/about/#q5).
@@ -546,6 +599,8 @@ message Currency {
   string position_uid = 29; //Уникальный идентификатор позиции инструмента.
 
   repeated string required_tests = 30; //Тесты, которые необходимо пройти клиенту, чтобы совершать сделки по инструменту.
+
+  string asset_uid = 31; //Уникальный идентификатор актива.
 
   bool for_iis_flag = 41; //Признак доступности для ИИС.
   bool for_qual_investor_flag = 52; //Флаг, отображающий доступность торговли инструментом только для квалифицированных инвесторов.
@@ -835,7 +890,7 @@ message GetAccruedInterestsRequest {
   string figi = 1 [deprecated = true]; //FIGI-идентификатор инструмента.
   google.protobuf.Timestamp from = 2 [(google.api.field_behavior) = REQUIRED]; //Начало запрашиваемого периода по UTC.
   google.protobuf.Timestamp to = 3 [(google.api.field_behavior) = REQUIRED]; //Окончание запрашиваемого периода по UTC.
-  string instrument_id = 4 [(google.api.field_behavior) = REQUIRED]; //Идентификатор инструмента — `figi` или `instrument_uid`.
+  string instrument_id = 4 [(google.api.field_behavior) = REQUIRED]; //Идентификатор инструмента. Принимает значение `figi`, `instrument_uid` или `ticker + '_' + class_code`.
 }
 
 //НКД облигации.
@@ -854,7 +909,7 @@ message AccruedInterest {
 //Запрос информации о фьючерсе
 message GetFuturesMarginRequest {
   string figi = 1 [deprecated = true]; // Идентификатор инструмента.
-  string instrument_id = 4 [(google.api.field_behavior) = REQUIRED]; //Идентификатор инструмента — `figi` или `instrument_uid`.
+  string instrument_id = 4 [(google.api.field_behavior) = REQUIRED]; //Идентификатор инструмента. Принимает значение `figi`, `instrument_uid` или `ticker + '_' + class_code`.
 }
 
 //Данные по фьючерсу
@@ -865,13 +920,14 @@ message GetFuturesMarginResponse {
   Quotation min_price_increment_amount = 4; //Стоимость шага цены.
 }
 
-//Тип идентификатора инструмента. [Подробнее об идентификации инструментов](./faq_identification/).
+//Тип идентификатора инструмента. [Подробнее об идентификации инструментов](/invest/intro/intro/faq_identification).
 enum InstrumentIdType {
   INSTRUMENT_ID_UNSPECIFIED = 0; //Значение не определено.
   INSTRUMENT_ID_TYPE_FIGI = 1; //FIGI.
   INSTRUMENT_ID_TYPE_TICKER = 2; //Ticker.
   INSTRUMENT_ID_TYPE_UID = 3; //Уникальный идентификатор.
   INSTRUMENT_ID_TYPE_POSITION_UID = 4; //Идентификатор позиции.
+  INSTRUMENT_ID_TYPE_ID = 5; //Универсальный тип идентификатора инструмента.
 }
 
 //Данные по инструменту.
@@ -935,7 +991,7 @@ message GetDividendsRequest {
   string figi = 1 [deprecated = true]; //FIGI-идентификатор инструмента.
   optional google.protobuf.Timestamp from = 2; //Начало запрашиваемого периода по UTC. Фильтрация происходит по параметру `record_date` — дата фиксации реестра.
   optional google.protobuf.Timestamp to = 3; //Окончание запрашиваемого периода по UTC. Фильтрация происходит по параметру `record_date` — дата фиксации реестра.
-  string instrument_id = 4 [(google.api.field_behavior) = REQUIRED]; //Идентификатор инструмента — `figi` или `instrument_uid`.
+  string instrument_id = 4 [(google.api.field_behavior) = REQUIRED]; //Идентификатор инструмента. Принимает значение `figi`, `instrument_uid` или `ticker + '_' + class_code`.
 }
 
 //Дивиденды.
@@ -1309,6 +1365,13 @@ message IndicativeResponse {
   string uid = 14; // Уникальный идентификатор инструмента.
   bool buy_available_flag = 404; // Признак доступности для покупки.
   bool sell_available_flag = 405; // Признак доступности для продажи.
+  repeated IndexInstrument index_composition = 406; // Состав индекса.
+}
+
+//Инструмент в составе индекса
+message IndexInstrument {
+  string uid = 1; // Идентификатор инструмента.
+  Quotation weight = 2; // Вес инструмента в составе индекса в %.
 }
 
 //Данные о стране.
@@ -1441,7 +1504,7 @@ message GetAssetFundamentalsResponse {
 
 //Запрос отчетов эмитентов
 message GetAssetReportsRequest {
-  string instrument_id = 1 [(google.api.field_behavior) = REQUIRED]; //Идентификатор инструмента в формате UID.
+  string instrument_id = 1 [(google.api.field_behavior) = REQUIRED]; //Идентификатор инструмента. Принимает значение `figi`, `instrument_uid` или `ticker + '_' + class_code`.
   optional google.protobuf.Timestamp from = 2; //Начало запрашиваемого периода по UTC.
   optional google.protobuf.Timestamp to = 3; //Окончание запрашиваемого периода по UTC.
 }
@@ -1505,7 +1568,7 @@ enum Recommendation {
 
 //Запрос прогнозов инвестдомов.
 message GetForecastRequest {
-  string instrument_id = 1;  // Идентификатор инструмента.
+  string instrument_id = 1;  // Идентификатор инструмента. Принимает значение `figi`, `instrument_uid` или `ticker + '_' + class_code`.
 }
 
 //Прогнозы инвестдомов по инструменту.
@@ -1546,7 +1609,7 @@ message GetForecastResponse {
 
 //Запрос ставок риска
 message RiskRatesRequest {
-  repeated string instrument_id = 1;  // Идентификаторы инструментов.
+  repeated string instrument_id = 1;  // Идентификатор инструмента. Принимает значение `figi`, `instrument_uid` или `ticker + '_' + class_code`.
 }
 
 
@@ -1581,9 +1644,9 @@ message TradingInterval {
 
 //Запрос сделок по инсайдерам
 message GetInsiderDealsRequest {
-  string instrument_id = 1;
-  int32 limit = 2;
-  optional string next_cursor = 3;
+  string instrument_id = 1; // Идентификатор инструмента. Принимает значение `figi`, `instrument_uid` или `ticker + '_' + class_code`.
+  int32 limit = 2; // Количество выводимых записей в ответе, не больше 100.
+  optional string next_cursor = 3; // Курсор.
 }
 
 //сделки инсайдеров
@@ -1615,6 +1678,57 @@ message GetInsiderDealsResponse {
     TRADE_DIRECTION_INCREASE = 3; // Увеличение доли.
     TRADE_DIRECTION_DECREASE = 4; // Уменьшение доли.
   }
+}
+
+//Запрос цифровых активов
+message DfasRequest {
+
+}
+
+//Цифровой актив
+message DfaResponse {
+  string uid = 1; // Уникальный идентификатор инструмента.
+  string ticker = 2; // Тикер инструмента.
+  string name = 3; // Название инструмента.
+  string position_uid = 4; // Уникальный идентификатор позиции.
+  Quotation min_price_increment = 5; // Шаг цены.
+  int32 lot = 6; // Количество лотов.
+  MoneyValue nominal = 7; // Номинал.
+  string currency = 8; // Валюта.
+  google.protobuf.Timestamp maturity_date = 9; // Дата погашения ЦФА в формате UTC.
+  bool short_enabled_flag = 10; // Признак доступности для операций шорт.
+  bool api_trade_available_flag = 11; // Признак доступности торгов по бумаге через API.
+  bool buy_available_flag = 12; // Признак доступности для покупки.
+  bool sell_available_flag = 13; // Признак доступности для продажи.
+  bool limit_order_available_flag = 14; // Признак доступности выставления лимитной заявки по инструменту.
+  bool market_order_available_flag = 15; // Признак доступности выставления рыночной заявки по инструменту.
+  bool bestprice_order_available_flag = 16; // Признак доступности выставления bestprice заявки по инструменту.
+  bool for_iis_flag = 17; // Возможность покупки/продажи на ИИС.
+  bool for_qual_investor_flag = 18; // Флаг отображающий доступность торговли инструментом только для квалифицированных инвесторов.
+  string type = 19; // Тип актива. Возможные значения: credit_portfolio_dfa, debt_dfa.
+  repeated BasicAsset basic_assets = 20; // Базовые активы, входящие в ЦФА.
+  ForecastYield forecast_yield = 21; // Прогнозная доходность смарт-портфелей, в виде интервала в %.
+  Quotation yield_to_maturity = 22; // Доходность к погашению в %.
+  Quotation coupon_value = 23; // Величина купона.
+  int32 coupon_payment_frequency = 24; // Количество выплат в год.
+  google.protobuf.Timestamp coupon_payment_date = 25; // Дата выплаты купона.
+  Quotation aci_value = 26; // Значение НКД (накопленного купонного дохода) на дату.
+
+  // Базовый актив.
+  message BasicAsset {
+    string uid = 1; // UID базового актива
+  }
+
+  // Прогнозная доходность смарт-портфелей.
+  message ForecastYield {
+    Quotation min_value = 1; // Минимальное значение прогнозной доходности в %
+    Quotation max_value = 2; // Максимальное значение прогнозной доходности в %
+  }
+}
+
+ // Цифровые активы
+message DfasResponse {
+  repeated DfaResponse instruments = 1; // Массив инструментов.
 }
 
 //Уровень риска облигации.

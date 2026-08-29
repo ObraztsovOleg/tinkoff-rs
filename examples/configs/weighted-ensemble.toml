@@ -1,0 +1,43 @@
+contour = "sandbox"
+account_id = "REPLACE_WITH_DEDICATED_SANDBOX_ACCOUNT_ID"
+# При изменении universe, состава/порядка компонент, их signal_weight, kind или
+# параметров используйте новый strategy_id, чтобы не восстановить несовместимый state.
+strategy_id = "example-weighted-ensemble-v2"
+app_name = "YourName.tinkoff-rs.strategies"
+database_connections = 5
+
+[risk]
+budget_rub = "30000.00"
+daily_loss_percent = "5.0"
+max_drawdown_percent = "25.0"
+
+# Все компоненты используют один полный universe и управляют одной итоговой
+# позицией по каждому UID. Для этой комбинации достаточно одного инструмента;
+# два показаны, чтобы сигнал мог распределяться между несколькими бумагами.
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_01"
+group = "tradable"
+
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_02"
+group = "tradable"
+
+# Коэффициенты относительные: 5/3/2 эквивалентны 0.5/0.3/0.2.
+[[strategies]]
+signal_weight = "0.5"
+kind = "moving-average-trend"
+fast_window = 50
+slow_window = 200
+band_percent = "1.0"
+
+[[strategies]]
+signal_weight = "0.3"
+kind = "range-breakout"
+lookback_days = 50
+filter_percent = "1.0"
+
+[[strategies]]
+signal_weight = "0.2"
+kind = "time-series-momentum"
+horizons_days = [21, 63, 252]
+volatility_window_days = 63

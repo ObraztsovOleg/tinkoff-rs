@@ -1,0 +1,493 @@
+# Machine-readable bibliography for the strategy briefs.
+# URLs are metadata and retrieval locations; third-party PDFs are never committed.
+schema_version = "1"
+
+[[paper]]
+id = "brock-lakonishok-lebaron-1992"
+role = "primary"
+strategies = ["moving-average-trend", "range-breakout"]
+title = "Simple Technical Trading Rules and the Stochastic Properties of Stock Returns"
+authors = ["William Brock", "Josef Lakonishok", "Blake LeBaron"]
+year = 1992
+doi = "10.1111/j.1540-6261.1992.tb04681.x"
+doi_url = "https://doi.org/10.1111/j.1540-6261.1992.tb04681.x"
+landing_url = "https://doi.org/10.1111/j.1540-6261.1992.tb04681.x"
+pdf_url = "https://sfi-edu.s3.amazonaws.com/sfi-edu/production/uploads/sfi-com/dev/uploads/filer/17/91/1791d085-e000-427d-a5d2-94d20b072bcb/91-01-006.pdf"
+expected_filename = "brock-lakonishok-lebaron-1992.pdf"
+brief_pdfs = ["briefs/moving-average-trend.ru.pdf", "briefs/range-breakout.ru.pdf"]
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "sullivan-timmermann-white-1999"
+role = "critique"
+strategies = ["moving-average-trend", "range-breakout"]
+title = "Data-Snooping, Technical Trading Rule Performance, and the Bootstrap"
+authors = ["Ryan Sullivan", "Allan Timmermann", "Halbert White"]
+year = 1999
+doi = "10.1111/0022-1082.00163"
+doi_url = "https://doi.org/10.1111/0022-1082.00163"
+landing_url = "https://doi.org/10.1111/0022-1082.00163"
+pdf_url = ""
+expected_filename = "sullivan-timmermann-white-1999.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "moskowitz-ooi-pedersen-2012"
+role = "primary"
+strategies = ["time-series-momentum"]
+title = "Time Series Momentum"
+authors = ["Tobias J. Moskowitz", "Yao Hua Ooi", "Lasse Heje Pedersen"]
+year = 2012
+doi = "10.1016/j.jfineco.2011.11.003"
+doi_url = "https://doi.org/10.1016/j.jfineco.2011.11.003"
+landing_url = "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2089463"
+pdf_url = "https://fairmodel.econ.yale.edu/ec439/mosk.pdf"
+expected_filename = "moskowitz-ooi-pedersen-2012.pdf"
+brief_pdf = "briefs/time-series-momentum.ru.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "huang-li-wang-zhou-2020"
+role = "critique"
+strategies = ["time-series-momentum"]
+title = "Time Series Momentum: Is It There?"
+authors = ["Dashan Huang", "Jiangyuan Li", "Liyao Wang", "Guofu Zhou"]
+year = 2020
+doi = "10.1016/j.jfineco.2019.08.004"
+doi_url = "https://doi.org/10.1016/j.jfineco.2019.08.004"
+landing_url = "https://doi.org/10.1016/j.jfineco.2019.08.004"
+pdf_url = ""
+expected_filename = "huang-li-wang-zhou-2020.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "kim-tse-wald-2016"
+role = "critique"
+strategies = ["time-series-momentum"]
+title = "Time Series Momentum and Volatility Scaling"
+authors = ["Alexander Y. C. Kim", "Yiuman Tse", "Jeff K. Wald"]
+year = 2016
+doi = "10.1016/j.finmar.2016.05.003"
+doi_url = "https://doi.org/10.1016/j.finmar.2016.05.003"
+landing_url = "https://doi.org/10.1016/j.finmar.2016.05.003"
+pdf_url = ""
+expected_filename = "kim-tse-wald-2016.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "jegadeesh-titman-1993"
+role = "primary"
+strategies = ["cross-sectional-momentum"]
+title = "Returns to Buying Winners and Selling Losers: Implications for Stock Market Efficiency"
+authors = ["Narasimhan Jegadeesh", "Sheridan Titman"]
+year = 1993
+doi = "10.1111/j.1540-6261.1993.tb04702.x"
+doi_url = "https://doi.org/10.1111/j.1540-6261.1993.tb04702.x"
+landing_url = "https://www.bauer.uh.edu/rsusmel/phd/jegadeesh-titman93.pdf"
+pdf_url = "https://www.bauer.uh.edu/rsusmel/phd/jegadeesh-titman93.pdf"
+expected_filename = "jegadeesh-titman-1993.pdf"
+brief_pdf = "briefs/cross-sectional-momentum.ru.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "lesmond-schill-zhou-2004"
+role = "critique"
+strategies = ["cross-sectional-momentum", "short-term-reversal"]
+title = "The Illusory Nature of Momentum Profits"
+authors = ["David A. Lesmond", "Michael J. Schill", "Chunsheng Zhou"]
+year = 2004
+doi = "10.1016/S0304-405X(03)00206-X"
+doi_url = "https://doi.org/10.1016/S0304-405X(03)00206-X"
+landing_url = "https://doi.org/10.1016/S0304-405X(03)00206-X"
+pdf_url = ""
+expected_filename = "lesmond-schill-zhou-2004.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "daniel-moskowitz-2016"
+role = "critique"
+strategies = ["cross-sectional-momentum", "intermediate-momentum", "fifty-two-week-high", "residual-momentum"]
+title = "Momentum Crashes"
+authors = ["Kent Daniel", "Tobias J. Moskowitz"]
+year = 2016
+doi = "10.1016/j.jfineco.2015.12.002"
+doi_url = "https://doi.org/10.1016/j.jfineco.2015.12.002"
+landing_url = "https://www.nber.org/papers/w20439"
+pdf_url = "https://www.nber.org/papers/w20439.pdf"
+expected_filename = "daniel-moskowitz-2016.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-NBER-Personal-Use"
+license_url = "https://www.nber.org/subscribe/information-libraries"
+
+[[paper]]
+id = "novy-marx-2012"
+role = "primary"
+strategies = ["intermediate-momentum"]
+title = "Is Momentum Really Momentum?"
+authors = ["Robert Novy-Marx"]
+year = 2012
+doi = "10.1016/j.jfineco.2011.05.003"
+doi_url = "https://doi.org/10.1016/j.jfineco.2011.05.003"
+landing_url = "https://doi.org/10.1016/j.jfineco.2011.05.003"
+pdf_url = ""
+expected_filename = "novy-marx-2012.pdf"
+brief_pdf = "briefs/intermediate-momentum.ru.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "george-hwang-2004"
+role = "primary"
+strategies = ["fifty-two-week-high"]
+title = "The 52-Week High and Momentum Investing"
+authors = ["Thomas J. George", "Chuan-Yang Hwang"]
+year = 2004
+doi = "10.1111/j.1540-6261.2004.00695.x"
+doi_url = "https://doi.org/10.1111/j.1540-6261.2004.00695.x"
+landing_url = "https://doi.org/10.1111/j.1540-6261.2004.00695.x"
+pdf_url = "https://www.bauer.uh.edu/tgeorge/papers/gh4-paper.pdf"
+expected_filename = "george-hwang-2004.pdf"
+brief_pdf = "briefs/fifty-two-week-high.ru.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "blitz-huij-martens-2011"
+role = "primary"
+strategies = ["residual-momentum"]
+title = "Residual Momentum"
+authors = ["David Blitz", "Joop Huij", "Martin Martens"]
+year = 2011
+doi = "10.1016/j.jempfin.2011.01.003"
+doi_url = "https://doi.org/10.1016/j.jempfin.2011.01.003"
+landing_url = "https://repub.eur.nl/pub/22252"
+pdf_url = "https://repub.eur.nl/pub/22252/ResidualMomentum-2011.pdf"
+expected_filename = "blitz-huij-martens-2011.pdf"
+brief_pdf = "briefs/residual-momentum.ru.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "gatev-goetzmann-rouwenhorst-2006"
+role = "primary"
+strategies = ["pairs-trading"]
+title = "Pairs Trading: Performance of a Relative-Value Arbitrage Rule"
+authors = ["Evan Gatev", "William N. Goetzmann", "K. Geert Rouwenhorst"]
+year = 2006
+doi = "10.1093/rfs/hhj020"
+doi_url = "https://doi.org/10.1093/rfs/hhj020"
+landing_url = "https://www.nber.org/papers/w7032"
+pdf_url = "https://www.nber.org/system/files/working_papers/w7032/w7032.pdf"
+expected_filename = "gatev-goetzmann-rouwenhorst-2006.pdf"
+brief_pdf = "briefs/pairs-trading.ru.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://academic.oup.com/pages/standard-publication-reuse-rights"
+
+[[paper]]
+id = "do-faff-2010"
+role = "critique"
+strategies = ["pairs-trading"]
+title = "Does Simple Pairs Trading Still Work?"
+authors = ["Binh Do", "Robert Faff"]
+year = 2010
+doi = "10.2469/faj.v66.n4.1"
+doi_url = "https://doi.org/10.2469/faj.v66.n4.1"
+landing_url = "https://doi.org/10.2469/faj.v66.n4.1"
+pdf_url = ""
+expected_filename = "do-faff-2010.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://rpc.cfainstitute.org/en/about-rpc/copyright-and-permissions"
+
+[[paper]]
+id = "jegadeesh-1990"
+role = "primary"
+strategies = ["short-term-reversal"]
+title = "Evidence of Predictable Behavior of Security Returns"
+authors = ["Narasimhan Jegadeesh"]
+year = 1990
+doi = "10.1111/j.1540-6261.1990.tb05110.x"
+doi_url = "https://doi.org/10.1111/j.1540-6261.1990.tb05110.x"
+landing_url = "https://doi.org/10.1111/j.1540-6261.1990.tb05110.x"
+pdf_url = "https://onlinelibrary.wiley.com/doi/pdf/10.1111/j.1540-6261.1990.tb05110.x"
+expected_filename = "jegadeesh-1990.pdf"
+brief_pdf = "briefs/short-term-reversal.ru.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "avramov-chordia-goyal-2006"
+role = "critique"
+strategies = ["short-term-reversal"]
+title = "Liquidity and Autocorrelations in Individual Stock Returns"
+authors = ["Doron Avramov", "Tarun Chordia", "Amit Goyal"]
+year = 2006
+doi = "10.1111/j.1540-6261.2006.01060.x"
+doi_url = "https://doi.org/10.1111/j.1540-6261.2006.01060.x"
+landing_url = "https://doi.org/10.1111/j.1540-6261.2006.01060.x"
+pdf_url = ""
+expected_filename = "avramov-chordia-goyal-2006.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "gao-han-li-zhou-2018"
+role = "primary"
+strategies = ["market-intraday-momentum"]
+title = "Market Intraday Momentum"
+authors = ["Lei Gao", "Yufeng Han", "Sophia Zhengzi Li", "Guofu Zhou"]
+year = 2018
+doi = "10.1016/j.jfineco.2018.05.009"
+doi_url = "https://doi.org/10.1016/j.jfineco.2018.05.009"
+landing_url = "https://doi.org/10.1016/j.jfineco.2018.05.009"
+pdf_url = ""
+expected_filename = "gao-han-li-zhou-2018.pdf"
+brief_pdf = "briefs/market-intraday-momentum.ru.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "heston-korajczyk-sadka-2010"
+role = "primary"
+strategies = ["intraday-same-clock"]
+title = "Intraday Patterns in the Cross-Section of Stock Returns"
+authors = ["Steven L. Heston", "Robert A. Korajczyk", "Ronnie Sadka"]
+year = 2010
+doi = "10.1111/j.1540-6261.2010.01573.x"
+doi_url = "https://doi.org/10.1111/j.1540-6261.2010.01573.x"
+landing_url = "https://arxiv.org/abs/1005.3535"
+pdf_url = "https://arxiv.org/pdf/1005.3535"
+expected_filename = "heston-korajczyk-sadka-2010.pdf"
+brief_pdf = "briefs/intraday-same-clock.ru.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "ang-hodrick-xing-zhang-2006"
+role = "primary"
+strategies = ["low-volatility"]
+title = "The Cross-Section of Volatility and Expected Returns"
+authors = ["Andrew Ang", "Robert J. Hodrick", "Yuhang Xing", "Xiaoyan Zhang"]
+year = 2006
+doi = "10.1111/j.1540-6261.2006.00836.x"
+doi_url = "https://doi.org/10.1111/j.1540-6261.2006.00836.x"
+landing_url = "https://doi.org/10.1111/j.1540-6261.2006.00836.x"
+pdf_url = "https://www.ruf.rice.edu/~yxing/vol.pdf"
+expected_filename = "ang-hodrick-xing-zhang-2006.pdf"
+brief_pdf = "briefs/low-volatility.ru.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "blitz-van-vliet-2007"
+role = "primary"
+strategies = ["low-volatility"]
+title = "The Volatility Effect: Lower Risk without Lower Return"
+authors = ["David Blitz", "Pim van Vliet"]
+year = 2007
+doi = "10.3905/jpm.2007.698039"
+doi_url = "https://doi.org/10.3905/jpm.2007.698039"
+landing_url = "https://repub.eur.nl/pub/10460"
+pdf_url = "https://repub.eur.nl/pub/10460/ERS-2007-044-F%26A.pdf"
+expected_filename = "blitz-van-vliet-2007.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.pm-research.com/content/copyright-permissions"
+
+[[paper]]
+id = "frazzini-pedersen-2014"
+role = "primary"
+strategies = ["betting-against-beta"]
+title = "Betting Against Beta"
+authors = ["Andrea Frazzini", "Lasse Heje Pedersen"]
+year = 2014
+doi = "10.1016/j.jfineco.2013.10.005"
+doi_url = "https://doi.org/10.1016/j.jfineco.2013.10.005"
+landing_url = "https://www.aqr.com/Insights/Research/Journal-Article/Betting-Against-Beta"
+pdf_url = "https://pages.stern.nyu.edu/~afrazzin/pdf/Betting%20Against%20Beta%20-%20Frazzini%20and%20Pedersen.pdf"
+expected_filename = "frazzini-pedersen-2014.pdf"
+brief_pdf = "briefs/betting-against-beta.ru.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "novy-marx-velikov-2022"
+role = "critique"
+strategies = ["betting-against-beta"]
+title = "Betting Against Betting Against Beta"
+authors = ["Robert Novy-Marx", "Mihail Velikov"]
+year = 2022
+doi = "10.1016/j.jfineco.2021.05.023"
+doi_url = "https://doi.org/10.1016/j.jfineco.2021.05.023"
+landing_url = "https://doi.org/10.1016/j.jfineco.2021.05.023"
+pdf_url = ""
+expected_filename = "novy-marx-velikov-2022.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "maillard-roncalli-teiletche-2010"
+role = "primary"
+strategies = ["equal-risk-contribution"]
+title = "The Properties of Equally Weighted Risk Contribution Portfolios"
+authors = ["Sebastien Maillard", "Thierry Roncalli", "Jerome Teiletche"]
+year = 2010
+doi = "10.3905/jpm.2010.36.4.060"
+doi_url = "https://doi.org/10.3905/jpm.2010.36.4.060"
+landing_url = "https://doi.org/10.3905/jpm.2010.36.4.060"
+pdf_url = "https://www.thierry-roncalli.com/download/erc.pdf"
+expected_filename = "maillard-roncalli-teiletche-2010.pdf"
+brief_pdf = "briefs/equal-risk-contribution.ru.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.pm-research.com/content/copyright-permissions"
+
+[[paper]]
+id = "anderson-bianchi-goldberg-2012"
+role = "critique"
+strategies = ["equal-risk-contribution"]
+title = "Will My Risk Parity Strategy Outperform?"
+authors = ["Robert M. Anderson", "Stephen W. Bianchi", "Lisa R. Goldberg"]
+year = 2012
+doi = "10.2469/faj.v68.n6.7"
+doi_url = "https://doi.org/10.2469/faj.v68.n6.7"
+landing_url = "https://doi.org/10.2469/faj.v68.n6.7"
+pdf_url = ""
+expected_filename = "anderson-bianchi-goldberg-2012.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://rpc.cfainstitute.org/en/about-rpc/copyright-and-permissions"
+
+[[paper]]
+id = "moreira-muir-2017"
+role = "primary"
+strategies = ["volatility-managed"]
+title = "Volatility-Managed Portfolios"
+authors = ["Alan Moreira", "Tyler Muir"]
+year = 2017
+doi = "10.1111/jofi.12513"
+doi_url = "https://doi.org/10.1111/jofi.12513"
+landing_url = "https://www.nber.org/papers/w22208"
+pdf_url = "https://www.nber.org/system/files/working_papers/w22208/w22208.pdf"
+expected_filename = "moreira-muir-2017.pdf"
+brief_pdf = "briefs/volatility-managed.ru.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-NBER-Personal-Use"
+license_url = "https://www.nber.org/subscribe/information-libraries"
+
+[[paper]]
+id = "cederburg-odoherty-wang-yan-2020"
+role = "critique"
+strategies = ["volatility-managed"]
+title = "On the Performance of Volatility-Managed Portfolios"
+authors = ["Scott Cederburg", "Michael S. O'Doherty", "Feifei Wang", "Xuemin Yan"]
+year = 2020
+doi = "10.1016/j.jfineco.2020.04.015"
+doi_url = "https://doi.org/10.1016/j.jfineco.2020.04.015"
+landing_url = "https://doi.org/10.1016/j.jfineco.2020.04.015"
+pdf_url = ""
+expected_filename = "cederburg-odoherty-wang-yan-2020.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "hou-xue-zhang-2020"
+role = "context"
+strategies = ["all"]
+title = "Replicating Anomalies"
+authors = ["Kewei Hou", "Chen Xue", "Lu Zhang"]
+year = 2020
+doi = "10.1093/rfs/hhy131"
+doi_url = "https://doi.org/10.1093/rfs/hhy131"
+landing_url = "https://doi.org/10.1093/rfs/hhy131"
+pdf_url = ""
+expected_filename = "hou-xue-zhang-2020.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://academic.oup.com/pages/standard-publication-reuse-rights"
+
+[[paper]]
+id = "nnadi-tanna-2019"
+role = "context"
+strategies = ["cross-sectional-momentum", "short-term-reversal"]
+title = "Accounting Analyses of Momentum and Contrarian Strategies in Emerging Markets"
+authors = ["Matthias Nnadi", "Sailesh Tanna"]
+year = 2019
+doi = "10.1080/16081625.2017.1284596"
+doi_url = "https://doi.org/10.1080/16081625.2017.1284596"
+landing_url = "https://pureportal.coventry.ac.uk/en/publications/accounting-analyses-of-momentum-and-contrarian-strategies-in-emer-2/"
+pdf_url = "https://pureportal.coventry.ac.uk/files/23712691/Binder1.pdf"
+expected_filename = "nnadi-tanna-2019.pdf"
+retrieval = "manual"
+redistribution = "noncommercial-personal-study-only"
+license_spdx = "CC-BY-NC-4.0"
+license_url = "https://creativecommons.org/licenses/by-nc/4.0/"
+
+[[paper]]
+id = "nazarova-leshchev-2023"
+role = "context"
+strategies = ["cross-sectional-momentum", "intermediate-momentum", "short-term-reversal"]
+title = "Study of the Momentum Effect in the Price Dynamics of Highly Liquid Shares on the Russian Securities Market"
+authors = ["Varvara V. Nazarova", "Sergei I. Leshchev"]
+year = 2023
+doi = "10.31107/2075-1990-2023-1-58-73"
+doi_url = "https://doi.org/10.31107/2075-1990-2023-1-58-73"
+landing_url = "https://www.finjournal-nifi.ru/en/archive/2023/1"
+pdf_url = "https://www.finjournal-nifi.ru/images/FILES/Journal/Archive/2023/1/statii/04_1_2023_v15.pdf"
+expected_filename = "nazarova-leshchev-2023.pdf"
+retrieval = "personal-fetch"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.finjournal-nifi.ru/en/"

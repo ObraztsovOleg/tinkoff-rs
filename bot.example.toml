@@ -1,0 +1,25 @@
+contour = "sandbox"
+account_id = "replace-with-dedicated-sandbox-account-id"
+# Считайте strategy_id идентификатором неизменяемой конфигурации. После изменения
+# universe, состава/порядка strategies, signal_weight, kind или параметров задайте новый ID.
+strategy_id = "moving-average-ensemble"
+app_name = "ObraztsovOleg.tinkoff-rs.bot"
+database_connections = 5
+
+[risk]
+budget_rub = "30000.00"
+daily_loss_percent = "5.0"
+max_drawdown_percent = "25.0"
+
+[[universe]]
+uid = "replace-with-moex-instrument-uid-1"
+
+[[universe]]
+uid = "replace-with-moex-instrument-uid-2"
+
+[[strategies]]
+signal_weight = "1.0"
+kind = "moving-average-trend"
+fast_window = 50
+slow_window = 200
+band_percent = "1.0"

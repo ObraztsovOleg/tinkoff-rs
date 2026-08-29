@@ -1,0 +1,31 @@
+contour = "sandbox"
+account_id = "REPLACE_WITH_DEDICATED_SANDBOX_ACCOUNT_ID"
+strategy_id = "example-volatility-managed-ensemble-v2"
+app_name = "YourName.tinkoff-rs.strategies"
+database_connections = 5
+
+[risk]
+budget_rub = "30000.00"
+daily_loss_percent = "5.0"
+max_drawdown_percent = "25.0"
+
+# Volatility-managed requires at least four instruments.
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_01"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_02"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_03"
+group = "tradable"
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_04"
+group = "tradable"
+
+[[strategies]]
+signal_weight = "1.0"
+kind = "volatility-managed"
+realized_variance_days = 21
+target_annual_volatility_percent = "20.0"
+max_leverage = "2.0"

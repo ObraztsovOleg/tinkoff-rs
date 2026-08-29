@@ -39,6 +39,14 @@ service UsersService { /*С помощью сервиса можно получ�
   //CurrencyTransfer — перевод денежных средств между счетами
   //Перевести денежные средства между брокерскими счетами
   rpc CurrencyTransfer(CurrencyTransferRequest) returns (CurrencyTransferResponse);
+
+  //PayIn — пополнение брокерского счета
+  //Пополнить брокерский счёт с банковского
+  rpc PayIn(PayInRequest) returns (PayInResponse);
+
+  //GetAccountValues — дополнительные показатели счетов
+  //Метод предназначен для получения дополнительных показателей счетов
+  rpc GetAccountValues(GetAccountValuesRequest) returns (GetAccountValuesResponse);
 }
 
 //Запрос получения счетов пользователя.
@@ -86,6 +94,7 @@ enum AccountType {
   ACCOUNT_TYPE_INVEST_FUND = 4; //Фонд денежного рынка.
   ACCOUNT_TYPE_DEBIT = 5; //Дебетовый карточный счeт.
   ACCOUNT_TYPE_SAVING = 6; //Накопительный счeт.
+  ACCOUNT_TYPE_DFA = 7; //Смарт-счет.
 }
 
 //Статус счeта.
@@ -124,6 +133,9 @@ message GetMarginAttributesResponse {
 
   // Скорректированная маржа. Начальная маржа, в которой плановые позиции рассчитываются с учeтом активных заявок на покупку позиций лонг или продажу позиций шорт.
   MoneyValue corrected_margin = 6;
+
+  // Размер гарантийного обеспечения, заблокированного под фьючерсы.
+  MoneyValue guarantee_for_futures = 7;
 }
 
 //Запрос текущих лимитов пользователя.
@@ -199,4 +211,39 @@ message CurrencyTransferRequest {
 
 message CurrencyTransferResponse {
 
+}
+
+message PayInRequest {
+  string from_account_id = 1 [(google.api.field_behavior) = REQUIRED]; // Номер счета списания.
+  string to_account_id = 2 [(google.api.field_behavior) = REQUIRED]; // Номер брокерского счета зачисления.
+  MoneyValue amount = 3 [(google.api.field_behavior) = REQUIRED]; // Сумма перевода с указанием валюты.
+}
+
+message PayInResponse {
+
+}
+
+enum AccountValue {
+  ACCOUNT_VALUE_UNSPECIFIED = 0; // Не определён.
+  ACCOUNT_VALUE_MARGIN_FEE = 1; // Размер комиссии за маржинальное кредитование.
+  ACCOUNT_VALUE_AMOUNT_WITHOUT_EXTRA_FEE = 2; // Остаток доступного лимита с текущей комиссией.
+}
+
+message GetAccountValuesRequest {
+  repeated string accounts = 1; // Массив счетов пользователя.
+  repeated AccountValue values = 2; // Массив запрашиваемых параметров.
+}
+
+message GetAccountValuesResponse {
+  repeated AccountValuesWithParameters accounts = 1; // Массив счетов с параметрами.
+}
+
+message AccountValuesWithParameters {
+  string account_id = 1; // Номер счета.
+  repeated InstrumentParameter values = 2; // Массив параметров инструмента.
+}
+
+message InstrumentParameter {
+  AccountValue name = 1; // Тип запрашиваемого параметра.
+  MoneyValue value = 2; // Значение запрашиваемого параметра.
 }

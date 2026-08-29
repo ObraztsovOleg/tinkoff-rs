@@ -1,0 +1,21 @@
+contour = "sandbox"
+account_id = "REPLACE_WITH_DEDICATED_SANDBOX_ACCOUNT_ID"
+strategy_id = "example-market-intraday-momentum-ensemble-v2"
+app_name = "YourName.tinkoff-rs.strategies"
+database_connections = 5
+
+[risk]
+budget_rub = "30000.00"
+daily_loss_percent = "5.0"
+max_drawdown_percent = "25.0"
+
+# This strategy requires exactly one liquid benchmark-like instrument.
+[[universe]]
+uid = "REPLACE_WITH_LIQUID_MOEX_BENCHMARK_UID"
+group = "tradable"
+
+[[strategies]]
+signal_weight = "1.0"
+kind = "market-intraday-momentum"
+opening_window_minutes = 30
+final_window_minutes = 30
