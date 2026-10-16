@@ -29,3 +29,4 @@ kind = "volatility-managed"
 realized_variance_days = 21
 target_annual_volatility_percent = "20.0"
 max_leverage = "2.0"
+# Формула может запросить 2.0, но long-only target ограничен hard net-limit 1.0.

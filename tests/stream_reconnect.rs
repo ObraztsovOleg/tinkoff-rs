@@ -4,7 +4,7 @@ use futures::{Stream, StreamExt};
 use secrecy::SecretString;
 use tinkoff_rs::{
     ProductionApi,
-    domain::{AccountId, InstrumentId},
+    domain::{AccountId, CandleInterval, InstrumentId},
     proto,
     stream::{
         MarketDataSubscription, StreamConfig, operations_stream, order_state_stream,
@@ -13,7 +13,7 @@ use tinkoff_rs::{
 };
 use tokio::{
     net::TcpListener,
-    sync::oneshot,
+    sync::{Notify, mpsc, oneshot},
     time::{sleep, timeout},
 };
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -40,6 +40,9 @@ where
 struct MockMarketStream {
     calls: std::sync::atomic::AtomicUsize,
     restored_subscriptions: std::sync::atomic::AtomicUsize,
+    disconnect: Arc<Notify>,
+    reconnected: Arc<Notify>,
+    acknowledge: Arc<Notify>,
 }
 
 #[tonic::async_trait]
@@ -64,7 +67,7 @@ impl proto::market_data_stream_service_server::MarketDataStreamService for MockM
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("market stream omitted subscription"))?;
-        let Some(proto::market_data_request::Payload::SubscribeInfoRequest(subscription)) =
+        let Some(proto::market_data_request::Payload::SubscribeCandlesRequest(subscription)) =
             second.payload
         else {
             return Err(Status::invalid_argument("unexpected market subscription"));
@@ -72,7 +75,49 @@ impl proto::market_data_stream_service_server::MarketDataStreamService for MockM
         assert_eq!(subscription.instruments[0].instrument_id, "instrument-uid");
         self.restored_subscriptions
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(Response::new(reconnecting(&self.calls)))
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ack = proto::MarketDataResponse {
+            payload: Some(
+                proto::market_data_response::Payload::SubscribeCandlesResponse(
+                    proto::SubscribeCandlesResponse {
+                        candles_subscriptions: vec![proto::CandleSubscription {
+                            instrument_uid: "instrument-uid".to_owned(),
+                            interval: subscription.instruments[0].interval,
+                            waiting_close: subscription.waiting_close,
+                            subscription_action: proto::SubscriptionAction::Subscribe as i32,
+                            subscription_status: proto::SubscriptionStatus::Success as i32,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ),
+            ),
+        };
+        let disconnect = self.disconnect.clone();
+        let reconnected = self.reconnected.clone();
+        let acknowledge = self.acknowledge.clone();
+        let (sender, receiver) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let _requests = requests;
+            if call > 0 {
+                reconnected.notify_one();
+                tokio::select! {
+                    biased;
+                    () = sender.closed() => return,
+                    () = acknowledge.notified() => {},
+                }
+            }
+            sender.send(Ok(ack)).await.expect("ack receiver");
+            if call == 0 {
+                disconnect.notified().await;
+                let _ = sender
+                    .send(Err(Status::unavailable("force reconnect")))
+                    .await;
+            } else {
+                sender.closed().await;
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
     async fn market_data_server_side_stream(
@@ -206,24 +251,50 @@ async fn restores_market_orders_portfolio_positions_and_operations_streams() {
     let raw = api.raw();
     let account = AccountId::new("account").expect("account id");
 
-    let mut market_stream = tinkoff_rs::stream::market_data_stream(
+    let market_stream = tinkoff_rs::stream::market_data_stream(
         raw.market_data_stream(),
         vec![
-            MarketDataSubscription::info(vec![
-                InstrumentId::new("instrument-uid").expect("instrument id"),
-            ])
+            MarketDataSubscription::candles(
+                vec![InstrumentId::new("instrument-uid").expect("instrument id")],
+                CandleInterval::OneDay,
+            )
             .expect("subscription"),
         ],
         test_config(),
     )
     .expect("market stream");
-    for _ in 0..2 {
-        timeout(Duration::from_secs(2), market_stream.events.next())
+    market_stream
+        .handle
+        .wait_ready(Duration::from_secs(2))
+        .await
+        .expect("initial acknowledgement");
+    assert!(market_stream.handle.is_ready());
+    market.disconnect.notify_one();
+    timeout(Duration::from_secs(2), market.reconnected.notified())
+        .await
+        .expect("reconnected");
+    assert!(!market_stream.handle.is_ready());
+    assert!(
+        market_stream
+            .handle
+            .wait_ready(Duration::from_millis(20))
             .await
-            .expect("market stream did not reconnect")
-            .expect("market stream ended")
-            .expect("market event");
-    }
+            .is_err()
+    );
+    // A connection without acknowledgements must itself be replaced. Keeping
+    // the socket open must never let the runtime silently become ready.
+    timeout(Duration::from_secs(20), market.reconnected.notified())
+        .await
+        .expect("missing acknowledgements must trigger another connection");
+    assert!(!market_stream.handle.is_ready());
+    assert!(market.calls.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    market.acknowledge.notify_waiters();
+    market_stream
+        .handle
+        .wait_ready(Duration::from_secs(2))
+        .await
+        .expect("new acknowledgement after reconnect");
+    assert!(market_stream.handle.is_ready());
 
     let mut order_stream =
         order_state_stream(raw.orders_stream(), vec![account.clone()], test_config())

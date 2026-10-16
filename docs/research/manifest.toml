@@ -274,8 +274,8 @@ authors = ["Lei Gao", "Yufeng Han", "Sophia Zhengzi Li", "Guofu Zhou"]
 year = 2018
 doi = "10.1016/j.jfineco.2018.05.009"
 doi_url = "https://doi.org/10.1016/j.jfineco.2018.05.009"
-landing_url = "https://doi.org/10.1016/j.jfineco.2018.05.009"
-pdf_url = ""
+landing_url = "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2440866"
+pdf_url = "https://papers.ssrn.com/sol3/Delivery.cfm/SSRN_ID2585766_code16976.pdf?abstractid=2552752&mirid=1"
 expected_filename = "gao-han-li-zhou-2018.pdf"
 brief_pdf = "briefs/market-intraday-momentum.ru.pdf"
 retrieval = "manual"

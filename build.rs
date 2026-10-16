@@ -21,6 +21,9 @@ const CONTRACTS: &[&str] = &[
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // sqlx::migrate! embeds the directory at compile time. Track additions too,
+    // otherwise an incremental build can silently omit a new migration file.
+    println!("cargo:rerun-if-changed=migrations");
     // Vendored protoc обеспечивает одинаковую сборку без системной установки.
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
     let include = protoc_bin_vendored::include_path()?;

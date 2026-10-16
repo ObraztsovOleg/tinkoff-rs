@@ -17,8 +17,20 @@ use crate::{
         AccountId, Candle, CandleInterval, ExecutionFill, InstrumentId, OrderIntent, OrderStatus,
         OrderUpdate, StrategyId,
     },
-    engine::{AccountRiskState, RebalanceBatch, RebalanceBatchStatus},
+    engine::{AccountRiskState, PORTFOLIO_RUNTIME_VERSION, RebalanceBatch, RebalanceBatchStatus},
 };
+
+/// Durable-состояние одной ноги между планированием и исполнением.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BatchExecutionGate {
+    /// The current controller permits execution.
+    #[default]
+    Ready,
+    /// A durable plan awaits operator approval; no leg may be submitted.
+    Hold,
+    /// Reconcile existing requests, but never submit or resubmit any leg.
+    Cancel,
+}
 
 /// Durable-состояние одной ноги между планированием и исполнением.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +65,12 @@ impl IntentStatus {
             Self::Uncertain => "uncertain",
         }
     }
+
+    /// Терминальный intent больше никогда не должен возвращаться в состояние,
+    /// из которого executor способен повторно отправить заявку.
+    const fn is_terminal(self) -> bool {
+        matches!(self, Self::Filled | Self::Cancelled | Self::Rejected)
+    }
 }
 
 /// Сохранённый intent вместе с его текущим durable-статусом.
@@ -70,8 +88,8 @@ pub struct StoredIntent {
 pub trait Storage: Send + Sync {
     /// Регистрирует strategy ID за конкретными account и kind.
     ///
-    /// Повторная регистрация обновляет config только при совпадении владельца и
-    /// типа; использовать тот же ID для другой стратегии нельзя.
+    /// Повторная регистрация допустима только при точном совпадении владельца,
+    /// типа и immutable config; любое изменение требует нового strategy ID.
     async fn register_portfolio_strategy(
         &self,
         strategy_id: &StrategyId,
@@ -100,9 +118,21 @@ pub trait Storage: Send + Sync {
         risk_state: Option<&AccountRiskState>,
     ) -> Result<bool>;
 
+    /// Atomically commits a batch of warmup markers and the final strategy state.
+    /// No targets, intents or risk changes can be included. A duplicate rolls back the whole batch.
+    async fn commit_warmup(
+        &self,
+        _strategy_id: &StrategyId,
+        _event_ids: &[String],
+        _state: &Value,
+    ) -> Result<bool> {
+        Err(Error::UnsupportedCapability("batched warmup persistence"))
+    }
+
     /// Загружает durable risk-state выделенного счёта.
     async fn load_risk_state(&self, account_id: &AccountId) -> Result<Option<AccountRiskState>>;
-    /// Сохраняет risk-state отдельно, например после периодической переоценки/reset.
+    /// Сохраняет risk-state отдельно после периодической переоценки.
+    /// Обычный save не меняет owner или epoch; reset использует отдельный CAS.
     async fn save_risk_state(&self, state: &AccountRiskState) -> Result<()>;
     /// Загружает метаданные одного batch.
     async fn load_batch(&self, batch_id: Uuid) -> Result<Option<RebalanceBatch>>;
@@ -116,6 +146,12 @@ pub trait Storage: Send + Sync {
         account_id: &AccountId,
         strategy_id: &StrategyId,
     ) -> Result<Vec<Uuid>>;
+    /// Проверяет все незавершённые batch-и счёта независимо от прежнего owner.
+    ///
+    /// Account-wide проверка нужна перед передачей risk epoch другому
+    /// `strategy_id`: исторический batch старого владельца нельзя потерять только
+    /// потому, что новый runtime фильтрует recovery по собственному ID.
+    async fn has_unfinished_batches(&self, account_id: &AccountId) -> Result<bool>;
     /// Меняет durable-стадию batch и необязательную причину остановки.
     async fn set_batch_status(
         &self,
@@ -129,6 +165,11 @@ pub trait Storage: Send + Sync {
     /// `true` означает, что вызывающий worker получил исключительное право на
     /// первичную отправку. Для любого другого исходного статуса возвращает false.
     async fn claim_intent(&self, intent_id: Uuid) -> Result<bool>;
+
+    /// Latest durable operator decision, checked on recovery as well as submission.
+    async fn batch_execution_gate(&self, _batch_id: Uuid) -> Result<BatchExecutionGate> {
+        Ok(BatchExecutionGate::Ready)
+    }
     /// Проверяет незавершённую заявку по счёту и инструменту.
     async fn has_pending_order(
         &self,
@@ -137,9 +178,16 @@ pub trait Storage: Send + Sync {
     ) -> Result<bool>;
     /// Проверяет наличие любой незавершённой/неопределённой заявки счёта.
     async fn has_pending_orders(&self, account_id: &AccountId) -> Result<bool>;
+    /// Атомарно отклоняет только ещё не захваченную ногу `Pending → Rejected`.
+    ///
+    /// Возвращает `false`, если другой worker уже начал отправку либо intent не
+    /// существует. Этот CAS используется при подавлении просроченных openings.
+    async fn reject_pending_intent(&self, intent_id: Uuid, reason: &str) -> Result<bool>;
     /// Терминально отклоняет intent с аудируемой причиной.
+    /// Уже терминальный intent остаётся неизменным.
     async fn reject_intent(&self, intent_id: Uuid, reason: &str) -> Result<()>;
     /// Помечает исход заявки неопределённым до reconciliation.
+    /// Уже терминальный intent остаётся неизменным.
     async fn mark_uncertain(&self, intent_id: Uuid, reason: &str) -> Result<()>;
     /// Атомарно сохраняет broker update и синхронизирует статус intent.
     async fn record_order_update(&self, intent_id: Uuid, update: &OrderUpdate) -> Result<()>;
@@ -169,6 +217,14 @@ struct MemoryState {
     orders: HashMap<Uuid, OrderUpdate>,
     candles: HashMap<(InstrumentId, CandleInterval, chrono::DateTime<chrono::Utc>), Candle>,
     fills: HashMap<String, ExecutionFill>,
+    batch_gates: HashMap<Uuid, BatchExecutionGate>,
+}
+
+impl MemoryStorage {
+    /// Set a control decision for deterministic execution tests and embedded users.
+    pub async fn set_batch_execution_gate(&self, id: Uuid, gate: BatchExecutionGate) {
+        self.inner.lock().await.batch_gates.insert(id, gate);
+    }
 }
 
 #[async_trait]
@@ -197,9 +253,12 @@ impl Storage for MemoryStorage {
                     "strategy `{strategy_id}` is registered with kind `{stored_kind}`"
                 )));
             }
-            Some((_, _, stored_config)) => {
-                *stored_config = config.clone();
+            Some((_, _, stored_config)) if stored_config != config => {
+                return Err(Error::Storage(format!(
+                    "strategy `{strategy_id}` configuration changed; use a new strategy_id"
+                )));
             }
+            Some((_, _, _)) => {}
             None => {
                 inner.strategies.insert(
                     strategy_id.clone(),
@@ -236,15 +295,11 @@ impl Storage for MemoryStorage {
         // Mutex удерживается до завершения всех insert-ов: для MemoryStorage это
         // эквивалент одной транзакции PostgreSQL в части атомарной видимости.
         let mut inner = self.inner.lock().await;
-        if risk_state.is_some_and(|risk| {
-            inner
-                .risk_states
-                .get(&risk.account_id)
-                .is_some_and(|existing| existing.strategy_id != risk.strategy_id)
-        }) {
-            return Err(Error::Storage(
-                "account risk state is owned by another strategy".to_owned(),
-            ));
+        if let Some(risk) = risk_state {
+            validate_risk_state_version(risk)?;
+            if let Some(existing) = inner.risk_states.get(&risk.account_id) {
+                validate_matching_risk_epoch(existing, risk)?;
+            }
         }
         // Marker проверяется до изменения state/batch, обеспечивая exactly-once
         // применение события в пределах этого storage.
@@ -256,6 +311,23 @@ impl Storage for MemoryStorage {
             return Err(Error::Storage(format!(
                 "portfolio strategy `{strategy_id}` is not registered"
             )));
+        }
+        if let Some(batch) = batch {
+            // Один account/strategy может иметь лишь один незавершённый batch.
+            // Иначе два полных target-а начнут спорить за одни и те же позиции.
+            let unfinished_exists = inner.batches.values().any(|(stored, _)| {
+                stored.account_id == batch.account_id
+                    && !matches!(
+                        stored.status,
+                        RebalanceBatchStatus::Completed | RebalanceBatchStatus::Failed
+                    )
+            });
+            if unfinished_exists {
+                return Err(Error::Storage(format!(
+                    "account `{}` already has an unfinished rebalance batch",
+                    batch.account_id
+                )));
+            }
         }
         inner.processed_events.insert(event_key);
         inner
@@ -277,20 +349,43 @@ impl Storage for MemoryStorage {
         Ok(true)
     }
 
+    async fn commit_warmup(
+        &self,
+        strategy_id: &StrategyId,
+        event_ids: &[String],
+        state: &Value,
+    ) -> Result<bool> {
+        let mut inner = self.inner.lock().await;
+        if !inner.strategies.contains_key(strategy_id) {
+            return Err(Error::Storage(
+                "warmup strategy is not registered".to_owned(),
+            ));
+        }
+        let keys = event_ids
+            .iter()
+            .map(|id| (strategy_id.clone(), id.clone()))
+            .collect::<HashSet<_>>();
+        if keys.len() != event_ids.len()
+            || keys.iter().any(|key| inner.processed_events.contains(key))
+        {
+            return Ok(false);
+        }
+        inner.processed_events.extend(keys);
+        inner
+            .strategy_states
+            .insert(strategy_id.clone(), state.clone());
+        Ok(true)
+    }
+
     async fn load_risk_state(&self, account_id: &AccountId) -> Result<Option<AccountRiskState>> {
         Ok(self.inner.lock().await.risk_states.get(account_id).cloned())
     }
 
     async fn save_risk_state(&self, state: &AccountRiskState) -> Result<()> {
+        validate_risk_state_version(state)?;
         let mut inner = self.inner.lock().await;
-        if inner
-            .risk_states
-            .get(&state.account_id)
-            .is_some_and(|existing| existing.strategy_id != state.strategy_id)
-        {
-            return Err(Error::Storage(
-                "account risk state is owned by another strategy".to_owned(),
-            ));
+        if let Some(existing) = inner.risk_states.get(&state.account_id) {
+            validate_matching_risk_epoch(existing, state)?;
         }
         inner
             .risk_states
@@ -350,6 +445,16 @@ impl Storage for MemoryStorage {
         Ok(ids)
     }
 
+    async fn has_unfinished_batches(&self, account_id: &AccountId) -> Result<bool> {
+        Ok(self.inner.lock().await.batches.values().any(|(batch, _)| {
+            &batch.account_id == account_id
+                && !matches!(
+                    batch.status,
+                    RebalanceBatchStatus::Completed | RebalanceBatchStatus::Failed
+                )
+        }))
+    }
+
     async fn set_batch_status(
         &self,
         batch_id: Uuid,
@@ -362,6 +467,23 @@ impl Storage for MemoryStorage {
                 "rebalance batch `{batch_id}` was not found"
             )));
         };
+        // Поздний worker не имеет права вернуть завершённый batch в recoverable
+        // состояние. Повтор того же terminal результата идемпотентен, а попытка
+        // объявить Failed как Completed (или наоборот) является конфликтом.
+        if matches!(
+            batch.status,
+            RebalanceBatchStatus::Completed | RebalanceBatchStatus::Failed
+        ) {
+            return if batch.status == status {
+                Ok(())
+            } else {
+                Err(Error::Storage(format!(
+                    "rebalance batch `{batch_id}` is already terminal as `{}` and cannot become `{}`",
+                    batch.status.as_str(),
+                    status.as_str()
+                )))
+            };
+        }
         batch.status = status;
         *stored_reason = reason.map(str::to_owned);
         Ok(())
@@ -369,6 +491,17 @@ impl Storage for MemoryStorage {
 
     async fn claim_intent(&self, intent_id: Uuid) -> Result<bool> {
         let mut inner = self.inner.lock().await;
+        if let Some((intent, _, _)) = inner.intents.get(&intent_id) {
+            if inner
+                .batch_gates
+                .get(&intent.batch_id)
+                .copied()
+                .unwrap_or_default()
+                != BatchExecutionGate::Ready
+            {
+                return Ok(false);
+            }
+        }
         let Some((_, status, _)) = inner.intents.get_mut(&intent_id) else {
             return Ok(false);
         };
@@ -379,6 +512,17 @@ impl Storage for MemoryStorage {
         }
         *status = IntentStatus::Submitting;
         Ok(true)
+    }
+
+    async fn batch_execution_gate(&self, batch_id: Uuid) -> Result<BatchExecutionGate> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .batch_gates
+            .get(&batch_id)
+            .copied()
+            .unwrap_or_default())
     }
 
     async fn has_pending_order(
@@ -424,29 +568,75 @@ impl Storage for MemoryStorage {
             }))
     }
 
+    async fn reject_pending_intent(&self, intent_id: Uuid, reason: &str) -> Result<bool> {
+        let mut inner = self.inner.lock().await;
+        let Some((_, status, stored_reason)) = inner.intents.get_mut(&intent_id) else {
+            return Ok(false);
+        };
+        // Тот же mutex делает проверку и переход единым CAS: после
+        // Pending→Submitting этот метод уже не имеет права отменять ногу.
+        if *status != IntentStatus::Pending {
+            return Ok(false);
+        }
+        *status = IntentStatus::Rejected;
+        *stored_reason = Some(reason.to_owned());
+        Ok(true)
+    }
+
     async fn reject_intent(&self, intent_id: Uuid, reason: &str) -> Result<()> {
         let mut inner = self.inner.lock().await;
-        set_memory_intent_status(&mut inner, intent_id, IntentStatus::Rejected, Some(reason));
+        let Some((_, status, stored_reason)) = inner.intents.get_mut(&intent_id) else {
+            return Err(Error::Storage(format!(
+                "intent `{intent_id}` was not found"
+            )));
+        };
+        // Первый терминальный исход неизменяем: поздняя локальная ошибка не может
+        // превратить подтверждённый Filled/Cancelled в Rejected.
+        if !status.is_terminal() {
+            *status = IntentStatus::Rejected;
+            *stored_reason = Some(reason.to_owned());
+        }
         Ok(())
     }
 
     async fn mark_uncertain(&self, intent_id: Uuid, reason: &str) -> Result<()> {
         let mut inner = self.inner.lock().await;
-        set_memory_intent_status(&mut inner, intent_id, IntentStatus::Uncertain, Some(reason));
+        let Some((_, status, stored_reason)) = inner.intents.get_mut(&intent_id) else {
+            return Err(Error::Storage(format!(
+                "intent `{intent_id}` was not found"
+            )));
+        };
+        // Timeout имеет право уточнить только незавершённую заявку. Терминальное
+        // подтверждение сильнее более поздней сетевой неопределённости.
+        if !status.is_terminal() {
+            *status = IntentStatus::Uncertain;
+            *stored_reason = Some(reason.to_owned());
+        }
         Ok(())
     }
 
     async fn record_order_update(&self, intent_id: Uuid, update: &OrderUpdate) -> Result<()> {
         let mut inner = self.inner.lock().await;
-        set_memory_intent_status(
-            &mut inner,
-            intent_id,
-            status_from_order(update.status),
-            None,
-        );
-        inner
-            .orders
-            .insert(update.request_id.as_uuid(), update.clone());
+        let Some((intent, current_status, _)) = inner.intents.get(&intent_id) else {
+            return Err(Error::Storage(format!(
+                "intent `{intent_id}` was not found"
+            )));
+        };
+        validate_order_update_identity(intent.request_id.as_uuid(), intent.lots, update)?;
+        let current_status = *current_status;
+        let existing = inner.orders.get(&update.request_id.as_uuid());
+        if !should_apply_order_update(current_status, existing, update)? {
+            return Ok(());
+        }
+        let accepted = merge_order_update(existing, update);
+        inner.orders.insert(update.request_id.as_uuid(), accepted);
+        let (_, stored_status, stored_reason) = inner
+            .intents
+            .get_mut(&intent_id)
+            .expect("intent cannot disappear while MemoryStorage mutex is held");
+        *stored_status = status_from_order(update.status);
+        // Свежий broker snapshot заменяет прежнюю локальную timeout/error-причину.
+        *stored_reason = None;
         Ok(())
     }
 
@@ -468,17 +658,135 @@ impl Storage for MemoryStorage {
     }
 }
 
-fn set_memory_intent_status(
-    state: &mut MemoryState,
-    intent_id: Uuid,
-    status: IntentStatus,
-    reason: Option<&str>,
-) {
-    if let Some((_, stored_status, stored_reason)) = state.intents.get_mut(&intent_id) {
-        *stored_status = status;
-        if let Some(reason) = reason {
-            *stored_reason = Some(reason.to_owned());
+fn validate_risk_state_version(state: &AccountRiskState) -> Result<()> {
+    if state.runtime_version != PORTFOLIO_RUNTIME_VERSION {
+        return Err(Error::Storage(format!(
+            "cannot save account risk state with runtime version {}",
+            state.runtime_version
+        )));
+    }
+    Ok(())
+}
+
+fn validate_matching_risk_epoch(
+    existing: &AccountRiskState,
+    replacement: &AccountRiskState,
+) -> Result<()> {
+    if existing.account_id != replacement.account_id
+        || existing.strategy_id != replacement.strategy_id
+        || existing.epoch != replacement.epoch
+    {
+        return Err(Error::Storage(format!(
+            "ordinary risk-state save for account `{}` cannot change owner or epoch (stored strategy `{}`, epoch {}; received strategy `{}`, epoch {})",
+            replacement.account_id,
+            existing.strategy_id,
+            existing.epoch,
+            replacement.strategy_id,
+            replacement.epoch
+        )));
+    }
+    Ok(())
+}
+
+fn validate_order_update_identity(
+    expected_request_id: Uuid,
+    expected_lots: i64,
+    update: &OrderUpdate,
+) -> Result<()> {
+    if update.request_id.as_uuid() != expected_request_id {
+        return Err(Error::Storage(format!(
+            "broker update request_id `{}` does not match intent request_id `{expected_request_id}`",
+            update.request_id
+        )));
+    }
+    if update.lots_requested != expected_lots
+        || update.lots_executed < 0
+        || update.lots_executed > update.lots_requested
+        || (update.status == OrderStatus::Filled && update.lots_executed != update.lots_requested)
+    {
+        return Err(Error::Storage(format!(
+            "broker update for request `{}` has inconsistent lots: intent={}, requested={}, executed={}",
+            update.request_id, expected_lots, update.lots_requested, update.lots_executed
+        )));
+    }
+    Ok(())
+}
+
+/// Определяет, несёт ли broker update монотонно более свежую информацию.
+///
+/// Сравниваются три независимых признака: время наблюдения, число исполненных
+/// лотов и стадия broker status. Регресс хотя бы одного признака отбрасывает весь
+/// update, чтобы строки `orders` и `trade_intents` оставались согласованы.
+fn should_apply_order_update(
+    current_intent_status: IntentStatus,
+    existing: Option<&OrderUpdate>,
+    incoming: &OrderUpdate,
+) -> Result<bool> {
+    let incoming_intent_status = status_from_order(incoming.status);
+    // Terminal→active запрещён. Из terminal-состояний допустимо только более
+    // сильное подтверждение полного fill: Cancelled/Rejected→Filled. Повтор того
+    // же terminal может уточнить exchange_order_id и время наблюдения.
+    if current_intent_status.is_terminal()
+        && (!incoming_intent_status.is_terminal()
+            || (current_intent_status != incoming_intent_status
+                && intent_status_progress(incoming_intent_status)
+                    <= intent_status_progress(current_intent_status)))
+    {
+        return Ok(false);
+    }
+    let Some(existing) = existing else {
+        return Ok(true);
+    };
+    if let (Some(stored), Some(received)) = (
+        existing.exchange_order_id.as_deref(),
+        incoming.exchange_order_id.as_deref(),
+    ) {
+        if stored != received {
+            return Err(Error::Storage(format!(
+                "broker update for request `{}` changed exchange_order_id from `{stored}` to `{received}`",
+                incoming.request_id
+            )));
         }
+    }
+    if existing.lots_requested != incoming.lots_requested {
+        return Err(Error::Storage(format!(
+            "broker update for request `{}` changed lots_requested from {} to {}",
+            incoming.request_id, existing.lots_requested, incoming.lots_requested
+        )));
+    }
+    Ok(existing.observed_at <= incoming.observed_at
+        && existing.lots_executed <= incoming.lots_executed
+        && order_status_progress(existing.status) <= order_status_progress(incoming.status))
+}
+
+/// Сохраняет уже известный exchange order ID, если более свежий ответ его опустил.
+fn merge_order_update(existing: Option<&OrderUpdate>, incoming: &OrderUpdate) -> OrderUpdate {
+    let mut accepted = incoming.clone();
+    if accepted.exchange_order_id.is_none() {
+        accepted.exchange_order_id = existing.and_then(|value| value.exchange_order_id.clone());
+    }
+    accepted
+}
+
+/// Частичный порядок broker status: следующий update не может двигаться назад.
+const fn order_status_progress(status: OrderStatus) -> u8 {
+    match status {
+        OrderStatus::Unknown => 0,
+        OrderStatus::Pending => 1,
+        OrderStatus::New => 2,
+        OrderStatus::PartiallyFilled => 3,
+        OrderStatus::Cancelled | OrderStatus::Rejected => 4,
+        OrderStatus::Filled => 5,
+    }
+}
+
+const fn intent_status_progress(status: IntentStatus) -> u8 {
+    match status {
+        IntentStatus::Pending => 0,
+        IntentStatus::Submitting => 1,
+        IntentStatus::Accepted | IntentStatus::Uncertain => 2,
+        IntentStatus::Cancelled | IntentStatus::Rejected => 3,
+        IntentStatus::Filled => 4,
     }
 }
 
@@ -562,7 +870,11 @@ mod postgres {
     use sqlx::{PgConnection, PgPool, Row, postgres::PgPoolOptions};
     use uuid::Uuid;
 
-    use super::{IntentStatus, Storage, StoredIntent, status_from_order, validate_atomic_payload};
+    use super::{
+        BatchExecutionGate, IntentStatus, Storage, StoredIntent, merge_order_update,
+        should_apply_order_update, status_from_order, validate_atomic_payload,
+        validate_order_update_identity, validate_risk_state_version,
+    };
     use crate::{
         Error, Result,
         domain::{
@@ -578,6 +890,26 @@ mod postgres {
 
     static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+    const BATCH_GATE_SQL: &str = "SELECT CASE \
+        WHEN b.event_id LIKE 'cleanup:%' OR b.event_id LIKE 'risk:%' OR p.revision=-1 THEN 'ready' \
+        WHEN p.status='rejected' THEN 'cancel' \
+        WHEN b.event_id LIKE 'manual:%' THEN 'ready' \
+        WHEN c.enabled=false THEN 'cancel' \
+        WHEN p.revision IS NOT NULL AND p.revision<>c.revision THEN 'cancel' \
+        WHEN (p.status='awaiting' OR p.status='approved') AND (b.target->>'valid_until')::timestamptz <= now() THEN 'cancel' \
+        WHEN p.status='awaiting' OR (c.execution_mode='confirm' AND p.status IS DISTINCT FROM 'approved') THEN 'hold' \
+        ELSE 'ready' END AS gate FROM rebalance_batches b \
+        LEFT JOIN strategy_controls c ON c.strategy_id=b.strategy_id \
+        LEFT JOIN batch_controls p ON p.batch_id=b.id WHERE b.id=$1";
+
+    fn decode_gate(value: &str) -> BatchExecutionGate {
+        match value {
+            "ready" => BatchExecutionGate::Ready,
+            "hold" => BatchExecutionGate::Hold,
+            _ => BatchExecutionGate::Cancel,
+        }
+    }
+
     /// Namespace session advisory lock-а, отделяющий runtime lease от
     /// возможных advisory lock-ов других подсистем в той же БД.
     const RUNTIME_LEASE_NAMESPACE: &[u8] = b"tinkoff-rs:portfolio-runtime:v2:account:";
@@ -585,12 +917,12 @@ mod postgres {
     /// Эксклюзивная session lease одного Sandbox-счёта.
     ///
     /// Объект намеренно удерживает отсоединённый от пула `PgConnection`.
-    /// PostgreSQL освобождает session advisory lock автоматически при
+    /// `PostgreSQL` освобождает session advisory lock автоматически при
     /// закрытии этого соединения, поэтому lease действует ровно до `Drop`.
     #[must_use = "dropping RuntimeLease releases exclusive ownership of the account"]
     pub struct RuntimeLease {
         account_id: AccountId,
-        _connection: PgConnection,
+        connection: PgConnection,
     }
 
     impl RuntimeLease {
@@ -598,6 +930,31 @@ mod postgres {
         #[must_use]
         pub const fn account_id(&self) -> &AccountId {
             &self.account_id
+        }
+
+        /// Проверяет, что session с advisory lock всё ещё жива.
+        ///
+        /// `RuntimeLease` держит отдельное соединение, которое не участвует в
+        /// запросах пула. Без heartbeat серверный `idle_session_timeout` или
+        /// сетевой разрыв мог бы освободить lock незаметно для торгового цикла.
+        /// После ошибки вызывающий runtime обязан прекратить выставление заявок.
+        pub async fn check(&mut self) -> Result<()> {
+            let heartbeat: i32 = sqlx::query_scalar("SELECT 1")
+                .fetch_one(&mut self.connection)
+                .await
+                .map_err(|error| {
+                    Error::LeaseLost(format!(
+                        "runtime lease heartbeat for account `{}` failed; exclusive ownership is no longer proven: {error}",
+                        self.account_id
+                    ))
+                })?;
+            if heartbeat != 1 {
+                return Err(Error::LeaseLost(format!(
+                    "runtime lease heartbeat for account `{}` returned an invalid value; exclusive ownership is no longer proven",
+                    self.account_id
+                )));
+            }
+            Ok(())
         }
     }
 
@@ -648,8 +1005,65 @@ mod postgres {
             }
             Ok(RuntimeLease {
                 account_id: account_id.clone(),
-                _connection: connection,
+                connection,
             })
+        }
+
+        /// Атомарно заменяет risk epoch после уже выполненных `risk-reset`
+        /// проверок пустого счёта и отсутствия заявок.
+        ///
+        /// В отличие от обычного [`Storage::save_risk_state`] этот метод может
+        /// передать счёт новому `strategy_id`. CAS по прежним owner и epoch не
+        /// позволяет перезаписать состояние, изменившееся между чтением и reset.
+        pub async fn replace_risk_state_for_reset(
+            &self,
+            expected_strategy_id: &StrategyId,
+            expected_epoch: Uuid,
+            replacement: &AccountRiskState,
+        ) -> Result<()> {
+            if replacement.runtime_version != PORTFOLIO_RUNTIME_VERSION {
+                return Err(Error::Storage(format!(
+                    "cannot save risk reset with runtime version {}",
+                    replacement.runtime_version
+                )));
+            }
+            // FK проверяет лишь существование strategy_id. Дополнительная
+            // account-проверка не позволяет передать epoch стратегии, которая
+            // была зарегистрирована для другого выделенного счёта.
+            let replacement_owner: Option<String> = sqlx::query_scalar(
+                "SELECT account_id FROM strategy_instances WHERE id=$1 AND runtime_version=2",
+            )
+            .bind(replacement.strategy_id.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+            if replacement_owner.as_deref() != Some(replacement.account_id.as_str()) {
+                return Err(Error::Storage(format!(
+                    "risk reset strategy `{}` is not registered for account `{}`",
+                    replacement.strategy_id, replacement.account_id
+                )));
+            }
+            let changed = sqlx::query(
+                "UPDATE account_risk_state SET strategy_id=$4, epoch=$5, state=$6, \
+                 runtime_version=2, updated_at=$7 WHERE account_id=$1 \
+                 AND strategy_id=$2 AND epoch=$3 AND runtime_version=2",
+            )
+            .bind(replacement.account_id.as_str())
+            .bind(expected_strategy_id.as_str())
+            .bind(expected_epoch)
+            .bind(replacement.strategy_id.as_str())
+            .bind(replacement.epoch)
+            .bind(encode_json(replacement, "account risk state")?)
+            .bind(replacement.updated_at)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            if changed != 1 {
+                return Err(Error::Storage(format!(
+                    "risk reset for account `{}` lost its owner/epoch compare-and-swap",
+                    replacement.account_id
+                )));
+            }
+            Ok(())
         }
 
         /// Применяет встроенные SQL-миграции в правильном порядке.
@@ -662,7 +1076,7 @@ mod postgres {
     }
 
     /// Детерминированно сводит namespace и `account_id` в 64-битный ключ
-    /// PostgreSQL advisory lock. FNV-1a здесь не защищает секреты; он нужен
+    /// `PostgreSQL` advisory lock. FNV-1a здесь не защищает секреты; он нужен
     /// только для стабильного одинакового key в независимых процессах.
     fn runtime_lease_key(account_id: &AccountId) -> i64 {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -689,10 +1103,11 @@ mod postgres {
             let changed = sqlx::query(
                 "INSERT INTO strategy_instances (id, account_id, kind, config, runtime_version) \
                  VALUES ($1, $2, $3, $4, 2) \
-                 ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config, \
-                 updated_at = now() WHERE strategy_instances.runtime_version = 2 \
+                 ON CONFLICT (id) DO UPDATE SET updated_at = now() \
+                 WHERE strategy_instances.runtime_version = 2 \
                  AND strategy_instances.account_id = EXCLUDED.account_id \
-                 AND strategy_instances.kind = EXCLUDED.kind",
+                 AND strategy_instances.kind = EXCLUDED.kind \
+                 AND strategy_instances.config = EXCLUDED.config",
             )
             .bind(strategy_id.as_str())
             .bind(account_id.as_str())
@@ -703,7 +1118,7 @@ mod postgres {
             .rows_affected();
             if changed != 1 {
                 return Err(Error::Storage(format!(
-                    "strategy `{strategy_id}` belongs to legacy runtime version one, another account, or another kind; use a new strategy_id"
+                    "strategy `{strategy_id}` belongs to legacy runtime version one, another account/kind, or another immutable configuration; use a new strategy_id"
                 )));
             }
             Ok(())
@@ -777,6 +1192,24 @@ mod postgres {
                 for intent in intents {
                     insert_intent(&mut transaction, intent).await?;
                 }
+                if risk_state.is_some_and(|risk| risk.blocked.is_some()) {
+                    sqlx::query("INSERT INTO batch_controls(batch_id,status,revision) VALUES($1,'approved',-1)")
+                        .bind(batch.id).execute(&mut *transaction).await?;
+                } else if !event_id.starts_with("manual:")
+                    && !event_id.starts_with("cleanup:")
+                    && !event_id.starts_with("risk:")
+                {
+                    sqlx::query(
+                        "INSERT INTO batch_controls(batch_id,status,revision,preview) \
+                        SELECT $1,'awaiting',revision,$3 FROM strategy_controls \
+                        WHERE strategy_id=$2 AND execution_mode='confirm'",
+                    )
+                    .bind(batch.id)
+                    .bind(strategy_id.as_str())
+                    .bind(serde_json::json!({"target": batch.target, "intents": intents}))
+                    .execute(&mut *transaction)
+                    .await?;
+                }
                 upsert_risk_state(
                     &mut transaction,
                     risk_state.expect("validated matching risk state"),
@@ -787,18 +1220,72 @@ mod postgres {
             Ok(true)
         }
 
+        async fn commit_warmup(
+            &self,
+            strategy_id: &StrategyId,
+            event_ids: &[String],
+            state: &Value,
+        ) -> Result<bool> {
+            let mut transaction = self.pool.begin().await?;
+            let inserted = sqlx::query(
+                "INSERT INTO processed_events (strategy_id,event_id) SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING"
+            ).bind(strategy_id.as_str()).bind(event_ids).execute(&mut *transaction).await?.rows_affected();
+            if inserted != u64::try_from(event_ids.len()).unwrap_or(u64::MAX) {
+                transaction.rollback().await?;
+                return Ok(false);
+            }
+            let updated = sqlx::query(
+                "INSERT INTO strategy_state (strategy_id,state,version,runtime_version) VALUES ($1,$2,1,2) \
+                 ON CONFLICT (strategy_id) DO UPDATE SET state=EXCLUDED.state,version=strategy_state.version+1, \
+                 runtime_version=2,updated_at=now() WHERE strategy_state.runtime_version=2"
+            ).bind(strategy_id.as_str()).bind(state).execute(&mut *transaction).await?.rows_affected();
+            if updated != 1 {
+                return Err(Error::Storage(
+                    "warmup cannot overwrite legacy state".to_owned(),
+                ));
+            }
+            transaction.commit().await?;
+            Ok(true)
+        }
+
         async fn load_risk_state(
             &self,
             account_id: &AccountId,
         ) -> Result<Option<AccountRiskState>> {
             let row = sqlx::query(
-                "SELECT state FROM account_risk_state WHERE account_id = $1 AND runtime_version = 2",
+                "SELECT account_id, strategy_id, epoch, state, runtime_version \
+                 FROM account_risk_state WHERE account_id = $1",
             )
             .bind(account_id.as_str())
             .fetch_optional(&self.pool)
             .await?;
-            row.map(|row| decode_json(row.try_get("state")?, "account risk state"))
-                .transpose()
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let runtime_version: i16 = row.try_get("runtime_version")?;
+            if runtime_version != PORTFOLIO_RUNTIME_VERSION {
+                return Err(Error::Storage(format!(
+                    "risk state for account `{account_id}` uses unsupported runtime version {runtime_version}"
+                )));
+            }
+            let state: AccountRiskState = decode_json(row.try_get("state")?, "account risk state")?;
+            validate_risk_state_version(&state)?;
+            let stored_account: String = row.try_get("account_id")?;
+            let stored_strategy: String = row.try_get("strategy_id")?;
+            let stored_epoch: Uuid = row.try_get("epoch")?;
+            // Реляционные identity-поля служат индексируемым источником истины,
+            // но JSON нужен для полного snapshot. Расхождение означает ручное
+            // повреждение БД и должно остановить runtime, а не сменить владельца.
+            if stored_account != state.account_id.as_str()
+                || stored_account != account_id.as_str()
+                || stored_strategy != state.strategy_id.as_str()
+                || stored_epoch != state.epoch
+            {
+                return Err(Error::Storage(format!(
+                    "risk state identity columns do not match JSON for account `{account_id}`"
+                )));
+            }
+            Ok(Some(state))
         }
 
         async fn save_risk_state(&self, state: &AccountRiskState) -> Result<()> {
@@ -850,6 +1337,17 @@ mod postgres {
                 .collect()
         }
 
+        async fn has_unfinished_batches(&self, account_id: &AccountId) -> Result<bool> {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM rebalance_batches WHERE account_id = $1 \
+                 AND status NOT IN ('completed', 'failed'))",
+            )
+            .bind(account_id.as_str())
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(exists)
+        }
+
         async fn set_batch_status(
             &self,
             batch_id: Uuid,
@@ -857,7 +1355,8 @@ mod postgres {
             reason: Option<&str>,
         ) -> Result<()> {
             let changed = sqlx::query(
-                "UPDATE rebalance_batches SET status = $2, reason = $3, updated_at = now() WHERE id = $1",
+                "UPDATE rebalance_batches SET status = $2, reason = $3, updated_at = now() \
+                 WHERE id = $1 AND status NOT IN ('completed', 'failed')",
             )
             .bind(batch_id)
             .bind(status.as_str())
@@ -865,26 +1364,71 @@ mod postgres {
             .execute(&self.pool)
             .await?
             .rows_affected();
-            if changed != 1 {
-                return Err(Error::Storage(format!(
-                    "rebalance batch `{batch_id}` was not found"
-                )));
+            if changed == 1 {
+                return Ok(());
             }
-            Ok(())
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT status FROM rebalance_batches WHERE id=$1")
+                    .bind(batch_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            match current.as_deref() {
+                Some(current) if current == status.as_str() => Ok(()),
+                Some(current @ ("completed" | "failed")) => Err(Error::Storage(format!(
+                    "rebalance batch `{batch_id}` is already terminal as `{current}` and cannot become `{}`",
+                    status.as_str()
+                ))),
+                Some(current) => Err(Error::Storage(format!(
+                    "rebalance batch `{batch_id}` could not transition from `{current}`"
+                ))),
+                None => Err(Error::Storage(format!(
+                    "rebalance batch `{batch_id}` was not found"
+                ))),
+            }
         }
 
         async fn claim_intent(&self, intent_id: Uuid) -> Result<bool> {
-            // Условный UPDATE является межпроцессным compare-and-swap: ровно
-            // один executor увидит rows_affected == 1 и получит право отправки.
+            let mut transaction = self.pool.begin().await?;
+            // The HTTP control transaction takes the same row lock before pause
+            // or cancel. Whichever commits first determines the submission right.
+            sqlx::query("SELECT c.strategy_id FROM strategy_controls c JOIN trade_intents i ON i.strategy_id=c.strategy_id WHERE i.id=$1 FOR UPDATE OF c")
+                .bind(intent_id).fetch_optional(&mut *transaction).await?;
+            let batch_id: Option<Uuid> =
+                sqlx::query_scalar("SELECT batch_id FROM trade_intents WHERE id=$1")
+                    .bind(intent_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .flatten();
+            let Some(batch_id) = batch_id else {
+                return Ok(false);
+            };
+            let gate: String = sqlx::query_scalar(BATCH_GATE_SQL)
+                .bind(batch_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+            if decode_gate(&gate) != BatchExecutionGate::Ready {
+                return Ok(false);
+            }
             let changed = sqlx::query(
                 "UPDATE trade_intents SET status = 'submitting', updated_at = now() \
                  WHERE id = $1 AND runtime_version = 2 AND status = 'pending'",
             )
             .bind(intent_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?
             .rows_affected();
+            transaction.commit().await?;
             Ok(changed == 1)
+        }
+
+        async fn batch_execution_gate(&self, batch_id: Uuid) -> Result<BatchExecutionGate> {
+            let gate: Option<String> = sqlx::query_scalar(BATCH_GATE_SQL)
+                .bind(batch_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            Ok(gate
+                .as_deref()
+                .map_or(BatchExecutionGate::Cancel, decode_gate))
         }
 
         async fn has_pending_order(
@@ -915,41 +1459,143 @@ mod postgres {
             Ok(row.try_get("exists")?)
         }
 
+        async fn reject_pending_intent(&self, intent_id: Uuid, reason: &str) -> Result<bool> {
+            // Условный UPDATE не позволяет отменить ногу после того, как другой
+            // worker уже выполнил Pending→Submitting и получил право на сеть.
+            let changed = sqlx::query(
+                "UPDATE trade_intents SET status='rejected', reason=$2, updated_at=now() \
+                 WHERE id=$1 AND runtime_version=2 AND status='pending'",
+            )
+            .bind(intent_id)
+            .bind(reason)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            Ok(changed == 1)
+        }
+
         async fn reject_intent(&self, intent_id: Uuid, reason: &str) -> Result<()> {
-            set_intent_status(&self.pool, intent_id, "rejected", Some(reason)).await
+            transition_active_intent_status(&self.pool, intent_id, IntentStatus::Rejected, reason)
+                .await
         }
 
         async fn mark_uncertain(&self, intent_id: Uuid, reason: &str) -> Result<()> {
-            set_intent_status(&self.pool, intent_id, "uncertain", Some(reason)).await
+            transition_active_intent_status(&self.pool, intent_id, IntentStatus::Uncertain, reason)
+                .await
         }
 
         async fn record_order_update(&self, intent_id: Uuid, update: &OrderUpdate) -> Result<()> {
             // Broker view (`orders`) и локальный статус intent изменяются одной
-            // транзакцией, чтобы recovery не увидел противоречивую пару.
+            // транзакцией. FOR UPDATE сериализует конкурирующие poll/stream
+            // ответы одной заявки и не даёт позднему stale-ответу откатить статус.
             let mut transaction = self.pool.begin().await?;
-            sqlx::query(
-                "INSERT INTO orders (request_id, intent_id, exchange_order_id, status, \
-                 lots_requested, lots_executed, observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7) \
-                 ON CONFLICT (request_id) DO UPDATE SET exchange_order_id=EXCLUDED.exchange_order_id, \
-                 status=EXCLUDED.status, lots_requested=EXCLUDED.lots_requested, \
-                 lots_executed=EXCLUDED.lots_executed, observed_at=EXCLUDED.observed_at",
+            let intent_row = sqlx::query(
+                "SELECT request_id, status, lots FROM trade_intents \
+                 WHERE id=$1 AND runtime_version=2 FOR UPDATE",
+            )
+            .bind(intent_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| Error::Storage(format!("intent `{intent_id}` was not found")))?;
+            let expected_request_id: Uuid = intent_row.try_get("request_id")?;
+            let expected_lots: i64 = intent_row.try_get("lots")?;
+            let current_status_value: String = intent_row.try_get("status")?;
+            let current_status = intent_status(&current_status_value)?;
+            validate_order_update_identity(expected_request_id, expected_lots, update)?;
+
+            // Обе UNIQUE-связи проверяются явно. OR может вернуть две строки только
+            // при перекрёстно повреждённых request_id/intent_id — такую БД нельзя
+            // молча "исправлять" очередным upsert-ом.
+            let order_rows = sqlx::query(
+                "SELECT request_id, intent_id, exchange_order_id, status, lots_requested, \
+                 lots_executed, observed_at FROM orders \
+                 WHERE request_id=$1 OR intent_id=$2 FOR UPDATE",
             )
             .bind(update.request_id.as_uuid())
             .bind(intent_id)
-            .bind(&update.exchange_order_id)
-            .bind(order_status(update.status))
-            .bind(update.lots_requested)
-            .bind(update.lots_executed)
-            .bind(update.observed_at)
-            .execute(&mut *transaction)
+            .fetch_all(&mut *transaction)
             .await?;
-            sqlx::query(
-                "UPDATE trade_intents SET status=$2, updated_at=now() WHERE id=$1 AND runtime_version=2",
+            if order_rows.len() > 1 {
+                return Err(Error::Storage(format!(
+                    "request `{}` and intent `{intent_id}` refer to different order rows",
+                    update.request_id
+                )));
+            }
+            let existing = order_rows
+                .first()
+                .map(|row| {
+                    let stored_intent_id: Uuid = row.try_get("intent_id")?;
+                    let stored_request_id: Uuid = row.try_get("request_id")?;
+                    if stored_intent_id != intent_id
+                        || stored_request_id != update.request_id.as_uuid()
+                    {
+                        return Err(Error::Storage(format!(
+                            "request `{}` is not linked one-to-one with intent `{intent_id}`",
+                            update.request_id
+                        )));
+                    }
+                    row_to_order_update(row)
+                })
+                .transpose()?;
+            if !should_apply_order_update(current_status, existing.as_ref(), update)? {
+                transaction.commit().await?;
+                return Ok(());
+            }
+            let accepted = merge_order_update(existing.as_ref(), update);
+            let order_changed = if existing.is_some() {
+                sqlx::query(
+                    "UPDATE orders SET exchange_order_id=$3, status=$4, lots_requested=$5, \
+                     lots_executed=$6, observed_at=$7, updated_at=now() \
+                     WHERE request_id=$1 AND intent_id=$2",
+                )
+                .bind(accepted.request_id.as_uuid())
+                .bind(intent_id)
+                .bind(&accepted.exchange_order_id)
+                .bind(order_status(accepted.status))
+                .bind(accepted.lots_requested)
+                .bind(accepted.lots_executed)
+                .bind(accepted.observed_at)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+            } else {
+                sqlx::query(
+                    "INSERT INTO orders (request_id, intent_id, exchange_order_id, status, \
+                     lots_requested, lots_executed, observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                )
+                .bind(accepted.request_id.as_uuid())
+                .bind(intent_id)
+                .bind(&accepted.exchange_order_id)
+                .bind(order_status(accepted.status))
+                .bind(accepted.lots_requested)
+                .bind(accepted.lots_executed)
+                .bind(accepted.observed_at)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+            };
+            if order_changed != 1 {
+                return Err(Error::Storage(format!(
+                    "broker order for request `{}` lost its compare-and-swap",
+                    update.request_id
+                )));
+            }
+            let intent_changed = sqlx::query(
+                "UPDATE trade_intents SET status=$2, reason=NULL, updated_at=now() \
+                 WHERE id=$1 AND runtime_version=2 AND request_id=$3 AND status=$4",
             )
             .bind(intent_id)
-            .bind(status_from_order(update.status).as_str())
+            .bind(status_from_order(accepted.status).as_str())
+            .bind(accepted.request_id.as_uuid())
+            .bind(&current_status_value)
             .execute(&mut *transaction)
-            .await?;
+            .await?
+            .rows_affected();
+            if intent_changed != 1 {
+                return Err(Error::Storage(format!(
+                    "intent `{intent_id}` lost its status compare-and-swap"
+                )));
+            }
             transaction.commit().await?;
             Ok(())
         }
@@ -1049,13 +1695,14 @@ mod postgres {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         state: &AccountRiskState,
     ) -> Result<()> {
+        validate_risk_state_version(state)?;
         let changed = sqlx::query(
             "INSERT INTO account_risk_state (account_id,strategy_id,epoch,state,runtime_version,updated_at) \
              VALUES ($1,$2,$3,$4,2,$5) ON CONFLICT (account_id) DO UPDATE SET \
-             strategy_id=EXCLUDED.strategy_id, epoch=EXCLUDED.epoch, state=EXCLUDED.state, \
-             runtime_version=2, updated_at=EXCLUDED.updated_at \
+             state=EXCLUDED.state, updated_at=EXCLUDED.updated_at \
              WHERE account_risk_state.runtime_version=2 \
-             AND account_risk_state.strategy_id=EXCLUDED.strategy_id",
+             AND account_risk_state.strategy_id=EXCLUDED.strategy_id \
+             AND account_risk_state.epoch=EXCLUDED.epoch",
         )
         .bind(state.account_id.as_str())
         .bind(state.strategy_id.as_str())
@@ -1067,7 +1714,7 @@ mod postgres {
         .rows_affected();
         if changed != 1 {
             return Err(Error::Storage(format!(
-                "account `{}` is already owned by another runtime strategy",
+                "ordinary risk-state save for account `{}` cannot change owner or epoch",
                 state.account_id
             )));
         }
@@ -1096,6 +1743,18 @@ mod postgres {
         Ok(StoredIntent {
             intent: row_to_intent(row)?,
             status: intent_status(&status)?,
+        })
+    }
+
+    fn row_to_order_update(row: &sqlx::postgres::PgRow) -> Result<OrderUpdate> {
+        let status: String = row.try_get("status")?;
+        Ok(OrderUpdate {
+            request_id: OrderRequestId::from_uuid(row.try_get("request_id")?),
+            exchange_order_id: row.try_get("exchange_order_id")?,
+            status: stored_order_status(&status)?,
+            lots_requested: row.try_get("lots_requested")?,
+            lots_executed: row.try_get("lots_executed")?,
+            observed_at: row.try_get("observed_at")?,
         })
     }
 
@@ -1147,22 +1806,47 @@ mod postgres {
         })
     }
 
-    async fn set_intent_status(
+    /// Меняет только активный intent. Условие в SQL является частью state
+    /// machine: Filled/Cancelled/Rejected никогда не возвращаются в active state
+    /// и не меняют уже зафиксированную terminal-причину.
+    async fn transition_active_intent_status(
         pool: &PgPool,
         intent_id: Uuid,
-        status: &str,
-        reason: Option<&str>,
+        status: IntentStatus,
+        reason: &str,
     ) -> Result<()> {
-        sqlx::query(
+        let changed = sqlx::query(
             "UPDATE trade_intents SET status=$2, reason=$3, updated_at=now() \
-             WHERE id=$1 AND runtime_version=2",
+             WHERE id=$1 AND runtime_version=2 \
+             AND status IN ('pending', 'submitting', 'accepted', 'uncertain')",
         )
         .bind(intent_id)
-        .bind(status)
+        .bind(status.as_str())
         .bind(reason)
         .execute(pool)
+        .await?
+        .rows_affected();
+        if changed == 1 {
+            return Ok(());
+        }
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM trade_intents WHERE id=$1 AND runtime_version=2",
+        )
+        .bind(intent_id)
+        .fetch_optional(pool)
         .await?;
-        Ok(())
+        let Some(current) = current else {
+            return Err(Error::Storage(format!(
+                "intent `{intent_id}` was not found"
+            )));
+        };
+        if intent_status(&current)?.is_terminal() {
+            return Ok(());
+        }
+        Err(Error::Storage(format!(
+            "intent `{intent_id}` could not transition from `{current}` to `{}`",
+            status.as_str()
+        )))
     }
 
     fn encode_json<T: serde::Serialize>(value: &T, what: &str) -> Result<Value> {
@@ -1226,6 +1910,19 @@ mod postgres {
             "rejected" => Ok(IntentStatus::Rejected),
             "uncertain" => Ok(IntentStatus::Uncertain),
             _ => Err(Error::Storage(format!("unknown intent status `{value}`"))),
+        }
+    }
+
+    fn stored_order_status(value: &str) -> Result<OrderStatus> {
+        match value {
+            "pending" => Ok(OrderStatus::Pending),
+            "new" => Ok(OrderStatus::New),
+            "partially_filled" => Ok(OrderStatus::PartiallyFilled),
+            "filled" => Ok(OrderStatus::Filled),
+            "cancelled" => Ok(OrderStatus::Cancelled),
+            "rejected" => Ok(OrderStatus::Rejected),
+            "unknown" => Ok(OrderStatus::Unknown),
+            _ => Err(Error::Storage(format!("unknown order status `{value}`"))),
         }
     }
 

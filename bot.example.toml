@@ -4,6 +4,7 @@ account_id = "replace-with-dedicated-sandbox-account-id"
 # universe, состава/порядка strategies, signal_weight, kind или параметров задайте новый ID.
 strategy_id = "moving-average-ensemble"
 app_name = "ObraztsovOleg.tinkoff-rs.bot"
+# Рабочий pool; runtime lease дополнительно удерживает одно отдельное соединение.
 database_connections = 5
 
 [risk]

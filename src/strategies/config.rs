@@ -306,11 +306,11 @@ pub struct ShortTermReversalConfig {
 /// Параметры внутридневного momentum рынка.
 pub struct MarketIntradayMomentumConfig {
     /// Длительность окна после открытия, задающего направление позиции.
-    /// В runtime v1 поддерживается ровно 30 минут.
+    /// В portfolio runtime v2 поддерживается ровно 30 минут.
     #[serde(default = "default_thirty_minutes")]
     pub opening_window_minutes: u32,
     /// За сколько минут до завершающего аукциона сформировать цель.
-    /// В runtime v1 поддерживается ровно 30 минут.
+    /// В portfolio runtime v2 поддерживается ровно 30 минут.
     #[serde(default = "default_thirty_minutes")]
     pub final_window_minutes: u32,
 }
@@ -334,7 +334,7 @@ pub struct IntradaySameClockConfig {
     /// Размер long- и short-хвоста ранга прогнозов.
     #[serde(default = "default_quantile_percent")]
     pub quantile_percent: usize,
-    /// Размер внутридневной свечи; runtime v1 поддерживает ровно 30 минут.
+    /// Размер внутридневной свечи; portfolio runtime v2 поддерживает ровно 30 минут.
     #[serde(default = "default_thirty_minutes")]
     pub interval_minutes: u32,
 }

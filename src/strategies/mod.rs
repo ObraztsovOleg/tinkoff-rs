@@ -52,6 +52,13 @@ const INTRADAY_VALIDITY: Duration = Duration::minutes(30);
 /// Закрывающий rebalance после истечения внутридневного сигнала должен быть
 /// отправлен быстро, но получает небольшой запас на сетевую задержку runtime.
 const EXPIRY_REBALANCE_VALIDITY: Duration = Duration::minutes(5);
+/// Верхняя оценка числа получасовых баров календарных суток.
+///
+/// Запас нужен внутридневным стратегиям: поток может содержать расширенную сессию
+/// и аукционы, а opening candle нельзя вытеснить из bounded state до вечернего сигнала.
+const MAX_HALF_HOUR_BARS_PER_SESSION: usize = 50;
+/// Один history-запрос runtime не принимает больше 2500 закрытых свечей.
+const MAX_WARMUP_BARS: usize = 2_500;
 
 /// Один настроенный экземпляр встроенной portfolio-стратегии.
 ///
@@ -105,7 +112,7 @@ struct CachedComponentTarget {
 struct WeightedComponentState {
     /// Защищает от восстановления state в стратегию другого вида после перестановки TOML.
     kind: String,
-    /// Изменение относительного вклада требует нового strategy_id.
+    /// Изменение относительного вклада требует нового `strategy_id`.
     #[serde(with = "rust_decimal::serde::str")]
     signal_weight: Decimal,
     /// Не позволяет применить историю к другому набору параметров того же kind.
@@ -412,10 +419,12 @@ impl BuiltinStrategySpec {
                         "moving-average windows must satisfy 0 < fast_window < slow_window",
                     );
                 }
+                validate_warmup_window(config.slow_window, 0, "slow_window")?;
                 validate_percent(config.band_percent, "band_percent", true)?;
             }
             Self::RangeBreakout(config) => {
                 validate_positive(config.lookback_days, "lookback_days")?;
+                validate_warmup_window(config.lookback_days, 1, "lookback_days")?;
                 validate_percent(config.filter_percent, "filter_percent", true)?;
             }
             Self::TimeSeriesMomentum(config) => {
@@ -431,10 +440,22 @@ impl BuiltinStrategySpec {
                     );
                 }
                 validate_positive(config.volatility_window_days, "volatility_window_days")?;
+                validate_warmup_window(
+                    config
+                        .horizons_days
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or_default()
+                        .max(config.volatility_window_days),
+                    1,
+                    "momentum/volatility window",
+                )?;
             }
             Self::CrossSectionalMomentum(config) => {
                 validate_ranking_universe(universe)?;
                 validate_formation_skip(config.formation_days, config.skip_days)?;
+                validate_warmup_window(config.formation_days, 1, "formation_days")?;
                 validate_quantile(config.quantile_percent)?;
             }
             Self::IntermediateMomentum(config) => {
@@ -444,17 +465,20 @@ impl BuiltinStrategySpec {
                         "intermediate momentum requires start_days_ago > end_days_ago > 0",
                     );
                 }
+                validate_warmup_window(config.start_days_ago, 1, "start_days_ago")?;
                 validate_quantile(config.quantile_percent)?;
             }
             Self::FiftyTwoWeekHigh(config) => {
                 validate_ranking_universe(universe)?;
                 validate_positive(config.lookback_days, "lookback_days")?;
+                validate_warmup_window(config.lookback_days, 0, "lookback_days")?;
                 validate_quantile(config.quantile_percent)?;
             }
             Self::ResidualMomentum(config) => {
                 validate_ranking_universe(universe)?;
                 validate_reference(&config.benchmark_uid, universe)?;
                 validate_formation_skip(config.formation_days, config.skip_days)?;
+                validate_warmup_window(config.formation_days, 1, "formation_days")?;
                 validate_quantile(config.quantile_percent)?;
             }
             Self::PairsTrading(config) => {
@@ -462,6 +486,7 @@ impl BuiltinStrategySpec {
                     return configuration_error("pairs-trading requires at least two instruments");
                 }
                 validate_positive(config.formation_days, "formation_days")?;
+                validate_warmup_window(config.formation_days, 0, "formation_days")?;
                 validate_positive(config.trading_days, "trading_days")?;
                 if config.entry_z_score <= Decimal::ZERO {
                     return configuration_error("entry_z_score must be positive");
@@ -471,6 +496,7 @@ impl BuiltinStrategySpec {
                 validate_ranking_universe(universe)?;
                 validate_reference(&config.benchmark_uid, universe)?;
                 validate_positive(config.lookback_days, "lookback_days")?;
+                validate_warmup_window(config.lookback_days, 1, "lookback_days")?;
                 validate_quantile(config.quantile_percent)?;
             }
             Self::MarketIntradayMomentum(config) => {
@@ -481,17 +507,27 @@ impl BuiltinStrategySpec {
                 }
                 if config.opening_window_minutes != 30 || config.final_window_minutes != 30 {
                     return configuration_error(
-                        "v1 market-intraday-momentum supports only 30-minute opening and final windows",
+                        "portfolio runtime v2 market-intraday-momentum supports only 30-minute opening and final windows",
                     );
                 }
             }
             Self::IntradaySameClock(config) => {
                 validate_ranking_universe(universe)?;
                 validate_positive(config.lookback_sessions, "lookback_sessions")?;
+                let warmup_bars = config
+                    .lookback_sessions
+                    .checked_mul(MAX_HALF_HOUR_BARS_PER_SESSION)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| {
+                        Error::Configuration(
+                            "lookback_sessions overflows the warmup size".to_owned(),
+                        )
+                    })?;
+                validate_warmup_window(warmup_bars, 0, "lookback_sessions")?;
                 validate_quantile(config.quantile_percent)?;
                 if config.interval_minutes != 30 {
                     return configuration_error(
-                        "v1 intraday-same-clock supports only 30-minute candles",
+                        "portfolio runtime v2 intraday-same-clock supports only 30-minute candles",
                     );
                 }
             }
@@ -500,6 +536,7 @@ impl BuiltinStrategySpec {
                 if config.lookback_months < 2 {
                     return configuration_error("lookback_months must be at least 2");
                 }
+                validate_warmup_window(config.lookback_months, 1, "lookback_months")?;
                 validate_quantile(config.quantile_percent)?;
             }
             Self::BettingAgainstBeta(config) => {
@@ -508,6 +545,7 @@ impl BuiltinStrategySpec {
                 if config.lookback_days < 2 {
                     return configuration_error("lookback_days must be at least 2");
                 }
+                validate_warmup_window(config.lookback_days, 1, "lookback_days")?;
                 if config.shrinkage < Decimal::ZERO || config.shrinkage > Decimal::ONE {
                     return configuration_error("shrinkage must be between 0 and 1");
                 }
@@ -521,6 +559,7 @@ impl BuiltinStrategySpec {
                 if config.lookback_days < 2 {
                     return configuration_error("lookback_days must be at least 2");
                 }
+                validate_warmup_window(config.lookback_days, 1, "lookback_days")?;
                 validate_percent(
                     config.diagonal_shrinkage_percent,
                     "diagonal_shrinkage_percent",
@@ -540,6 +579,7 @@ impl BuiltinStrategySpec {
                 if config.realized_variance_days < 2 {
                     return configuration_error("realized_variance_days must be at least 2");
                 }
+                validate_warmup_window(config.realized_variance_days, 1, "realized_variance_days")?;
                 validate_percent(
                     config.target_annual_volatility_percent,
                     "target_annual_volatility_percent",
@@ -632,7 +672,10 @@ impl BuiltinStrategy {
             }
             BuiltinStrategySpec::IntradaySameClock(config) => (
                 CandleInterval::ThirtyMinutes,
-                config.lookback_sessions.saturating_mul(32) + 1,
+                config
+                    .lookback_sessions
+                    .saturating_mul(MAX_HALF_HOUR_BARS_PER_SESSION)
+                    .saturating_add(1),
             ),
             BuiltinStrategySpec::LowVolatility(config) => {
                 (CandleInterval::OneMonth, config.lookback_months + 1)
@@ -672,8 +715,8 @@ impl BuiltinStrategy {
         requirements
     }
 
-    /// Возвращает два ряда для market-intraday: прошлое дневное закрытие и первую
-    /// закрытую 30-минутную свечу текущей сессии.
+    /// Возвращает два ряда для market-intraday: прошлое дневное закрытие и полный
+    /// внутридневной хвост, сохраняющий первую свечу до финального окна сессии.
     fn market_intraday_requirements(&self) -> Vec<DataRequirement> {
         let instrument_id = self.universe[0].clone();
         vec![
@@ -688,7 +731,9 @@ impl BuiltinStrategy {
                 instrument_id,
                 role: DataRole::Tradable,
                 interval: CandleInterval::ThirtyMinutes,
-                warmup_bars: 1,
+                // Одного бара недостаточно: bounded state вытеснил бы opening
+                // candle задолго до closing trigger. Суточный запас сохраняет её.
+                warmup_bars: MAX_HALF_HOUR_BARS_PER_SESSION,
                 waiting_close: true,
             },
         ]
@@ -732,14 +777,35 @@ impl BuiltinStrategy {
     ///
     /// Большинство сигналов исполняется на следующем открытии после закрытых данных;
     /// market-intraday — за 30 минут до аукциона закрытия; same-clock реагирует прямо
-    /// на закрытие очередной 30-минутной свечи и отдельного schedule не требует.
+    /// на закрытие очередной 30-минутной свечи. Обе intraday-стратегии получают
+    /// официальные open/close: open разрешает принимать регулярные свечи, close
+    /// гарантированно снимает их cached target.
     fn schedules(&self) -> Vec<ScheduleRequirement> {
         match &self.spec {
-            BuiltinStrategySpec::IntradaySameClock(_) => Vec::new(),
-            BuiltinStrategySpec::MarketIntradayMomentum(config) => vec![ScheduleRequirement {
-                anchor: ScheduleAnchor::ClosingAuctionStart,
-                offset_seconds: -i64::from(config.final_window_minutes) * 60,
-            }],
+            BuiltinStrategySpec::IntradaySameClock(_) => vec![
+                ScheduleRequirement {
+                    anchor: ScheduleAnchor::SessionOpen,
+                    offset_seconds: 0,
+                },
+                ScheduleRequirement {
+                    anchor: ScheduleAnchor::SessionClose,
+                    offset_seconds: 0,
+                },
+            ],
+            BuiltinStrategySpec::MarketIntradayMomentum(config) => vec![
+                ScheduleRequirement {
+                    anchor: ScheduleAnchor::SessionOpen,
+                    offset_seconds: 0,
+                },
+                ScheduleRequirement {
+                    anchor: ScheduleAnchor::ClosingAuctionStart,
+                    offset_seconds: -i64::from(config.final_window_minutes) * 60,
+                },
+                ScheduleRequirement {
+                    anchor: ScheduleAnchor::SessionClose,
+                    offset_seconds: 0,
+                },
+            ],
             _ => vec![ScheduleRequirement {
                 anchor: ScheduleAnchor::SessionOpen,
                 offset_seconds: 0,
@@ -1111,6 +1177,14 @@ impl BuiltinStrategy {
         let (Some(left_last), Some(right_last)) = (left.last(), right.last()) else {
             return Ok(None);
         };
+        // День, которым закончился formation-период, только фиксирует пару и
+        // пороги. Первый торговый z-score считается на следующей закрытой сессии.
+        if left_last.time <= pair.formation_completed_at
+            || right_last.time <= pair.formation_completed_at
+        {
+            self.state.pair = Some(pair);
+            return Ok(None);
+        }
         if pair.left_base <= Decimal::ZERO
             || pair.right_base <= Decimal::ZERO
             || pair.standard_deviation <= Decimal::ZERO
@@ -1219,6 +1293,12 @@ impl BuiltinStrategy {
         if standard_deviation.is_zero() {
             return Ok(None);
         }
+        let formation_completed_at = self
+            .state
+            .candles(&left, CandleInterval::OneDay)
+            .last()
+            .expect("selected pair has a complete formation window")
+            .time;
         Ok(Some(PairState {
             left,
             right,
@@ -1226,6 +1306,7 @@ impl BuiltinStrategy {
             right_base,
             mean_spread,
             standard_deviation,
+            formation_completed_at,
             sessions_remaining: config.trading_days,
             position: PairPosition::Flat,
         }))
@@ -1260,6 +1341,12 @@ impl BuiltinStrategy {
         &self,
         session_date: chrono::NaiveDate,
     ) -> Option<Vec<(InstrumentId, Decimal)>> {
+        // Сама дата свечи недостаточна: T-Invest может отдавать бары расширенной
+        // сессии. Разрешение появляется только после официального SessionOpen.
+        if self.state.active_intraday_session != Some(session_date) {
+            return None;
+        }
+        let session_open_at = self.state.intraday_session_open_at?;
         let instrument_id = &self.universe[0];
         let daily = self.state.candles(instrument_id, CandleInterval::OneDay);
         let previous_close = daily
@@ -1271,7 +1358,9 @@ impl BuiltinStrategy {
             .state
             .candles(instrument_id, CandleInterval::ThirtyMinutes)
             .iter()
-            .filter(|candle| candle.time.date_naive() == session_date)
+            .filter(|candle| {
+                candle.time.date_naive() == session_date && candle.time >= session_open_at
+            })
             .min_by_key(|candle| candle.time)
             .map(|candle| candle.close.0);
         let (Some(previous_close), Some(opening_close)) = (previous_close, opening_close) else {
@@ -1302,6 +1391,27 @@ impl BuiltinStrategy {
         let BuiltinStrategySpec::IntradaySameClock(config) = &self.spec else {
             return Ok(None);
         };
+        let Some(session_open_at) = self.state.intraday_session_open_at else {
+            return Ok(None);
+        };
+        if self.state.active_intraday_session != Some(candle.time.date_naive())
+            || candle.time < session_open_at
+        {
+            // Только официальный SessionOpen включает live-сигналы. При старте
+            // процесса посреди дня без восстановленного open-marker стратегия
+            // безопасно ждёт следующую сессию, сохраняя свечи как историю.
+            return Ok(None);
+        }
+        if self
+            .state
+            .last_intraday_session_close
+            .is_some_and(|closed| candle.time.date_naive() <= closed)
+        {
+            // Stream и schedule доставляются независимо. Если финальная свеча
+            // пришла уже после official close, она остаётся в истории,
+            // но не может породить новую overnight-позицию.
+            return Ok(None);
+        }
         if self.state.last_intraday_source == Some(candle.time) {
             return Ok(None);
         }
@@ -1481,7 +1591,8 @@ impl BuiltinStrategy {
     ///
     /// После оценки `Σ` решатель ищет веса, для которых каждый вклад в дисперсию
     /// `w_i(Σw)_i` одинаков. Полученные веса суммируются к единице и затем каждый
-    /// ограничивается 0,5; недостающий после cap вес намеренно не перераспределяется.
+    /// ограничивается 0,5. Остаток перераспределяется между остальными бумагами,
+    /// поэтому при как минимум двух инструментах long gross остаётся равен единице.
     fn equal_risk_contribution_weights(
         &self,
         config: &EqualRiskContributionConfig,
@@ -1508,9 +1619,12 @@ impl BuiltinStrategy {
             .iter()
             .cloned()
             .zip(weights)
-            .map(|(instrument_id, weight)| (instrument_id, weight.min(MAX_INSTRUMENT_WEIGHT)))
             .collect::<Vec<_>>();
-        Ok(Some(fill_universe(&self.universe, &selected)))
+        Ok(Some(normalize_gross(
+            &self.universe,
+            &selected,
+            Decimal::ONE,
+        )))
     }
 
     /// Масштабирует равновзвешенную корзину обратно реализованной дисперсии.
@@ -1519,7 +1633,8 @@ impl BuiltinStrategy {
     /// `RV_annual = sample_variance(portfolio_returns) * 252`. Итоговый gross равен
     /// `min(max_leverage, target_volatility² / RV_annual)` и распределяется поровну
     /// с индивидуальным cap 0,5. Это именно inverse-variance, а не target-vol
-    /// `target / realized_vol`.
+    /// `target / realized_vol`. Исследовательская формула может дать 2, но
+    /// исполнимый long-only target дополнительно ограничен hard net limit 1.
     fn volatility_managed_weights(
         &self,
         config: &VolatilityManagedConfig,
@@ -1553,19 +1668,28 @@ impl BuiltinStrategy {
         let target_volatility = config.target_annual_volatility_percent / Decimal::from(100);
         // Нулевая/отрицательная оценка variance не используется как бесконечное
         // плечо: безопасный результат в таком случае — полностью закрытый портфель.
-        let leverage = if annualized_variance <= Decimal::ZERO {
+        let requested_leverage = if annualized_variance <= Decimal::ZERO {
             Decimal::ZERO
         } else {
             (target_volatility * target_volatility / annualized_variance)
                 .clamp(Decimal::ZERO, config.max_leverage)
         };
+        // У long-only корзины net равен gross. Поэтому запрошенное формулой
+        // плечо выше 1 несовместимо с фиксированным `max_net_exposure = 1`.
+        // Ограничиваем target здесь, чтобы planner не останавливал runtime
+        // ошибкой на обычном сигнале низкой волатильности.
+        let executable_leverage = requested_leverage.min(Decimal::ONE);
         let raw = self
             .universe
             .iter()
             .cloned()
             .map(|instrument_id| (instrument_id, Decimal::ONE))
             .collect::<Vec<_>>();
-        Ok(Some(normalize_gross(&self.universe, &raw, leverage)))
+        Ok(Some(normalize_gross(
+            &self.universe,
+            &raw,
+            executable_leverage,
+        )))
     }
 
     /// Формирует полный `TargetPortfolio` и его временные метки аудита.
@@ -1702,14 +1826,67 @@ impl PortfolioStrategy for BuiltinStrategy {
                 Ok(None)
             }
             StrategyEventKind::Schedule(schedule) => {
-                if event.phase == EventPhase::Warmup {
-                    return Ok(None);
-                }
                 if !self
                     .schedules()
                     .iter()
                     .any(|requirement| requirement.anchor == schedule.anchor)
                 {
+                    return Ok(None);
+                }
+                if schedule.anchor == ScheduleAnchor::SessionOpen
+                    && matches!(
+                        &self.spec,
+                        BuiltinStrategySpec::MarketIntradayMomentum(_)
+                            | BuiltinStrategySpec::IntradaySameClock(_)
+                    )
+                {
+                    // Дата и время берутся только из официального расписания.
+                    // Запоздалое событие старой сессии не может вернуть state назад.
+                    if self
+                        .state
+                        .last_intraday_session_close
+                        .is_none_or(|closed| schedule.session_date > closed)
+                        && self
+                            .state
+                            .active_intraday_session
+                            .is_none_or(|active| schedule.session_date >= active)
+                    {
+                        self.state.active_intraday_session = Some(schedule.session_date);
+                        self.state.intraday_session_open_at = Some(schedule.scheduled_at);
+                    }
+                    return Ok(None);
+                }
+                if schedule.anchor == ScheduleAnchor::SessionClose
+                    && matches!(
+                        &self.spec,
+                        BuiltinStrategySpec::MarketIntradayMomentum(_)
+                            | BuiltinStrategySpec::IntradaySameClock(_)
+                    )
+                {
+                    // Сама компонента на close новый сигнал не выпускает.
+                    // Ensemble удаляет cached intraday target и строит
+                    // закрывающий общий target на том же событии.
+                    if self
+                        .state
+                        .active_intraday_session
+                        .is_none_or(|active| active <= schedule.session_date)
+                    {
+                        self.state.active_intraday_session = None;
+                        self.state.intraday_session_open_at = None;
+                    }
+                    self.state.last_intraday_session_close = Some(
+                        self.state
+                            .last_intraday_session_close
+                            .map_or(schedule.session_date, |closed| {
+                                closed.max(schedule.session_date)
+                            }),
+                    );
+                    return Ok(None);
+                }
+                if event.phase == EventPhase::Warmup {
+                    // При single-flight runtime передаёт пропущенный session
+                    // boundary как Warmup. Open/close gate выше сохранить нужно,
+                    // но обычный scheduled сигнал в этой фазе запрещён.
                     return Ok(None);
                 }
                 if self.should_rebalance_monthly()
@@ -1880,27 +2057,30 @@ impl PortfolioStrategy for WeightedEnsembleStrategy {
             let intraday = Self::is_intraday_kind(component.strategy.kind());
             // Истечение применяется только в live-фазе. Иначе исторический warm-up
             // мог бы породить запрещённый closing target до запуска runtime.
+            let official_intraday_close = intraday
+                && matches!(
+                    &event.payload,
+                    StrategyEventKind::Schedule(schedule)
+                        if schedule.anchor == ScheduleAnchor::SessionClose
+                );
             let expired = event.phase == EventPhase::Live
-                && component
-                    .last_target
-                    .as_ref()
-                    .and_then(|target| target.holding_valid_until)
-                    .is_some_and(|expires_at| event.occurred_at >= expires_at);
-            if expired {
+                && (official_intraday_close
+                    || component
+                        .last_target
+                        .as_ref()
+                        .and_then(|target| target.holding_valid_until)
+                        .is_some_and(|expires_at| event.occurred_at >= expires_at));
+            let expired_had_exposure = if expired {
                 // Нулевой cache можно удалить без batch: durable state всё равно
                 // сохранится вместе с текущим событием, а позицию он не менял.
                 let had_exposure = component.last_target.as_ref().is_some_and(|target| {
                     target.weights.iter().any(|weight| !weight.weight.is_zero())
                 });
                 component.last_target = None;
-                if had_exposure {
-                    emitted = true;
-                    let expiry_deadline = event.occurred_at + EXPIRY_REBALANCE_VALIDITY;
-                    valid_until = Some(
-                        valid_until.map_or(expiry_deadline, |current| current.min(expiry_deadline)),
-                    );
-                }
-            }
+                had_exposure
+            } else {
+                false
+            };
 
             let component_id = component.strategy.id().clone();
             if let Some(target) = component.strategy.on_event(event).await? {
@@ -1920,6 +2100,15 @@ impl PortfolioStrategy for WeightedEnsembleStrategy {
                     holding_valid_until: intraday.then_some(target.valid_until),
                     weights: target.weights,
                 });
+            } else if expired_had_exposure {
+                // Если на том же событии появился новый target компоненты, он
+                // заменяет старый и получает собственный полный deadline. Короткий
+                // closing deadline нужен лишь когда замены действительно нет.
+                emitted = true;
+                let expiry_deadline = event.occurred_at + EXPIRY_REBALANCE_VALIDITY;
+                valid_until = Some(
+                    valid_until.map_or(expiry_deadline, |current| current.min(expiry_deadline)),
+                );
             }
         }
 
@@ -2019,6 +2208,19 @@ fn validate_percent(value: Decimal, name: &str, zero_allowed: bool) -> Result<()
 fn validate_positive(value: usize, name: &str) -> Result<()> {
     if value == 0 {
         return configuration_error(format!("{name} must be positive"));
+    }
+    Ok(())
+}
+
+/// Проверяет итоговую глубину history-запроса и одновременно исключает overflow.
+fn validate_warmup_window(value: usize, extra_bars: usize, name: &str) -> Result<()> {
+    let required = value.checked_add(extra_bars).ok_or_else(|| {
+        Error::Configuration(format!("{name} overflows the required warmup size"))
+    })?;
+    if required == 0 || required > MAX_WARMUP_BARS {
+        return configuration_error(format!(
+            "{name} requires {required} warmup bars; supported range is 1..={MAX_WARMUP_BARS}"
+        ));
     }
     Ok(())
 }

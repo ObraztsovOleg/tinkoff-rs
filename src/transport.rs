@@ -84,7 +84,11 @@ pub(crate) async fn connect(
     let endpoint = Endpoint::from_shared(config.endpoint.clone())
         .map_err(|_| Error::InvalidEndpoint(config.endpoint.clone()))?
         .connect_timeout(config.connect_timeout)
-        .timeout(config.request_timeout);
+        .timeout(config.request_timeout)
+        // TCP keepalive помогает ОС обнаружить соединение, «умершее» во время
+        // сна компьютера или смены сети; HTTP/2 ping не используется, чтобы не
+        // нарушать серверные ограничения частоты keepalive.
+        .tcp_keepalive(Some(Duration::from_secs(60)));
     let endpoint = if config.endpoint.starts_with("https://") {
         endpoint.tls_config(ClientTlsConfig::new().with_native_roots())?
     } else {

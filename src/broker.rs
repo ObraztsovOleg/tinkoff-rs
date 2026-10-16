@@ -436,6 +436,33 @@ impl Trading for ProductionTrading {
 #[async_trait]
 impl Trading for SandboxBroker {
     async fn place_order(&self, intent: &OrderIntent) -> Result<ApiResponse<OrderUpdate>> {
+        let availability = self.trading_availability(&intent.instrument_id).await?.data;
+        if !availability.api_trade_available
+            || (intent.kind == OrderKind::Market && !availability.market_order_available)
+        {
+            return Err(Error::RiskRejected(format!(
+                "trading is currently unavailable for {}",
+                intent.instrument_id
+            )));
+        }
+        // Recovery may submit an intent well after planning. Validate a fresh
+        // quote again immediately before the mutation, independently of candles.
+        let response = self
+            .api
+            .raw()
+            .market_data()
+            .get_last_prices(proto::GetLastPricesRequest {
+                instrument_id: vec![intent.instrument_id.to_string()],
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        let quote = response
+            .last_prices
+            .iter()
+            .find(|p| p.instrument_uid == intent.instrument_id.as_str())
+            .ok_or_else(|| Error::RiskRejected("current execution quote is missing".to_owned()))?;
+        Price::from_recent_trade(quote, Utc::now())?;
         // order_request строит единый PostOrderRequest; меняется только RPC,
         // который принимает его в выбранном контуре.
         let mut client = self.api.raw().sandbox();
@@ -784,6 +811,11 @@ fn map_portfolio_response(
     let positions = data
         .positions
         .into_iter()
+        // RUB settlement cash contributes to total equity, but is not a tradable
+        // position. Keep other currencies so dedicated-account checks still reject them.
+        .filter(|position| {
+            !(position.instrument_type == "currency" && position.figi == "RUB000UTSTOM")
+        })
         .map(|position| {
             let quantity = position
                 .quantity
@@ -967,6 +999,46 @@ mod tests {
     use crate::domain::{
         AccountId, ExecutionPhase, InstrumentId, MarginConsent, OrderIntent, OrderSide, StrategyId,
     };
+
+    #[test]
+    fn portfolio_cash_is_equity_not_an_outside_security_position() {
+        let position = |uid: &str, figi: &str, kind: &str| crate::proto::PortfolioPosition {
+            instrument_uid: uid.to_owned(),
+            figi: figi.to_owned(),
+            instrument_type: kind.to_owned(),
+            quantity: Some(crate::proto::Quotation { units: 1, nano: 0 }),
+            ..Default::default()
+        };
+        let response = crate::proto::PortfolioResponse {
+            account_id: "account".to_owned(),
+            positions: vec![
+                position("rub", "RUB000UTSTOM", "currency"),
+                position("share", "share-figi", "share"),
+                position("usd", "usd-figi", "currency"),
+            ],
+            total_amount_portfolio: Some(crate::proto::MoneyValue {
+                currency: "rub".to_owned(),
+                units: 1_000_000,
+                nano: 0,
+            }),
+            ..Default::default()
+        };
+        let portfolio = super::map_portfolio_response(tonic::Response::new(response))
+            .unwrap()
+            .data;
+        assert_eq!(
+            portfolio
+                .positions
+                .iter()
+                .map(|p| p.instrument_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["share", "usd"]
+        );
+        assert_eq!(
+            portfolio.total.unwrap().amount.0,
+            rust_decimal::Decimal::from(1_000_000)
+        );
+    }
 
     #[test]
     #[allow(deprecated)]

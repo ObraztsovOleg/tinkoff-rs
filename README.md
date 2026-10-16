@@ -16,6 +16,8 @@
 - 15 встроенных дневных, недельных, месячных и intraday стратегий;
 - жёсткий конфигурируемый бюджет и опциональные loss/drawdown stop;
 - single-flight, reductions-first исполнение многоинструментных ребалансировок;
+- работа без сети: runtime пропускает решения без связи, сам переподключается,
+  догружает пропущенные свечи и не завершается из-за обрыва;
 - PostgreSQL persistence для state, risk epoch, batches, intents и fills;
 - 15 русских PDF-разборов и локальный personal-use кэш оригинальных статей;
 - отдельный TOML-пример для каждой встроенной стратегии и пример ансамбля.
@@ -39,7 +41,8 @@ cargo run --release -- --config bot.toml run
 
 `strategy_id` идентифицирует не только процесс, но и неизменяемую конфигурацию
 ансамбля. После изменения общего universe, числа или порядка компонент, их
-`signal_weight`, `kind` либо параметров задайте новый `strategy_id`.
+`signal_weight`, `kind` либо параметров задайте свежий, ранее не использованный
+`strategy_id`.
 Перед передачей того же счёта новому ID остановите старый runtime, ликвидируйте
 позиции, дождитесь terminal status всех заявок и выполните `risk-reset` из нового
 конфига; активная lease или незавершённый batch блокируют transfer.
@@ -51,6 +54,8 @@ Runtime не открывает и не пополняет sandbox-счёт ав
 
 - [Руководство по runtime](docs/RUNBOOK.ru.md)
 - [Примеры запуска](docs/EXAMPLES.ru.md)
+- [Живая sandbox-кампания](docs/SANDBOX-CAMPAIGN.ru.md)
+- [Запуск всего стенда через Docker Compose](docs/DOCKER.ru.md)
 - [Алгоритмы стратегий](docs/STRATEGIES.ru.md)
 - [PDF-архив исследований](docs/research/README.ru.md)
 - [Манифест источников](docs/research/manifest.toml)
@@ -73,8 +78,9 @@ cargo check --workspace --all-features --examples
 cargo clippy --workspace --all-features -- -D warnings
 ```
 
-Автоматические тесты, бэктест, slippage-модель, point-in-time состав индекса и
-гарантия прибыльности намеренно не входят в версию 0.3.
+Регрессионные проверки транспорта и запуска выполняются через `cargo test`.
+Бэктест, slippage-модель, point-in-time состав индекса и гарантия прибыльности
+не входят в версию 0.3.
 
 ## Контракты API
 

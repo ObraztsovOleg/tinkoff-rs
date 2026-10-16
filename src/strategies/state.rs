@@ -20,6 +20,22 @@ pub(crate) struct BuiltinState {
     pub(crate) last_week: Option<(i32, u32)>,
     /// Время свечи, уже породившей intraday-same-clock target.
     pub(crate) last_intraday_source: Option<DateTime<Utc>>,
+    /// Торговая дата официально открытой внутридневной сессии.
+    ///
+    /// Поле устанавливается только событием `SessionOpen` из календаря MOEX.
+    /// Поэтому свеча расширенной сессии либо поток после запуска посреди дня не
+    /// может сама объявить сессию открытой и породить заявку.
+    pub(crate) active_intraday_session: Option<chrono::NaiveDate>,
+    /// Фактическое UTC-время официального открытия активной сессии.
+    ///
+    /// Оно отделяет первую регулярную 30-минутную свечу от более ранних баров той
+    /// же календарной даты, которые могли прийти с утренней расширенной сессии.
+    pub(crate) intraday_session_open_at: Option<DateTime<Utc>>,
+    /// Последняя официально закрытая intraday-сессия.
+    ///
+    /// Маркер не позволяет запоздавшей финальной свече снова открыть
+    /// позицию после срабатывания `SessionClose`.
+    pub(crate) last_intraday_session_close: Option<chrono::NaiveDate>,
     /// Выбранная пара и её открытое/закрытое состояние между сессиями.
     pub(crate) pair: Option<PairState>,
 }
@@ -153,6 +169,11 @@ pub(crate) struct PairState {
     pub(crate) mean_spread: Decimal,
     /// Выборочное стандартное отклонение formation-спреда.
     pub(crate) standard_deviation: Decimal,
+    /// Последняя свеча formation-периода.
+    ///
+    /// Вход разрешён только после появления более новой закрытой сессии: иначе
+    /// одна и та же цена участвовала бы и в выборе пары, и в out-of-sample сигнале.
+    pub(crate) formation_completed_at: DateTime<Utc>,
     /// Число сессий до обязательного закрытия и нового выбора пары.
     pub(crate) sessions_remaining: usize,
     /// Текущая позиция, необходимая для корректных правил входа и выхода.

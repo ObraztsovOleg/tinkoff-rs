@@ -1,3 +1,4 @@
 /target
 .DS_Store
+/docker/local/
 /docs/research/originals/

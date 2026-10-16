@@ -26,7 +26,7 @@
 | `low-volatility` | месяц | long-only low-vol quintile | [разбор](research/briefs/low-volatility.ru.pdf) |
 | `betting-against-beta` | месяц | beta-balanced long/short | [разбор](research/briefs/betting-against-beta.ru.pdf) |
 | `equal-risk-contribution` | месяц | long-only risk allocation | [разбор](research/briefs/equal-risk-contribution.ru.pdf) |
-| `volatility-managed` | месяц | long/cash, gross до 2 | [разбор](research/briefs/volatility-managed.ru.pdf) |
+| `volatility-managed` | месяц | long/cash, formula cap 2; executable net cap 1 | [разбор](research/briefs/volatility-managed.ru.pdf) |
 
 ## Единая семантика
 
@@ -36,13 +36,22 @@
   `market-intraday-momentum` и `intraday-same-clock` он также ограничивает время
   удержания: на следующем live event просроченный вклад обнуляется, а ансамбль
   формирует обновлённый target для сохранения остальных сигналов или закрытия.
+  Официальный `SessionOpen` включает приём регулярных intraday-свечей, а
+  `SessionClose` в любом случае удаляет intraday-вклад; бары расширенной сессии и
+  запоздавшая финальная свеча не могут открыть overnight-позицию. При первом
+  запуске посреди сессии без сохранённого open-marker intraday-сигналы безопасно
+  ждут следующего официального открытия.
 - Обычный long/short signal portfolio нормализуется по сторонам: до `+0.5` long
   и до `-0.5` short. Если сигналов одной стороны нет, её половина остаётся в
-  кэше. Плечо до gross 2 используют только BAB и volatility-managed.
+  кэше. BAB может достигать gross 2 при net не выше 1.
+  Формула volatility-managed также имеет cap 2, но long-only
+  target исполняется с cap 1, так как для него net равен gross.
 - Квинтильным стратегиям нужны минимум десять пригодных инструментов, pairs —
   два, volatility-managed — четыре.
-- Инструмент без достаточной истории, с недоступным short/market order либо с
-  одним лотом дороже разрешённого размера исключается до signal construction.
+- Недостаточная история откладывает общий сигнал, а недоступный обязательный
+  short/market order останавливает preflight. Если максимальный вес `0.5` не
+  позволяет купить даже один лот при текущем `sizing_capital`, planner получает
+  для новой позиции ноль лотов и заявку по ней не создаёт.
 - Ограничения счёта и risk manager имеют приоритет над target стратегии.
 
 ## Где лежат статьи

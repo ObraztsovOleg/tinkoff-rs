@@ -1,0 +1,67 @@
+name: tinkoff-sandbox
+
+services:
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_DB: tinkoff_campaign
+      POSTGRES_USER: tinkoff_campaign
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/local/import/db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U tinkoff_campaign -d tinkoff_campaign"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    stop_grace_period: 1m
+
+  app:
+    build: .
+    image: tinkoff-rs-sandbox:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TINKOFF_TOKEN_FILE: /run/secrets/tinkoff_token
+      # Reuse after cleanup was explicitly approved for this 16-scenario campaign.
+      SANDBOX_ALLOW_ACCOUNT_REUSE: ${SANDBOX_ALLOW_ACCOUNT_REUSE:-1}
+      # Use already open empty sandbox accounts (no account is closed or deleted).
+      SANDBOX_ADOPT_IDLE_ACCOUNTS: ${SANDBOX_ADOPT_IDLE_ACCOUNTS:-0}
+      DASHBOARD_BIND: 0.0.0.0
+      DASHBOARD_PUBLIC_PORT: ${DASHBOARD_PORT:-8765}
+    secrets:
+      - tinkoff_token
+      - postgres_password
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-8765}:8765"
+    volumes:
+      - campaign-data:/data
+      - ./docker/local/ca:/run/extra-ca:ro
+      - ./docker/local/import/state:/seed:ro
+    healthcheck:
+      test: [CMD, python3, scripts/container-stack.py, --health]
+      start_period: 20m
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stop_grace_period: 5m
+
+volumes:
+  postgres-data:
+  campaign-data:
+
+secrets:
+  tinkoff_token:
+    file: ./docker/local/secrets/tinkoff_token
+  postgres_password:
+    file: ./docker/local/secrets/postgres_password

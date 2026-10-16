@@ -129,6 +129,30 @@ impl FromStr for OrderRequestId {
 pub struct Price(#[serde(with = "rust_decimal::serde::str")] pub Decimal);
 
 impl Price {
+    /// Проверяет положительную цену сделки и её возраст перед sandbox-исполнением.
+    /// Допускается до 30 секунд рассогласования часов; отсутствующее время запрещено.
+    pub fn from_recent_trade(value: &proto::LastPrice, now: DateTime<Utc>) -> Result<Self> {
+        let observed = value.time.ok_or_else(|| {
+            Error::RiskRejected("execution quote timestamp is missing".to_owned())
+        })?;
+        let age = now - timestamp_to_datetime(observed)?;
+        if age > chrono::Duration::minutes(5) || age < -chrono::Duration::seconds(30) {
+            return Err(Error::RiskRejected(
+                "execution quote is stale or future-dated".to_owned(),
+            ));
+        }
+        let price =
+            Self::from_quotation(value.price.ok_or_else(|| {
+                Error::RiskRejected("execution quote price is missing".to_owned())
+            })?)?;
+        if price.0 <= Decimal::ZERO {
+            return Err(Error::RiskRejected(
+                "execution quote must be positive".to_owned(),
+            ));
+        }
+        Ok(price)
+    }
+
     /// Оборачивает точное [`Decimal`] значение.
     #[must_use]
     pub const fn new(value: Decimal) -> Self {
@@ -366,7 +390,7 @@ pub struct PortfolioSnapshot {
     pub account_id: AccountId,
     /// Общая стоимость портфеля, если API вернул показатель.
     pub total: Option<Money>,
-    /// Известные позиции счёта.
+    /// Инвестиционные позиции счёта; рублёвый денежный остаток входит в `total`.
     pub positions: Vec<PortfolioPosition>,
     /// Локальное время получения и преобразования ответа.
     pub observed_at: DateTime<Utc>,

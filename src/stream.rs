@@ -10,10 +10,18 @@
 //! ёмкость каналов создаёт backpressure и не позволяет бесконтрольно накапливать
 //! сообщения в памяти.
 
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use rand::Rng;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Streaming;
 
@@ -373,9 +381,50 @@ enum MarketDataCommand {
 /// туда сам event receiver.
 pub struct MarketDataStreamHandle {
     commands: mpsc::Sender<MarketDataCommand>,
+    readiness: watch::Receiver<std::result::Result<bool, String>>,
+    connections: Arc<AtomicU64>,
 }
 
 impl MarketDataStreamHandle {
+    /// Число успешно установленных соединений с начала работы потока.
+    ///
+    /// Рост значения означает, что был reconnect: свечи, закрывшиеся во время
+    /// разрыва, поток не доставит, и потребитель должен догрузить их из истории.
+    #[must_use]
+    pub fn connection_count(&self) -> u64 {
+        self.connections.load(Ordering::Acquire)
+    }
+
+    /// True only after all candle subscriptions in the current connection are confirmed.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.readiness.has_changed().is_ok() && matches!(*self.readiness.borrow(), Ok(true))
+    }
+
+    /// Waits for confirmed subscriptions, failing on rejection, closure or timeout.
+    pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
+        let mut receiver = self.readiness.clone();
+        tokio::time::timeout(timeout, async move {
+            loop {
+                if receiver.has_changed().is_err() {
+                    return Err(Error::StreamClosed(
+                        "subscription readiness channel closed".to_owned(),
+                    ));
+                }
+                match receiver.borrow().clone() {
+                    Ok(true) => return Ok(()),
+                    Err(message) => return Err(Error::StreamClosed(message)),
+                    Ok(false) => {}
+                }
+                receiver.changed().await.map_err(|_| {
+                    Error::StreamClosed("subscription readiness channel closed".to_owned())
+                })?;
+            }
+        })
+        .await
+        .map_err(|_| Error::Timeout(timeout))?
+    }
+
     /// Добавляет подписку в активное соединение и reconnect registry.
     pub async fn subscribe(&self, subscription: MarketDataSubscription) -> Result<()> {
         self.commands
@@ -424,12 +473,22 @@ pub fn market_data_stream(
     }
     let (command_tx, command_rx) = mpsc::channel(config.capacity);
     let (event_tx, event_rx) = mpsc::channel(config.capacity);
+    let (ready_tx, ready_rx) = watch::channel(Ok(false));
+    let connections = Arc::new(AtomicU64::new(0));
     tokio::spawn(run_market_data_stream(
-        client, registry, command_rx, event_tx, config,
+        client,
+        registry,
+        command_rx,
+        event_tx,
+        config,
+        ready_tx,
+        connections.clone(),
     ));
     Ok(MarketDataStream {
         handle: MarketDataStreamHandle {
             commands: command_tx,
+            readiness: ready_rx,
+            connections,
         },
         events: ReceiverStream::new(event_rx),
     })
@@ -441,9 +500,17 @@ async fn run_market_data_stream(
     mut commands: mpsc::Receiver<MarketDataCommand>,
     events: mpsc::Sender<Result<MarketDataResponse>>,
     config: StreamConfig,
+    readiness: watch::Sender<std::result::Result<bool, String>>,
+    connections: Arc<AtomicU64>,
 ) {
+    // Сервер присылает ping с интервалом `ping_delay`. Тишина в три интервала
+    // означает «полуоткрытое» соединение (сон компьютера, смена сети): его нужно
+    // заменить, иначе стратегия будет ждать свечей, которые уже не придут.
+    let silence_limit = config.ping_delay.saturating_mul(3);
     let mut reconnect_attempt = 0_u32;
     loop {
+        let _ = readiness.send_replace(Ok(false));
+        let mut pending = candle_subscription_keys(registry.values());
         // Каждый reconnect получает новый request channel. Registry живёт
         // снаружи цикла соединения и поэтому переживает разрыв.
         let (requests_tx, requests_rx) = mpsc::channel(config.capacity);
@@ -473,9 +540,12 @@ async fn run_market_data_stream(
         let mut stream = match response {
             Ok(response) => {
                 reconnect_attempt = 0;
+                connections.fetch_add(1, Ordering::AcqRel);
+                let _ = readiness.send_replace(Ok(pending.is_empty()));
                 response.into_inner()
             }
             Err(status) => {
+                tracing::warn!(code = ?status.code(), "market data connection failed");
                 if !is_retryable_status(&status) {
                     let _ = events.send(Err(status.into())).await;
                     return;
@@ -491,14 +561,29 @@ async fn run_market_data_stream(
         };
 
         let mut heartbeat = tokio::time::interval(config.ping_delay);
+        let acknowledgement_deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(acknowledgement_deadline);
+        let silence_deadline = tokio::time::sleep(silence_limit);
+        tokio::pin!(silence_deadline);
         let should_reconnect = loop {
             // Один select одновременно обслуживает команды приложения,
             // heartbeat и серверные сообщения, не блокируя остальные ветки.
             tokio::select! {
+                () = &mut silence_deadline => {
+                    tracing::warn!(silent_seconds = silence_limit.as_secs(), "market data stream is silent; reconnecting");
+                    break true;
+                }
+                () = &mut acknowledgement_deadline, if !pending.is_empty() => {
+                    tracing::warn!(pending = pending.len(), "subscription acknowledgement timeout; reconnecting");
+                    break true;
+                }
                 command = commands.recv() => {
                     match command {
                         Some(MarketDataCommand::Subscribe(subscription)) => {
                             let key = subscription.key();
+                            pending.extend(candle_subscription_keys(std::iter::once(&subscription)));
+                            acknowledgement_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(15));
+                            let _ = readiness.send_replace(Ok(pending.is_empty()));
                             match subscription.request(SubscriptionAction::Subscribe) {
                                 Ok(request) => {
                                     if requests_tx.send(request).await.is_err() {
@@ -520,6 +605,8 @@ async fn run_market_data_stream(
                                         break true;
                                     }
                                     registry.remove(&subscription.key());
+                                    for key in candle_subscription_keys(std::iter::once(&subscription)) { pending.remove(&key); }
+                                    let _ = readiness.send_replace(Ok(pending.is_empty()));
                                 }
                                 Err(error) => {
                                     if events.send(Err(error)).await.is_err() {
@@ -544,12 +631,26 @@ async fn run_market_data_stream(
                 message = stream.message() => {
                     match message {
                         Ok(Some(message)) => {
+                            silence_deadline.as_mut().reset(tokio::time::Instant::now() + silence_limit);
+                            tracing::debug!(payload = ?message.payload, "market data response");
+                            if let Err(error) = confirm_candles(&message, &mut pending) {
+                                let _ = readiness.send_replace(Err(error.to_string()));
+                                let _ = events.send(Err(error)).await;
+                                return;
+                            }
+                            if matches!(&message.payload, Some(proto::market_data_response::Payload::SubscribeCandlesResponse(_))) {
+                                tracing::info!(pending = pending.len(), "candle subscriptions acknowledged");
+                            }
+                            let _ = readiness.send_replace(Ok(pending.is_empty()));
                             if events.send(Ok(message)).await.is_err() {
                                 return;
                             }
                         }
                         Ok(None) => break true,
-                        Err(status) if is_retryable_status(&status) => break true,
+                        Err(status) if is_retryable_status(&status) => {
+                            tracing::warn!(code = ?status.code(), "market data stream reconnecting");
+                            break true;
+                        },
                         Err(status) => {
                             let _ = events.send(Err(status.into())).await;
                             return;
@@ -560,6 +661,7 @@ async fn run_market_data_stream(
         };
 
         if should_reconnect {
+            let _ = readiness.send_replace(Ok(false));
             reconnect_attempt = reconnect_attempt.saturating_add(1);
             if reconnect_exhausted(config, reconnect_attempt) {
                 let _ = events
@@ -572,6 +674,64 @@ async fn run_market_data_stream(
             tokio::time::sleep(reconnect_delay(config, reconnect_attempt)).await;
         }
     }
+}
+
+type CandleSubscriptionKey = (String, i32, bool);
+
+fn candle_subscription_keys<'a>(
+    subscriptions: impl Iterator<Item = &'a MarketDataSubscription>,
+) -> HashSet<CandleSubscriptionKey> {
+    subscriptions
+        .flat_map(|subscription| match subscription {
+            MarketDataSubscription::Candles {
+                instruments,
+                interval,
+                waiting_close,
+                ..
+            } => instruments
+                .iter()
+                .map(|id| {
+                    (
+                        id.to_string(),
+                        interval
+                            .as_subscription_proto()
+                            .expect("validated interval") as i32,
+                        *waiting_close,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+fn confirm_candles(
+    response: &MarketDataResponse,
+    pending: &mut HashSet<CandleSubscriptionKey>,
+) -> Result<()> {
+    if let Some(proto::market_data_response::Payload::SubscribeCandlesResponse(response)) =
+        &response.payload
+    {
+        for subscription in &response.candles_subscriptions {
+            if subscription.subscription_action == SubscriptionAction::Unsubscribe as i32 {
+                continue;
+            }
+            if subscription.subscription_status != proto::SubscriptionStatus::Success as i32 {
+                return Err(Error::StreamClosed(format!(
+                    "candle subscription rejected: uid={} interval={} status={}",
+                    subscription.instrument_uid,
+                    subscription.interval,
+                    subscription.subscription_status
+                )));
+            }
+            pending.remove(&(
+                subscription.instrument_uid.clone(),
+                subscription.interval,
+                subscription.waiting_close,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Открывает server stream состояний заявок с reconnect.
@@ -698,10 +858,11 @@ where
                     reconnect_attempt = 0;
                     stream
                 }
-                Err(Error::Status(status)) if is_retryable_status(&status) => {
+                Err(error) if error.is_transient() => {
+                    tracing::warn!(stream = name, %error, "server stream connection failed; reconnecting");
                     reconnect_attempt = reconnect_attempt.saturating_add(1);
                     if reconnect_exhausted(config, reconnect_attempt) {
-                        let _ = sender.send(Err(Error::Status(status))).await;
+                        let _ = sender.send(Err(error)).await;
                         return;
                     }
                     tokio::time::sleep(reconnect_delay(config, reconnect_attempt)).await;
@@ -744,14 +905,10 @@ where
     Ok(ReceiverStream::new(receiver))
 }
 
+/// Stream переподключается при любой временной недоступности сети или API,
+/// включая обрыв HTTP/2 (`Unknown`/`Internal`), а не завершает поток событий.
 fn is_retryable_status(status: &tonic::Status) -> bool {
-    matches!(
-        status.code(),
-        tonic::Code::Unavailable
-            | tonic::Code::DeadlineExceeded
-            | tonic::Code::ResourceExhausted
-            | tonic::Code::Cancelled
-    )
+    crate::error::is_transient_code(status.code())
 }
 
 fn reconnect_exhausted(config: StreamConfig, attempt: u32) -> bool {
@@ -783,6 +940,69 @@ mod tests {
     };
 
     use super::MarketDataSubscription;
+
+    #[test]
+    fn candle_acknowledgements_require_all_uids_and_reject_errors() {
+        let mut pending =
+            std::collections::HashSet::from([("a".to_owned(), 9, true), ("b".to_owned(), 9, true)]);
+        let response = |uid: &str, status: i32| proto::MarketDataResponse {
+            payload: Some(
+                proto::market_data_response::Payload::SubscribeCandlesResponse(
+                    proto::SubscribeCandlesResponse {
+                        candles_subscriptions: vec![proto::CandleSubscription {
+                            instrument_uid: uid.to_owned(),
+                            interval: 9,
+                            waiting_close: true,
+                            subscription_status: status,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ),
+            ),
+        };
+        super::confirm_candles(
+            &response("a", proto::SubscriptionStatus::Success as i32),
+            &mut pending,
+        )
+        .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(super::confirm_candles(&response("b", 6), &mut pending).is_err());
+        assert_eq!(pending.len(), 1);
+        super::confirm_candles(
+            &response("b", proto::SubscriptionStatus::Success as i32),
+            &mut pending,
+        )
+        .unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn readiness_is_revoked_on_reconnect_and_wait_is_bounded() {
+        let (sender, receiver) = tokio::sync::watch::channel(Ok(true));
+        let (commands, _commands) = tokio::sync::mpsc::channel(1);
+        let handle = super::MarketDataStreamHandle {
+            commands,
+            readiness: receiver,
+            connections: std::sync::Arc::default(),
+        };
+        assert!(handle.is_ready());
+        let _ = sender.send_replace(Ok(false));
+        assert!(!handle.is_ready());
+        assert!(
+            handle
+                .wait_ready(std::time::Duration::from_millis(5))
+                .await
+                .is_err()
+        );
+        let _ = sender.send_replace(Ok(true));
+        handle
+            .wait_ready(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        drop(sender);
+        assert!(!handle.is_ready());
+    }
 
     #[test]
     #[allow(deprecated)]

@@ -29,7 +29,7 @@ use crate::{
         AccountId, Candle, CandleInterval, ExecutionPhase, InstrumentId, MarginConsent,
         OrderIntent, OrderSide, OrderStatus, OrderUpdate, PortfolioSnapshot, Price, StrategyId,
     },
-    storage::{IntentStatus, Storage, StoredIntent},
+    storage::{BatchExecutionGate, IntentStatus, Storage, StoredIntent},
 };
 
 /// Версия формата durable-state текущего portfolio runtime.
@@ -516,7 +516,13 @@ impl RiskManager {
             - observation.external_cash_flows;
 
         // На первой оценке новой сессии фиксируем новую базу дневного stop-а.
-        if observation.session_date != self.state.session_date {
+        if observation.session_date < self.state.session_date {
+            return Err(Error::RiskRejected(format!(
+                "MOEX session date regressed from {} to {}",
+                self.state.session_date, observation.session_date
+            )));
+        }
+        if observation.session_date > self.state.session_date {
             self.state.session_date = observation.session_date;
             self.state.day_start_equity = strategy_equity;
         }
@@ -808,6 +814,15 @@ impl TargetPlanner {
                 .get(&target_weight.instrument_id)
                 .copied()
                 .unwrap_or_default();
+            // `abs(i64::MIN)` и разность двух противоположных крайних значений
+            // не представимы в i64. Такое количество всё равно нельзя передать
+            // broker API, поэтому отклоняем snapshot до построения intents.
+            if desired_lots == i64::MIN || current == i64::MIN {
+                return Err(Error::RiskRejected(format!(
+                    "position lots are outside the supported range for `{}`",
+                    target_weight.instrument_id
+                )));
+            }
             append_legs(
                 &effective_target,
                 target_weight.instrument_id,
@@ -816,7 +831,7 @@ impl TargetPlanner {
                 info.lot_size,
                 &mut reductions,
                 &mut openings,
-            );
+            )?;
         }
         // Порядок внутри Vec является частью протокола исполнения: ни одна
         // opening leg не должна предшествовать reduction leg.
@@ -985,9 +1000,9 @@ fn append_legs(
     lot_size: i64,
     reductions: &mut Vec<OrderIntent>,
     openings: &mut Vec<OrderIntent>,
-) {
+) -> Result<()> {
     if current == desired {
-        return;
+        return Ok(());
     }
     // `common` — позиция, которую можно оставить без сделки. При сохранении
     // направления сначала сокращаем модуль до common, затем при необходимости
@@ -1006,7 +1021,7 @@ fn append_legs(
             common,
             lot_size,
             ExecutionPhase::Reduction,
-        ));
+        )?);
     }
     if common != desired {
         openings.push(make_intent(
@@ -1016,8 +1031,9 @@ fn append_legs(
             desired,
             lot_size,
             ExecutionPhase::Opening,
-        ));
+        )?);
     }
+    Ok(())
 }
 
 fn make_intent(
@@ -1027,10 +1043,19 @@ fn make_intent(
     target_lots: i64,
     lot_size: i64,
     phase: ExecutionPhase,
-) -> OrderIntent {
+) -> Result<OrderIntent> {
     // Знак delta определяет сторону, а API получает положительное число лотов.
-    let delta = target_lots - from_lots;
-    OrderIntent::market(
+    let delta = target_lots.checked_sub(from_lots).ok_or_else(|| {
+        Error::RiskRejected(format!(
+            "order delta overflow for instrument `{instrument_id}`"
+        ))
+    })?;
+    let lots = delta.checked_abs().ok_or_else(|| {
+        Error::RiskRejected(format!(
+            "order size overflow for instrument `{instrument_id}`"
+        ))
+    })?;
+    Ok(OrderIntent::market(
         target.batch_id,
         0,
         target.event_id.clone(),
@@ -1042,7 +1067,7 @@ fn make_intent(
         } else {
             OrderSide::Sell
         },
-        delta.abs(),
+        lots,
         target_lots,
         lot_size,
         phase,
@@ -1052,7 +1077,7 @@ fn make_intent(
             MarginConsent::UncoveredAllowed
         },
         target.generated_at,
-    )
+    ))
 }
 
 /// Результат применения одного события к стратегии и planner-у.
@@ -1116,6 +1141,47 @@ impl<S: Storage> PortfolioEngine<S> {
     /// Возвращает требования стратегии к расписанию MOEX.
     pub async fn schedule_requirements(&self) -> Vec<ScheduleRequirement> {
         self.strategy.lock().await.schedule_requirements()
+    }
+
+    /// Applies closed historical candles and commits one atomic warmup checkpoint.
+    /// Live events and targets are forbidden. All in-memory changes roll back on failure.
+    pub async fn process_warmup_batch(&self, events: &[StrategyEvent]) -> Result<bool> {
+        if events.is_empty() {
+            return Ok(true);
+        }
+        if events.iter().any(|event| {
+            event.phase != EventPhase::Warmup
+                || event.id.is_empty()
+                || !matches!(&event.payload, StrategyEventKind::Candle(c) if c.complete)
+        }) {
+            return Err(Error::InvalidArgument(
+                "warmup batch requires closed candles in Warmup phase".to_owned(),
+            ));
+        }
+        let mut strategy = self.strategy.lock().await;
+        let previous = strategy.state()?;
+        let result = async {
+            for event in events {
+                if let StrategyEventKind::Candle(candle) = &event.payload {
+                    self.storage.store_candle(candle).await?;
+                }
+                if strategy.on_event(event).await?.is_some() {
+                    return Err(Error::Strategy {
+                        strategy: self.strategy_id.to_string(),
+                        message: "warmup events cannot emit targets".to_owned(),
+                    });
+                }
+            }
+            let ids = events.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+            self.storage
+                .commit_warmup(&self.strategy_id, &ids, &strategy.state()?)
+                .await
+        }
+        .await;
+        if !matches!(result, Ok(true)) {
+            strategy.restore_state(previous)?;
+        }
+        result
     }
 
     /// Применяет событие и атомарно сохраняет state, batch, risk и все ноги.
@@ -1280,6 +1346,8 @@ pub enum ExecutionOutcome {
     Submitted(OrderUpdate),
     /// Операция уже была обработана другим worker-ом.
     AlreadyHandled,
+    /// Новая отправка запрещена, потому что execution deadline уже прошёл.
+    Suppressed,
 }
 
 /// Результат одной попытки провести весь batch.
@@ -1365,6 +1433,24 @@ where
             )));
         }
         let mut intents = self.storage.batch_intents(batch_id).await?;
+        if !matches!(
+            batch.status,
+            RebalanceBatchStatus::Completed | RebalanceBatchStatus::Failed
+        ) {
+            match self.storage.batch_execution_gate(batch_id).await? {
+                BatchExecutionGate::Ready => {}
+                BatchExecutionGate::Hold => return Ok(BatchExecutionOutcome::AwaitingFills),
+                BatchExecutionGate::Cancel => {
+                    return self
+                        .settle_failed_batch(
+                            batch_id,
+                            &intents,
+                            "operator control cancelled execution",
+                        )
+                        .await;
+                }
+            }
+        }
         if intents.iter().any(|stored| {
             stored.intent.batch_id != batch.id
                 || stored.intent.account_id != batch.account_id
@@ -1377,35 +1463,89 @@ where
         }
 
         // Терминальный отказ reduction означает, что даже безопасная часть
-        // исходного target недостижима. Opening-ошибки проверяются позже: они не
-        // должны мешать завершить уже сохранённое сокращение позиции.
+        // исходного target недостижима. Он проверяется до reconciliation, чтобы
+        // другая active reduction уже не получила разрешение на resubmit.
         if phase_has_terminal_failure(&intents, ExecutionPhase::Reduction) {
-            self.storage
-                .set_batch_status(
+            return self
+                .settle_failed_batch(
                     batch_id,
-                    RebalanceBatchStatus::Failed,
-                    Some("a reduction leg is rejected or cancelled"),
+                    &intents,
+                    "a reduction leg is rejected or cancelled",
                 )
-                .await?;
-            return Ok(BatchExecutionOutcome::Failed);
+                .await;
+        }
+
+        // После crash reduction могла уже уйти брокеру. Сначала сверяем ровно
+        // одну такую ногу. Остальные active/pending в этом проходе не трогаются:
+        // если текущая стала terminal, дальнейшие отправки сразу запрещаются.
+        if let Some(stored) = intents.iter().find(|stored| {
+            stored.intent.execution_phase == ExecutionPhase::Reduction
+                && matches!(
+                    stored.status,
+                    IntentStatus::Submitting | IntentStatus::Accepted | IntentStatus::Uncertain
+                )
+        }) {
+            self.submit_or_reconcile(&stored.intent, true, None).await?;
+            intents = self.storage.batch_intents(batch_id).await?;
+            if phase_has_terminal_failure(&intents, ExecutionPhase::Reduction) {
+                return self
+                    .settle_failed_batch(
+                        batch_id,
+                        &intents,
+                        "a reduction leg is rejected or cancelled",
+                    )
+                    .await;
+            }
+            if !phase_is_filled(&intents, ExecutionPhase::Reduction) {
+                self.storage
+                    .set_batch_status(batch_id, RebalanceBatchStatus::AwaitingFills, None)
+                    .await?;
+                return Ok(BatchExecutionOutcome::AwaitingFills);
+            }
+        }
+        if !phase_is_filled(&intents, ExecutionPhase::Reduction) {
+            // Pending reduction тоже нельзя слепо отправить после restart:
+            // позицию могли вручную изменить между plan и recovery. target_lots
+            // позволяет восстановить и проверить source каждой Pending ноги.
+            let refreshed = self.portfolio.portfolio(&batch.account_id).await?.data;
+            if refreshed.account_id != batch.account_id
+                || refreshed.positions.iter().any(|position| position.blocked)
+            {
+                self.storage
+                    .set_batch_status(
+                        batch_id,
+                        RebalanceBatchStatus::AwaitingFills,
+                        Some("fresh portfolio is unavailable or contains blocked positions"),
+                    )
+                    .await?;
+                return Ok(BatchExecutionOutcome::AwaitingFills);
+            }
+            if !pending_sources_match(&refreshed, &intents, ExecutionPhase::Reduction)? {
+                return self
+                    .settle_failed_batch(
+                        batch_id,
+                        &intents,
+                        "fresh positions do not match the pending reduction sources",
+                    )
+                    .await;
+            }
         }
         self.storage
             .set_batch_status(batch_id, RebalanceBatchStatus::Reducing, None)
             .await?;
         if !self
-            .execute_phase(&intents, ExecutionPhase::Reduction)
+            .execute_phase(&intents, ExecutionPhase::Reduction, None)
             .await?
         {
             intents = self.storage.batch_intents(batch_id).await?;
             if phase_has_terminal_failure(&intents, ExecutionPhase::Reduction) {
-                self.storage
-                    .set_batch_status(
+                return self
+                    .settle_failed_batch(
                         batch_id,
-                        RebalanceBatchStatus::Failed,
-                        Some("a reduction leg is rejected or cancelled"),
+                        &intents,
+                        "a reduction leg is rejected or cancelled",
                     )
-                    .await?;
-                return Ok(BatchExecutionOutcome::Failed);
+                    .await;
             }
             self.storage
                 .set_batch_status(batch_id, RebalanceBatchStatus::AwaitingFills, None)
@@ -1414,6 +1554,23 @@ where
         }
 
         intents = self.storage.batch_intents(batch_id).await?;
+        // Решение о переходе к openings принимается по свежему durable state, а
+        // не только по ответам текущего worker-а.
+        if phase_has_terminal_failure(&intents, ExecutionPhase::Reduction) {
+            return self
+                .settle_failed_batch(
+                    batch_id,
+                    &intents,
+                    "a reduction leg is rejected or cancelled",
+                )
+                .await;
+        }
+        if !phase_is_filled(&intents, ExecutionPhase::Reduction) {
+            self.storage
+                .set_batch_status(batch_id, RebalanceBatchStatus::AwaitingFills, None)
+                .await?;
+            return Ok(BatchExecutionOutcome::AwaitingFills);
+        }
         let opening_legs = intents
             .iter()
             .filter(|stored| stored.intent.execution_phase == ExecutionPhase::Opening)
@@ -1441,36 +1598,42 @@ where
                 .await;
         }
 
+        // Если полный target уже невозможен, ни одна active нога ниже не должна
+        // получить разрешение на resubmit после broker NotFound.
+        if phase_has_terminal_failure(&intents, ExecutionPhase::Opening) {
+            return self
+                .settle_failed_batch(
+                    batch_id,
+                    &intents,
+                    "an opening leg is rejected or cancelled",
+                )
+                .await;
+        }
+
         // Если до restart хотя бы одна opening leg уже могла уйти брокеру,
         // сначала только выясняем её исход. Оставшиеся Pending legs в этом же
         // проходе не отправляются: следующий проход заново прочитает портфель.
-        if opening_legs.iter().any(|stored| {
+        if let Some(stored) = opening_legs.iter().find(|stored| {
             matches!(
                 stored.status,
                 IntentStatus::Submitting | IntentStatus::Accepted | IntentStatus::Uncertain
             )
         }) {
-            for stored in opening_legs.iter().filter(|stored| {
-                matches!(
-                    stored.status,
-                    IntentStatus::Submitting | IntentStatus::Accepted | IntentStatus::Uncertain
-                )
-            }) {
-                self.submit_or_reconcile(&stored.intent, true).await?;
-            }
-            intents = self.storage.batch_intents(batch_id).await?;
-            return self.finish_or_wait_openings(batch_id, &intents).await;
-        }
-
-        if phase_has_terminal_failure(&intents, ExecutionPhase::Opening) {
-            self.storage
-                .set_batch_status(
-                    batch_id,
-                    RebalanceBatchStatus::Failed,
-                    Some("an opening leg is rejected or cancelled"),
-                )
+            self.submit_or_reconcile(&stored.intent, true, Some(batch.target.valid_until))
                 .await?;
-            return Ok(BatchExecutionOutcome::Failed);
+            intents = self.storage.batch_intents(batch_id).await?;
+            // Проверяется результат каждой отдельной reconciliation. Если она
+            // стала terminal, остальные legs обрабатываются только no-resubmit.
+            if phase_has_terminal_failure(&intents, ExecutionPhase::Opening) {
+                return self
+                    .settle_failed_batch(
+                        batch_id,
+                        &intents,
+                        "an opening leg is rejected or cancelled",
+                    )
+                    .await;
+            }
+            return self.finish_or_wait_openings(batch_id, &intents).await;
         }
         if phase_is_filled(&intents, ExecutionPhase::Opening) {
             self.storage
@@ -1495,33 +1658,35 @@ where
                 .await?;
             return Ok(BatchExecutionOutcome::AwaitingFills);
         }
-        if !opening_sources_match(&refreshed, &intents)? {
-            self.storage
-                .set_batch_status(
+        if !pending_sources_match(&refreshed, &intents, ExecutionPhase::Opening)? {
+            return self
+                .settle_failed_batch(
                     batch_id,
-                    RebalanceBatchStatus::AwaitingFills,
-                    Some("fresh positions do not match the pending opening sources"),
+                    &intents,
+                    "fresh positions do not match the pending opening sources",
                 )
-                .await?;
-            return Ok(BatchExecutionOutcome::AwaitingFills);
+                .await;
         }
         self.storage
             .set_batch_status(batch_id, RebalanceBatchStatus::Opening, None)
             .await?;
         if !self
-            .execute_phase(&intents, ExecutionPhase::Opening)
+            .execute_phase(
+                &intents,
+                ExecutionPhase::Opening,
+                Some(batch.target.valid_until),
+            )
             .await?
         {
             intents = self.storage.batch_intents(batch_id).await?;
             if phase_has_terminal_failure(&intents, ExecutionPhase::Opening) {
-                self.storage
-                    .set_batch_status(
+                return self
+                    .settle_failed_batch(
                         batch_id,
-                        RebalanceBatchStatus::Failed,
-                        Some("an opening leg is rejected or cancelled"),
+                        &intents,
+                        "an opening leg is rejected or cancelled",
                     )
-                    .await?;
-                return Ok(BatchExecutionOutcome::Failed);
+                    .await;
             }
             self.storage
                 .set_batch_status(batch_id, RebalanceBatchStatus::AwaitingFills, None)
@@ -1577,7 +1742,12 @@ where
         {
             match stored.status {
                 IntentStatus::Pending => {
-                    self.storage.reject_intent(stored.intent.id, reason).await?;
+                    // Отклоняем только действительно не захваченную ногу. Если
+                    // конкурент уже сделал Pending→Submitting, свежая загрузка
+                    // ниже увидит active status и оставит batch recoverable.
+                    self.storage
+                        .reject_pending_intent(stored.intent.id, reason)
+                        .await?;
                 }
                 IntentStatus::Submitting | IntentStatus::Accepted | IntentStatus::Uncertain => {
                     self.reconcile_without_resubmission(&stored.intent, reason)
@@ -1618,14 +1788,9 @@ where
             return Ok(BatchExecutionOutcome::Completed);
         }
         if phase_has_terminal_failure(intents, ExecutionPhase::Opening) {
-            self.storage
-                .set_batch_status(
-                    batch_id,
-                    RebalanceBatchStatus::Failed,
-                    Some("an opening leg is rejected or cancelled"),
-                )
-                .await?;
-            return Ok(BatchExecutionOutcome::Failed);
+            return self
+                .settle_failed_batch(batch_id, intents, "an opening leg is rejected or cancelled")
+                .await;
         }
         self.storage
             .set_batch_status(batch_id, RebalanceBatchStatus::AwaitingFills, None)
@@ -1633,7 +1798,53 @@ where
         Ok(BatchExecutionOutcome::AwaitingFills)
     }
 
-    async fn execute_phase(&self, intents: &[StoredIntent], phase: ExecutionPhase) -> Result<bool> {
+    /// Доводит невозможный полный target до безопасного terminal-состояния.
+    ///
+    /// Наличие одной rejected/cancelled ноги ещё не разрешает забыть остальные:
+    /// Pending отклоняются локально, а заявки, которые могли попасть брокеру,
+    /// только reconciliate-ятся. Batch остаётся recoverable, пока хотя бы одна
+    /// такая заявка не получила terminal status.
+    async fn settle_failed_batch(
+        &self,
+        batch_id: Uuid,
+        intents: &[StoredIntent],
+        reason: &str,
+    ) -> Result<BatchExecutionOutcome> {
+        for stored in intents {
+            match stored.status {
+                IntentStatus::Pending => {
+                    // CAS не позволяет локальному settle отменить заявку после
+                    // того, как другой worker получил право на broker RPC.
+                    self.storage
+                        .reject_pending_intent(stored.intent.id, reason)
+                        .await?;
+                }
+                IntentStatus::Submitting | IntentStatus::Accepted | IntentStatus::Uncertain => {
+                    self.reconcile_without_resubmission(&stored.intent, reason)
+                        .await?;
+                }
+                IntentStatus::Filled | IntentStatus::Cancelled | IntentStatus::Rejected => {}
+            }
+        }
+        let refreshed = self.storage.batch_intents(batch_id).await?;
+        if intents_have_active_legs(&refreshed) {
+            self.storage
+                .set_batch_status(batch_id, RebalanceBatchStatus::AwaitingFills, Some(reason))
+                .await?;
+            return Ok(BatchExecutionOutcome::AwaitingFills);
+        }
+        self.storage
+            .set_batch_status(batch_id, RebalanceBatchStatus::Failed, Some(reason))
+            .await?;
+        Ok(BatchExecutionOutcome::Failed)
+    }
+
+    async fn execute_phase(
+        &self,
+        intents: &[StoredIntent],
+        phase: ExecutionPhase,
+        submission_deadline: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
         for stored in intents
             .iter()
             .filter(|stored| stored.intent.execution_phase == phase)
@@ -1642,12 +1853,38 @@ where
                 IntentStatus::Filled => {}
                 IntentStatus::Cancelled | IntentStatus::Rejected => return Ok(false),
                 IntentStatus::Pending => {
+                    // Deadline проверяется непосредственно перед CAS/сетевым
+                    // вызовом, а не только при загрузке batch: portfolio refresh
+                    // сам может занять оставшееся время жизни target.
+                    if submission_deadline.is_some_and(|deadline| Utc::now() > deadline) {
+                        self.storage
+                            .reject_pending_intent(
+                                stored.intent.id,
+                                "opening target expired before broker submission",
+                            )
+                            .await?;
+                        return Ok(false);
+                    }
                     // CAS Pending→Submitting даёт право отправки только одному
                     // worker-у и закрывает окно двойной заявки.
                     if !self.storage.claim_intent(stored.intent.id).await? {
                         return Ok(false);
                     }
-                    let update = self.submit_or_reconcile(&stored.intent, false).await?;
+                    // CAS сам является await и мог завершиться уже после
+                    // deadline. В этот момент RPC ещё точно не начинался, поэтому
+                    // захваченный Submitting можно безопасно сделать Rejected.
+                    if submission_deadline.is_some_and(|deadline| Utc::now() > deadline) {
+                        self.storage
+                            .reject_intent(
+                                stored.intent.id,
+                                "opening target expired while claiming broker submission",
+                            )
+                            .await?;
+                        return Ok(false);
+                    }
+                    let update = self
+                        .submit_or_reconcile(&stored.intent, false, submission_deadline)
+                        .await?;
                     if !matches!(
                         update,
                         ExecutionOutcome::Submitted(OrderUpdate {
@@ -1661,7 +1898,9 @@ where
                 IntentStatus::Submitting | IntentStatus::Accepted | IntentStatus::Uncertain => {
                     // После crash неизвестно, дошёл ли предыдущий запрос. Сначала
                     // запрашиваем брокера по тому же request_id, не отправляем заново.
-                    let update = self.submit_or_reconcile(&stored.intent, true).await?;
+                    let update = self
+                        .submit_or_reconcile(&stored.intent, true, submission_deadline)
+                        .await?;
                     if !matches!(
                         update,
                         ExecutionOutcome::Submitted(OrderUpdate {
@@ -1681,9 +1920,10 @@ where
         &self,
         intent: &OrderIntent,
         reconcile_first: bool,
+        resubmission_deadline: Option<DateTime<Utc>>,
     ) -> Result<ExecutionOutcome> {
         if reconcile_first {
-            return self.reconcile(intent, None).await;
+            return self.reconcile(intent, None, resubmission_deadline).await;
         }
         match self.trading.place_order(intent).await {
             Ok(response) => {
@@ -1693,7 +1933,8 @@ where
                 Ok(ExecutionOutcome::Submitted(response.data))
             }
             Err(error) if ambiguous_order_error(&error) => {
-                self.reconcile(intent, Some(error)).await
+                self.reconcile(intent, Some(error), resubmission_deadline)
+                    .await
             }
             Err(error) => {
                 self.storage
@@ -1708,6 +1949,7 @@ where
         &self,
         intent: &OrderIntent,
         original: Option<Error>,
+        resubmission_deadline: Option<DateTime<Utc>>,
     ) -> Result<ExecutionOutcome> {
         match self
             .trading
@@ -1722,7 +1964,49 @@ where
             }
             Err(Error::Status(status)) if status.code() == Code::NotFound => {
                 // Только подтверждённый NotFound означает, что request_id у
-                // брокера отсутствует и его допустимо отправить впервые/повторно.
+                // брокера отсутствует. Но перед повтором нужно ещё доказать, что
+                // фактическая позиция не изменилась относительно source этой ноги.
+                if resubmission_deadline.is_some_and(|deadline| Utc::now() > deadline) {
+                    self.storage
+                        .reject_intent(
+                            intent.id,
+                            "opening target expired before broker resubmission",
+                        )
+                        .await?;
+                    return Ok(ExecutionOutcome::Suppressed);
+                }
+                let portfolio = self.portfolio.portfolio(&intent.account_id).await?.data;
+                if portfolio.account_id != intent.account_id
+                    || portfolio.positions.iter().any(|position| position.blocked)
+                    || !intent_source_matches(&portfolio, intent)?
+                {
+                    self.storage
+                        .reject_intent(
+                            intent.id,
+                            "broker request is absent, but the current position no longer matches the intent source",
+                        )
+                        .await?;
+                    return Ok(ExecutionOutcome::Suppressed);
+                }
+                // Portfolio RPC тоже занимает время; opening deadline повторно
+                // проверяется непосредственно перед mutation RPC.
+                if resubmission_deadline.is_some_and(|deadline| Utc::now() > deadline) {
+                    self.storage
+                        .reject_intent(
+                            intent.id,
+                            "opening target expired while validating broker resubmission",
+                        )
+                        .await?;
+                    return Ok(ExecutionOutcome::Suppressed);
+                }
+                if self.storage.batch_execution_gate(intent.batch_id).await?
+                    != BatchExecutionGate::Ready
+                {
+                    self.storage
+                        .reject_intent(intent.id, "operator control forbids resubmission")
+                        .await?;
+                    return Ok(ExecutionOutcome::Suppressed);
+                }
                 match self.trading.place_order(intent).await {
                     Ok(response) => {
                         self.storage
@@ -1730,9 +2014,18 @@ where
                             .await?;
                         Ok(ExecutionOutcome::Submitted(response.data))
                     }
-                    Err(error) => {
+                    Err(error) if ambiguous_order_error(&error) => {
                         self.storage
                             .mark_uncertain(intent.id, &error.to_string())
+                            .await?;
+                        Err(error)
+                    }
+                    Err(error) => {
+                        // InvalidArgument/PermissionDenied и прочие однозначные
+                        // ответы доказывают, что заявка не принята. Оставлять их
+                        // Uncertain означало бы бесконечно повторять невалидный RPC.
+                        self.storage
+                            .reject_intent(intent.id, &error.to_string())
                             .await?;
                         Err(error)
                     }
@@ -1816,6 +2109,18 @@ fn phase_has_active(intents: &[StoredIntent], phase: ExecutionPhase) -> bool {
     })
 }
 
+fn intents_have_active_legs(intents: &[StoredIntent]) -> bool {
+    intents.iter().any(|stored| {
+        matches!(
+            stored.status,
+            IntentStatus::Pending
+                | IntentStatus::Submitting
+                | IntentStatus::Accepted
+                | IntentStatus::Uncertain
+        )
+    })
+}
+
 fn phase_is_filled(intents: &[StoredIntent], phase: ExecutionPhase) -> bool {
     intents
         .iter()
@@ -1823,38 +2128,48 @@ fn phase_is_filled(intents: &[StoredIntent], phase: ExecutionPhase) -> bool {
         .all(|stored| stored.status == IntentStatus::Filled)
 }
 
-fn opening_sources_match(portfolio: &PortfolioSnapshot, intents: &[StoredIntent]) -> Result<bool> {
-    let opening_legs = intents
+fn pending_sources_match(
+    portfolio: &PortfolioSnapshot,
+    intents: &[StoredIntent],
+    phase: ExecutionPhase,
+) -> Result<bool> {
+    let pending_legs = intents
         .iter()
-        .filter(|stored| stored.intent.execution_phase == ExecutionPhase::Opening)
+        .filter(|stored| stored.intent.execution_phase == phase)
         .collect::<Vec<_>>();
     // Filled legs уже закономерно изменили позицию. Сверяются только ещё не
     // отправленные ноги; active legs до этой функции не допускаются executor-ом.
-    for stored in opening_legs
+    for stored in pending_legs
         .into_iter()
         .filter(|stored| stored.status == IntentStatus::Pending)
     {
-        let intent = &stored.intent;
-        // Intent хранит конечный target и абсолютный delta. Восстанавливаем
-        // позицию, с которой должна начинаться opening leg:
-        // buy: source = target - lots; sell: source = target + lots.
-        let source_lots = match intent.side {
-            OrderSide::Buy => intent.target_lots.checked_sub(intent.lots),
-            OrderSide::Sell => intent.target_lots.checked_add(intent.lots),
-        }
-        .ok_or_else(|| Error::RiskRejected("opening source lots overflow".to_owned()))?;
-        let expected_quantity = Decimal::from(source_lots) * Decimal::from(intent.lot_size);
-        let actual_quantity = portfolio
-            .positions
-            .iter()
-            .filter(|position| position.instrument_id == intent.instrument_id)
-            .map(|position| position.quantity)
-            .sum::<Decimal>();
-        if actual_quantity != expected_quantity {
+        if !intent_source_matches(portfolio, &stored.intent)? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Сверяет фактическое количество бумаг с позицией, от которой была построена leg.
+///
+/// Intent хранит конечный `target_lots` и положительный размер delta. Поэтому
+/// исходная позиция восстанавливается однозначно: для buy это `target - lots`,
+/// для sell — `target + lots`. Проверка используется и для Pending legs, и перед
+/// resubmit ранее захваченной, но отсутствующей у брокера заявки.
+fn intent_source_matches(portfolio: &PortfolioSnapshot, intent: &OrderIntent) -> Result<bool> {
+    let source_lots = match intent.side {
+        OrderSide::Buy => intent.target_lots.checked_sub(intent.lots),
+        OrderSide::Sell => intent.target_lots.checked_add(intent.lots),
+    }
+    .ok_or_else(|| Error::RiskRejected("order source lots overflow".to_owned()))?;
+    let expected_quantity = Decimal::from(source_lots) * Decimal::from(intent.lot_size);
+    let actual_quantity = portfolio
+        .positions
+        .iter()
+        .filter(|position| position.instrument_id == intent.instrument_id)
+        .map(|position| position.quantity)
+        .sum::<Decimal>();
+    Ok(actual_quantity == expected_quantity)
 }
 
 fn ambiguous_order_error(error: &Error) -> bool {
@@ -1872,4 +2187,84 @@ fn ambiguous_order_error(error: &Error) -> bool {
                     | Code::Unavailable
             )
     ) || matches!(error, Error::Timeout(_))
+}
+
+#[cfg(all(test, feature = "strategies"))]
+mod warmup_batch_tests {
+    use super::{EventPhase, PortfolioEngine, StrategyEvent, StrategyEventKind};
+    use crate::{
+        domain::{AccountId, Candle, CandleInterval, InstrumentId, Price, StrategyId},
+        storage::{MemoryStorage, Storage},
+        strategies::{
+            BuiltinStrategySpec, MovingAverageTrendConfig, WeightedEnsembleStrategy,
+            WeightedStrategySpec,
+        },
+    };
+    use chrono::{Duration, Utc};
+    use rust_decimal::Decimal;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn warmup_checkpoint_is_atomic_and_never_accepts_live_events() {
+        let id = StrategyId::new("warmup-test").unwrap();
+        let account = AccountId::new("account").unwrap();
+        let uid = InstrumentId::new("uid").unwrap();
+        let storage = Arc::new(MemoryStorage::default());
+        let strategy = WeightedEnsembleStrategy::new(
+            id.clone(),
+            account.clone(),
+            vec![uid.clone()],
+            vec![WeightedStrategySpec {
+                signal_weight: Decimal::ONE,
+                strategy: BuiltinStrategySpec::MovingAverageTrend(
+                    MovingAverageTrendConfig::default(),
+                ),
+            }],
+        )
+        .unwrap();
+        let engine = PortfolioEngine::new(Box::new(strategy), storage.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let event = |n| StrategyEvent {
+            id: format!("candle-{n}"),
+            phase: EventPhase::Warmup,
+            occurred_at: now + Duration::days(n),
+            payload: StrategyEventKind::Candle(Candle {
+                instrument_id: uid.clone(),
+                interval: CandleInterval::OneDay,
+                time: now + Duration::days(n),
+                complete: true,
+                volume: 1,
+                open: Price::new(Decimal::ONE),
+                high: Price::new(Decimal::ONE),
+                low: Price::new(Decimal::ONE),
+                close: Price::new(Decimal::ONE),
+            }),
+        };
+        assert!(engine.process_warmup_batch(&[event(0)]).await.unwrap());
+        let before = storage.load_portfolio_strategy_state(&id).await.unwrap();
+        assert!(
+            !engine
+                .process_warmup_batch(&[event(1), event(0)])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            storage.load_portfolio_strategy_state(&id).await.unwrap(),
+            before
+        );
+        assert!(engine.process_warmup_batch(&[event(1)]).await.unwrap());
+        let mut live = event(2);
+        live.phase = EventPhase::Live;
+        assert!(engine.process_warmup_batch(&[live]).await.is_err());
+        assert!(!storage.has_pending_orders(&account).await.unwrap());
+        assert!(
+            storage
+                .pending_batch_ids(&account, &id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

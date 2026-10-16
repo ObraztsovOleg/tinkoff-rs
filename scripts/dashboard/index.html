@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light"><title>Sandbox · Наблюдение за стратегиями</title>
+  <link rel="icon" href="data:,"><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/detail.js" defer></script><script src="/controls.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#overview"><span class="brand-icon">S<span>↗</span></span><span>Sandbox<span class="brand-sub">STRATEGY LAB</span></span></a>
+    <div class="nav-label">НАБЛЮДЕНИЕ</div>
+    <nav><a href="#overview" class="selected"><span>◫</span>Обзор</a><a href="#strategies"><span>≋</span>Стратегии</a><a href="#activity"><span>↔</span>Сделки и позиции</a><a href="#accounts"><span>▤</span>Счета</a></nav>
+    <div class="sidebar-note"><span class="small-dot"></span> Виртуальные средства<p>Пять торговых сессий.<br>Реальные рыночные события.</p></div>
+    <div class="sidebar-bottom">T‑Invest Sandbox<span>Локальное управление</span></div>
+  </aside>
+  <main>
+    <header id="overview"><div><div class="eyebrow">ПЕСОЧНИЦА / КАМПАНИЯ</div><h1>Стратегии в работе<span class="title-dot">.</span></h1><p id="campaign-id" class="muted">Подключаемся к стенду…</p></div><div class="header-actions"><span id="connection" class="badge">Загрузка</span><button id="refresh" class="button" type="button">↻ Обновить</button></div></header>
+    <div id="notice" class="notice" role="status" hidden></div>
+    <div id="schedule-explanation" class="schedule-explanation" hidden></div>
+    <section class="session-panel panel" aria-label="Расписание"><div class="session-heading"><span class="eyebrow">ОКНО НАБЛЮДЕНИЯ</span><span id="next-session" class="muted"></span></div><div id="sessions" class="sessions"></div></section>
+    <section class="metrics" aria-label="Основные показатели">
+      <article class="metric"><div class="metric-label">Стоимость всех счетов <span>₽</span></div><div id="total-equity" class="metric-value">—</div><div id="account-count" class="metric-note">Ожидаем снимок брокера</div></article>
+      <article class="metric"><div class="metric-label">Стратегии <span>◫</span></div><div id="strategy-count" class="metric-value">—</div><div id="runtime-count" class="metric-note">Процессы ещё не проверены</div></article>
+      <article class="metric"><div class="metric-label">Активные заявки <span>↗</span></div><div id="open-orders" class="metric-value">—</div><div class="metric-note">По последнему снимку брокера</div></article>
+      <article class="metric"><div class="metric-label">Исполненные заявки <span>✓</span></div><div id="filled-orders" class="metric-value">—</div><div id="filled-note" class="metric-note">Служебные закрытия отдельно</div></article>
+    </section>
+    <section class="chart-panel panel"><div class="section-heading"><div><h2>Стоимость портфеля</h2><p class="muted">Виртуальные рубли · включая пополнения и комиссии</p></div><label class="sr-only" for="chart-account">Счёт для графика</label><select id="chart-account"><option value="">Все счета</option></select></div><div class="chart-wrap"><svg id="equity-chart" viewBox="0 0 1000 220" role="img" aria-label="График стоимости счетов"></svg><div id="chart-empty" class="chart-empty"><span class="empty-icon">⌁</span><strong>История только начинается</strong><span>Для графика нужны два снимка брокера.<br>Новые точки появляются примерно раз в пять минут.</span></div><div id="chart-tooltip" class="chart-tooltip" hidden></div></div><div class="chart-footer"><span><i class="legend-dot"></i>Стоимость по снимкам API</span><span id="broker-updated">Нет снимка</span></div></section>
+    <section id="strategies" class="panel"><div class="section-heading"><div><h2>Стратегии <span id="strategies-total" class="count-pill">0</span></h2><p class="muted">Нажмите на стратегию, чтобы открыть график её инструментов и сделки</p></div><label class="sr-only" for="strategy-filter">Выбрать стратегию</label><select id="strategy-filter"><option value="">Все стратегии</option></select></div><div class="table-wrap"><table><thead><tr><th>Стратегия</th><th>Сессии</th><th>Состояние</th><th>Прогрев</th><th class="num">Решения / цели</th><th class="num">Заявки исполнены</th><th>Риск / перезапуск</th></tr></thead><tbody id="strategy-rows"></tbody></table></div><div class="panel-footnote">Нулевая цель — корректное решение. Отсутствие цели или сделки пока означает непокрытый сценарий. Успешный прогрев не означает, что процесс сейчас запущен.</div></section>
+    <section id="strategy-detail" class="panel" hidden>
+      <div class="section-heading"><div><div class="eyebrow">ПОДРОБНОСТИ СТРАТЕГИИ</div><h2 id="detail-name"></h2><p id="detail-schedule" class="muted"></p></div><button id="close-detail" class="button" type="button">← Все стратегии</button></div>
+      <div class="asset-toolbar"><div><label for="asset-select">Инструмент графика</label><select id="asset-select"></select></div><div><label for="asset-interval">Свечи</label><select id="asset-interval"><option value="5s">5 секунд</option><option value="10s">10 секунд</option><option value="30s">30 секунд</option><option value="5m">5 минут</option><option value="30m">30 минут · 14 дней</option><option value="day">1 день · год</option></select></div><div class="asset-quote"><strong id="asset-price">—</strong><span id="asset-time"></span></div></div>
+      <div class="asset-chart-wrap"><svg id="asset-chart" viewBox="0 0 1000 320" role="img" aria-label="Свечи инструмента и отметки сделок"></svg><div id="asset-empty" class="chart-empty"><strong>Загружаем историю инструмента…</strong></div><div id="asset-tooltip" class="chart-tooltip" hidden></div></div>
+      <div class="asset-legend"><span><i class="legend-dot"></i>Покупка ▲</span><span class="side-sell">Продажа ▼</span><span class="planned-label">План ◇ · цена рыночной заявки ещё неизвестна</span><span id="asset-freshness"></span></div>
+      <div class="detail-columns"><div><h3>Совершённые сделки <span id="executed-count" class="count-pill">0</span></h3><div id="executed-trades"></div></div><div><h3>План и заявки <span id="planned-count" class="count-pill">0</span></h3><p id="target-summary" class="detail-note"></p><div id="planned-trades"></div></div></div>
+      <div class="panel-footnote">График показывает рыночные свечи выбранного актива. Отметки исполнения используют подтверждённые цены сделок. Планы берутся из сохранённых решений стратегии; будущие сигналы заранее неизвестны.</div>
+    </section>
+    <section id="activity" class="panel"><div class="section-heading"><div><h2>Сделки и позиции</h2><p id="activity-scope" class="muted">Все счета кампании</p></div></div><div class="tabs" role="tablist" aria-label="Данные о торговле"><button role="tab" aria-selected="true" aria-controls="activity-content" id="tab-orders" data-tab="orders">Заявки</button><button role="tab" aria-selected="false" aria-controls="activity-content" id="tab-fills" data-tab="fills">Исполнения</button><button role="tab" aria-selected="false" aria-controls="activity-content" id="tab-positions" data-tab="positions">Позиции</button><button role="tab" aria-selected="false" aria-controls="activity-content" id="tab-operations" data-tab="operations">Операции брокера</button></div><div id="activity-content" role="tabpanel" aria-labelledby="tab-orders" tabindex="0"></div></section>
+    <section id="accounts"><div class="section-heading"><div><h2>Счета песочницы</h2><p class="muted">Один счёт — одна карточка, даже при последовательном запуске нескольких стратегий</p></div></div><div id="account-cards" class="account-grid"></div></section>
+    <footer><span id="db-updated">Состояние стратегий: ожидаем данные</span><span>Страница: каждые 10 с · отчёт: ~1 мин · брокер: ~5 мин</span></footer>
+  </main>
+</body>
+</html>
