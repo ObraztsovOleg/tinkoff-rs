@@ -1,0 +1,29 @@
+contour = "sandbox"
+account_id = "REPLACE_WITH_DEDICATED_SANDBOX_ACCOUNT_ID"
+strategy_id = "example-ai-model"
+app_name = "YourName.tinkoff-rs.strategies"
+database_connections = 5
+
+[risk]
+budget_rub = "30000.00"
+daily_loss_percent = "3.0"
+max_drawdown_percent = "15.0"
+
+# The model chooses weights only among these instruments (1–50).
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_01"
+
+[[universe]]
+uid = "REPLACE_WITH_MOEX_INSTRUMENT_UID_02"
+
+[[strategies]]
+signal_weight = "1.0"
+kind = "ai-model"
+# Profile name from AI_MODELS_FILE (provider, url, model, token); omit for `default`.
+model_profile = "claude"
+# Your idea of the strategy, in plain words.
+instructions = "Держи бумаги с позитивными корпоративными новостями и восходящим трендом; при негативе сокращай позиции."
+news_hours = 24
+max_tool_rounds = 8
+max_weight_percent = "25"
+allow_short = false

@@ -34,6 +34,16 @@ CONTROL_SPEC = importlib.util.spec_from_file_location("dashboard_control", ASSET
 control_module = importlib.util.module_from_spec(CONTROL_SPEC)
 CONTROL_SPEC.loader.exec_module(control_module)
 CHART_INTERVALS = {"5s", "10s", "30s", "5m", "30m", "day"}
+# Runtime logs per strategy: main process, preflight warmup and account cleanup.
+LOG_SOURCES = {"main": "", "preflight": ".preflight", "cleanup": ".cleanup"}
+LOG_TAIL_BYTES = 512 * 1024
+LOG_LINE = re.compile(r"^(?P<time>\d{4}-\d\d-\d\dT[\d:.]+Z)\s+(?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+(?P<target>[\w:]+):\s?(?P<body>.*)$")
+LOG_FIELD = re.compile(r"(?:^|\s)([a-z_][a-z0-9_.]*)=")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# Tokens are never logged by design; mask them anyway in case an upstream error echoes one.
+SECRETS = [(re.compile(r"\bt\.[A-Za-z0-9_-]{20,}"), "t.***"),
+           (re.compile(r"(?i)\b(bearer\s+)[^\s\"',]+"), r"\1***"),
+           (re.compile(r"(postgres(?:ql)?://[^:/\s@]+:)[^@\s]+@"), r"\1***@")]
 
 
 def read_json(path):
@@ -96,6 +106,17 @@ def case_assets(work, case, instruments, benchmark):
     return assets
 
 
+def uses_ai_model(work, case):
+    """True when the strategy config contains an ai-model component."""
+    path = (work / case.get("config", "")).resolve()
+    if not path.is_relative_to((work / "configs").resolve()):
+        return False
+    try:
+        return 'kind = "ai-model"' in path.read_text()
+    except OSError:
+        return False
+
+
 def market_snapshot(work, uid, interval):
     if interval not in CHART_INTERVALS:
         return None
@@ -111,8 +132,71 @@ def market_snapshot(work, uid, interval):
                         for c in series.get("candles", [])]}
 
 
+def redact(text):
+    text = ANSI.sub("", text)
+    for pattern, replacement in SECRETS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def parse_log_line(line):
+    """tracing fmt line -> time, level, target, message and key=value fields."""
+    line = redact(line)[:4000]
+    match = LOG_LINE.match(line)
+    if not match:
+        return {"time": None, "level": "RAW", "target": None, "message": line, "fields": {}}
+    body = match["body"]
+    keys = list(LOG_FIELD.finditer(body))
+    fields = {}
+    for index, key in enumerate(keys):
+        end = keys[index + 1].start() if index + 1 < len(keys) else len(body)
+        fields[key[1]] = body[key.end():end].strip()
+    message = body[:keys[0].start()].strip() if keys else body.strip()
+    return {"time": match["time"], "level": match["level"], "target": match["target"], "message": message, "fields": fields}
+
+
+def strategy_log(work, kind, source="main", limit=300):
+    """Tail of one strategy log, parsed and redacted. Reads at most LOG_TAIL_BYTES."""
+    if source not in LOG_SOURCES or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", kind or ""):
+        raise ValueError("unknown log")
+    directory = work / "logs"
+    available = [name for name, suffix in LOG_SOURCES.items() if (directory / f"{kind}{suffix}.log").is_file()]
+    path = directory / f"{kind}{LOG_SOURCES[source]}.log"
+    result = {"strategy": kind, "source": source, "sources": available, "exists": path.is_file(),
+              "size": 0, "modified": None, "truncated": False, "entries": []}
+    if not result["exists"]:
+        return result
+    with path.open("rb") as log:
+        log.seek(0, os.SEEK_END)
+        size = log.tell()
+        start = max(0, size - LOG_TAIL_BYTES)
+        log.seek(start)
+        chunk = log.read()
+    if start:
+        # Drop the partial first line of a tail read.
+        chunk = chunk.split(b"\n", 1)[1] if b"\n" in chunk else b""
+    lines = [line for line in chunk.decode(errors="replace").splitlines() if line.strip()]
+    limit = max(1, min(int(limit), 1000))
+    result.update(size=size, modified=modified(path), truncated=bool(start) or len(lines) > limit,
+                  entries=[parse_log_line(line) for line in lines[-limit:]])
+    return result
+
+
+def storage(work, campaign):
+    """Disk space, nightly maintenance and backups, without paths of the host."""
+    disk = campaign.get("disk") or {}
+    directory = work / "backups"
+    files = sorted(directory.glob("*.dump"), key=lambda f: f.stat().st_mtime, reverse=True)[:5] if directory.is_dir() else []
+    return {"disk": dict(pick(disk, ["level", "free_bytes", "path", "database_bytes", "checked_at"]),
+                         readings=[pick(r, ["path", "free_bytes", "total_bytes"]) for r in disk.get("readings", [])]),
+            "maintenance": pick(campaign.get("maintenance") or {}, ["day", "at", "deleted", "rotated_logs", "database_bytes", "seconds", "error", "retry_at"]),
+            "backups": {"status": read_json(directory / "status.json"),
+                        "files": [{"name": f.name, "bytes": f.stat().st_size,
+                                   "at": dt.datetime.fromtimestamp(f.stat().st_mtime, UTC).isoformat()} for f in files]}}
+
+
 def snapshot(work):
-    """Explicit output schema: never expose campaign.json, config, errors or logs."""
+    """Explicit output schema: never expose campaign.json, config or errors. Logs have their own redacted endpoint."""
     campaign = read_json(work / "campaign.json") or {}
     database = read_json(work / "reports/database.json")
     broker = read_json(work / "reports/broker-latest.json")
@@ -166,6 +250,7 @@ def snapshot(work):
                        "status": o.get("state")}
                       for o in data.get("operations", [])]
         accounts[account_id] = {"id": account_id, "cases": [c["kind"] for c in candidates],
+                                "contour": "production" if any(c.get("contour") == "production" for c in candidates) else "sandbox",
                                 "owner": names.get(current_risk.get("strategy_id")),
                                 "equity": money(portfolio.get("totalAmountPortfolio")), "cash": cash,
                                 "available": bool(data), "positions": positions,
@@ -176,15 +261,26 @@ def snapshot(work):
         owned = current.get("strategy_id") == case["strategy_id"]
         risk_state = current.get("state", {}) if owned else {}
         lifecycle = case.get("lifecycle_check", {})
-        sessions = campaign.get("sessions", [])
-        first = 0 if case.get("cohort", 0) == 0 else case["cohort"] + 1
-        opening = sessions[first].get("startTime") if first < len(sessions) else None
-        launch_at = (dt.datetime.fromisoformat(opening.replace("Z", "+00:00")) - dt.timedelta(hours=1)).isoformat() if opening else None
-        row = pick(case, ["kind", "strategy_id", "account_id", "state", "cohort", "predecessor",
+        schedule = case.get("schedule") or {}
+        windows = [pick(w, ["begin", "open", "end", "days"]) for w in schedule.get("windows", [])]
+        # The current or next operator window; past windows only matter for history.
+        upcoming = next((w for w in windows if w.get("end") and w["end"] > dt.datetime.now(UTC).isoformat()), None)
+        row = pick(case, ["kind", "strategy_id", "account_id", "state", "cohort", "predecessor", "title",
                           "natural_decision_count", "natural_target_count", "nonzero_target_count",
-                          "strategy_filled_intents", "failed_batches", "preflight_result", "readiness_observed"])
+                          "strategy_filled_intents", "failed_batches", "preflight_result", "readiness_observed",
+                          "service_only", "last_started", "retry_at", "launches", "source", "promoted_at"])
+        # Real accounts are marked everywhere; the UI never offers sandbox-only actions there.
+        row["contour"] = "production" if case.get("contour") == "production" else "sandbox"
+        row["ai_model"] = uses_ai_model(work, case)
+        if row["contour"] == "production":
+            row["risk_limits"] = pick(case.get("risk_limits") or {}, ["budget", "daily_loss_percent", "max_drawdown_percent"])
         row.update(owns_account=owned, running=alive(case.get("pid"), str(work / case["config"])),
-                   launch_at=launch_at, opening_at=opening,
+                   launch_at=upcoming and upcoming["begin"], opening_at=upcoming and upcoming["open"],
+                   window_end_at=upcoming and upcoming["end"],
+                   schedule={"run_mode": schedule.get("run_mode"), "active": bool(schedule.get("active")),
+                             "close_after": schedule.get("close_after"), "windows": windows},
+                   blocks=[{"share": b.get("share"), "instruments": [{"uid": uid, "ticker": instruments.get(uid, uid)} for uid in b.get("instruments", [])],
+                            "strategies": [pick(x, ["kind", "weight", "params"]) for x in b.get("strategies", [])]} for b in case.get("blocks", [])],
                    assets=case_assets(work, case, instruments, campaign.get("benchmark")),
                    restart=case.get("restart_result") or ("passed" if lifecycle.get("risk_epoch_preserved") else None),
                    lease=case.get("lease_check") or lifecycle.get("lease_check"),
@@ -221,12 +317,16 @@ def snapshot(work):
                         "weights": [{"instrument_id": w.get("instrument_id"), "weight": number(w.get("weight"))}
                                     for w in target.get("weights", [])]})
     sessions = [pick(day, ["date", "startTime", "endTime"]) for day in campaign.get("sessions", [])]
-    return {"campaign": {"id": campaign.get("id"), "phase": campaign.get("phase"), "sessions": sessions,
+    known = {d["date"][:10]: dict(pick(d, ["startTime", "endTime"]), date=d["date"][:10], isTradingDay=True) for d in campaign.get("sessions", []) if d.get("date")}
+    known.update({d["date"]: pick(d, ["date", "isTradingDay", "startTime", "endTime"]) for d in campaign.get("calendar", []) if d.get("date")})
+    suspensions = [pick(x, ["from", "to"]) for x in campaign.get("suspensions", [])][-10:]
+    return {"campaign": {"id": campaign.get("id"), "phase": campaign.get("phase"), "sessions": sessions, "suspensions": suspensions,
+                         "calendar": sorted(known.values(), key=lambda d: d["date"]),
                           "supervisor_running": alive(campaign.get("supervisor_pid"), "sandbox-campaign.py supervise")},
             "updated": {"broker": broker.get("observed_at"), "database": modified(work / "reports/database.json"),
                         "campaign": modified(work / "campaign.json")},
             "cases": cases, "accounts": list(accounts.values()), "orders": orders, "fills": fills, "targets": targets,
-            "warnings": warnings}
+            "storage": storage(work, campaign), "warnings": warnings}
 
 
 class Feed:
@@ -367,6 +467,18 @@ class Handler(BaseHTTPRequestHandler):
                   "/app.js": ("app.js", "text/javascript; charset=utf-8"),
                   "/detail.js": ("detail.js", "text/javascript; charset=utf-8"),
                   "/controls.js": ("controls.js", "text/javascript; charset=utf-8"),
+                  "/logs.js": ("logs.js", "text/javascript; charset=utf-8"),
+                  "/live.js": ("live.js", "text/javascript; charset=utf-8"),
+                  "/nav.js": ("nav.js", "text/javascript; charset=utf-8"),
+                  "/ai.js": ("ai.js", "text/javascript; charset=utf-8"),
+                  "/storage.js": ("storage.js", "text/javascript; charset=utf-8"),
+                  "/documents.js": ("documents.js", "text/javascript; charset=utf-8"),
+                  "/exposures.js": ("exposures.js", "text/javascript; charset=utf-8"),
+                  "/portfolios.js": ("portfolios.js", "text/javascript; charset=utf-8"),
+                  "/aiboard.js": ("aiboard.js", "text/javascript; charset=utf-8"),
+                  "/costs.js": ("costs.js", "text/javascript; charset=utf-8"),
+                  "/theme.js": ("theme.js", "text/javascript; charset=utf-8"),
+                  "/dark.css": ("dark.css", "text/css; charset=utf-8"),
                   "/style.css": ("style.css", "text/css; charset=utf-8")}
         try:
             if route == "/api/session":
@@ -380,9 +492,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(self.require_control().data()["ranking"])
             elif route.startswith("/api/commands/"):
                 self.respond(self.require_control().get_command(route.rsplit("/", 1)[-1]))
+            elif route == "/api/documents":
+                query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self.respond(self.require_control().documents(query))
+            elif route == "/api/document":
+                document_id = parse_qs(urlsplit(self.path).query).get("id", [""])[0]
+                self.respond(self.require_control().document(document_id))
             elif route == "/api/instruments/search":
-                query = parse_qs(urlsplit(self.path).query).get("q", [""])[0]
-                self.respond(self.require_control().search(query))
+                params = parse_qs(urlsplit(self.path).query)
+                self.respond(self.require_control().search(params.get("q", [""])[0], params.get("kind", [""])[0]))
             elif route == "/api/market":
                 query = parse_qs(urlsplit(self.path).query)
                 uid, interval = query.get("instrument", [""])[0], query.get("interval", [""])[0]
@@ -395,6 +513,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.subscribe_chart(uid, interval)
                 series = market_snapshot(self.server.feed.work, uid, interval)
                 self.respond(series or {"uid": uid, "interval": interval, "candles": [], "loading": True, "error": False, "observed_at": None})
+            elif route == "/api/logs":
+                query = parse_qs(urlsplit(self.path).query)
+                kind, source = query.get("strategy", [""])[0], query.get("source", ["main"])[0]
+                current = json.loads(self.server.feed.data()) or {}
+                # Only campaign strategies: the name becomes part of a file path.
+                if kind not in {c["kind"] for c in current.get("cases", [])} or source not in LOG_SOURCES:
+                    self.send_error(404)
+                    return
+                limit = query.get("limit", ["300"])[0]
+                self.respond(strategy_log(self.server.feed.work, kind, source, int(limit) if limit.isdigit() else 300))
             elif route == "/api/health":
                 self.respond({"service": SERVICE, "pid": os.getpid()})
             elif route in assets:

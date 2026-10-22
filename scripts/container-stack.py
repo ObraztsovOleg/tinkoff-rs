@@ -34,6 +34,7 @@ def main():
     if (work / "campaign.json").exists():
         state = campaign.load()
         state.pop("supervisor_pid", None)
+        state.get("collector", {}).pop("pid", None)
         for case in state["cases"].values():
             case.pop("pid", None)
         campaign.persist(state)

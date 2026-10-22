@@ -13,7 +13,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl python3 postgresql-client procps tini && \
+    ca-certificates curl python3 postgresql-client procps tini poppler-utils && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /usr/local/bin/tinkoff-bot /usr/local/bin/tinkoff-bot

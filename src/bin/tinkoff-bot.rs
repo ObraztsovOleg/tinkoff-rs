@@ -1,9 +1,11 @@
-//! CLI и исполняемый цикл для портфельных стратегий T-Invest Sandbox.
+//! CLI и исполняемый цикл для портфельных стратегий T-Invest.
 //!
 //! Инвариант процесса: один экземпляр программы обслуживает один взвешенный ансамбль
-//! и один выделенный Sandbox-счёт. Ансамбль может содержать одну или несколько
-//! стратегий. Production-контур здесь намеренно отсутствует, поэтому ошибка в
-//! конфигурации или логике примера не может отправить заявку на реальный счёт.
+//! и один выделенный счёт. Ансамбль может содержать одну или несколько
+//! стратегий. По умолчанию счёт виртуальный (Sandbox). Реальный счёт
+//! (`contour = "production"`) требует обоих процентных стопов в TOML и токена
+//! `TINKOFF_TOKEN_PRODUCTION` с полным доступом к открытому счёту; аварийная
+//! остановка в базе не даёт запустить процесс реального контура.
 //!
 //! Жизненный цикл команды `run`:
 //! 1. проверить TOML, счёт и инструменты;
@@ -19,14 +21,22 @@
 //! пропускает решение. Процесс завершают сигнал остановки и ошибки, которые
 //! повтор не исправит: конфигурация, авторизация, занятый другим процессом счёт.
 
+#[path = "support/ai/mod.rs"]
+mod ai;
 #[path = "support/cleanup.rs"]
 mod cleanup;
 #[path = "support/control.rs"]
 mod control;
+#[path = "support/documents/mod.rs"]
+mod documents;
 #[path = "support/history.rs"]
 mod history;
+#[path = "support/instruments.rs"]
+mod instruments;
 #[path = "support/resilience.rs"]
 mod resilience;
+#[path = "support/venue.rs"]
+mod venue;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -39,24 +49,25 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use rust_decimal::Decimal;
-use secrecy::SecretString;
 use serde::Deserialize;
 use tinkoff_rs::{
-    Error, Result, SandboxApi,
-    broker::{Accounts, MarketData, Portfolio, SandboxBroker},
+    Error, Result,
+    broker::{MarketData, Portfolio},
     domain::{
         AccountId, Candle, CandleHistoryRequest, CandleInterval, InstrumentId, MarketDataEvent,
         Money, PortfolioSnapshot, Price, StrategyId, datetime_to_timestamp, timestamp_to_datetime,
     },
     engine::{
-        AccountRiskState, BatchExecutionOutcome, BatchExecutor, DataRequirement, EventPhase,
-        InstrumentInfo, PlanningContext, PortfolioEngine, PortfolioStrategy, RiskAnchor,
+        AccountRiskState, BatchExecutionOutcome, BatchExecutor, DataRequirement, DividendEvent,
+        EventPhase, InstrumentFundamentals, InstrumentInfo, InstrumentKind, PlanningContext,
+        PortfolioEngine, PortfolioStrategy, ReferenceData, ReferenceRequirement, RiskAnchor,
         RiskConfig, RiskManager, RiskMode, RiskObservation, ScheduleAnchor, ScheduleEvent,
         ScheduleRequirement, StrategyEvent, StrategyEventKind,
     },
     proto::{
-        GetOperationsByCursorRequest, GetOrdersRequest, InstrumentIdType, InstrumentRequest,
-        OperationState, OperationType, RealExchange, TradingSchedulesRequest,
+        GetAssetFundamentalsRequest, GetDividendsRequest, GetOperationsByCursorRequest,
+        InstrumentIdType, InstrumentRequest, OperationState, OperationType, RealExchange,
+        TradingSchedulesRequest,
     },
     storage::{PostgresStorage, RuntimeLease, Storage},
     strategies::{BuiltinStrategySpec, WeightedEnsembleStrategy, WeightedStrategySpec},
@@ -67,16 +78,27 @@ use tinkoff_rs::{
 };
 use tokio::{sync::watch, time::MissedTickBehavior};
 use tracing::{info, warn};
+use venue::{Contour, VenueApi, VenueBroker};
 
 const DEFAULT_APP_NAME: &str = "ObraztsovOleg.tinkoff-rs.strategies";
 const DEFAULT_DATABASE_CONNECTIONS: u32 = 5;
 /// Небольшое окно допуска для срабатывания события расписания после задержки процесса.
 /// Более старое событие пропускается: исполнять запоздалый сигнал опаснее, чем не исполнить его.
 const SCHEDULE_GRACE_SECONDS: i64 = 120;
+/// Решение открытия сессии, отложенное из-за сна компьютера, сети, аукциона или
+/// незавершённого пакета, повторяется с этим интервалом до конца той же сессии.
+const OPEN_RETRY_SECONDS: i64 = 60;
+/// Последний повтор — не позже чем за столько минут до конца основной сессии.
+const OPEN_RETRY_MARGIN_MINUTES: i64 = 10;
+/// Сколько раз за сессию повторять неудачный запрос к ИИ-модели.
+const AI_ATTEMPTS: u32 = 3;
 
 /// Общие аргументы CLI. Путь к TOML можно передать флагом или переменной окружения.
 #[derive(Parser)]
-#[command(version, about = "T-Invest Sandbox portfolio-strategy runtime")]
+#[command(
+    version,
+    about = "T-Invest portfolio-strategy runtime (Sandbox or a dedicated real account)"
+)]
 struct Cli {
     /// Путь к TOML одного счёта/ансамбля.
     #[arg(long, env = "TINKOFF_BOT_CONFIG", default_value = "bot.toml")]
@@ -94,7 +116,7 @@ enum Command {
     CheckConfig,
     /// Применить миграции `PostgreSQL`; незавершённые legacy-intents блокируют миграцию.
     Migrate,
-    /// Прогреть настроенный ансамбль и запустить его только в Sandbox.
+    /// Прогреть настроенный ансамбль и запустить его в контуре из TOML.
     Run {
         /// Validate live connectivity and persist warmup, then exit before any order recovery or live signal.
         #[arg(long)]
@@ -103,7 +125,7 @@ enum Command {
         #[arg(long, conflicts_with = "startup_only")]
         service_only: bool,
     },
-    /// Reconcile/cancel orders and flatten this dedicated Sandbox account; retry when trading opens.
+    /// Reconcile/cancel orders and flatten this dedicated account; retry when trading opens.
     Cleanup {
         #[arg(long)]
         reason: String,
@@ -116,17 +138,44 @@ enum Command {
         #[arg(long)]
         reason: String,
     },
-}
-
-/// Допустимый торговый контур.
-///
-/// Единственный вариант перечисления делает `contour = "production"` ошибкой TOML,
-/// а не скрытым переключателем, который можно случайно активировать.
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Contour {
-    #[default]
-    Sandbox,
+    /// Показать профили ИИ-моделей из `AI_MODELS_FILE` в JSON (без токенов).
+    AiProfiles,
+    /// Проверить подключение к ИИ-модели коротким запросом без торговли.
+    AiCheck {
+        /// Имя профиля; по умолчанию профиль `default`.
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Пробный анализ ИИ-модели для `ai-model` компонент конфига: решение без заявок.
+    AiPreview,
+    /// Собирать документы для ИИ-стратегии до остановки: новости T-Invest с полными
+    /// текстами и раскрытием эмитентов, деловые ленты, сообщения биржи и Банка России.
+    /// Нужны `DATABASE_URL` и токен Sandbox `TINKOFF_TOKEN` (только чтение).
+    Collect,
+    /// Найти документы в хранилище: та же выдача, что получает модель.
+    Documents {
+        /// Слова запроса; пусто — свежие документы.
+        #[arg(long, default_value = "")]
+        query: String,
+        /// Тикеры бумаг (можно несколько раз).
+        #[arg(long)]
+        ticker: Vec<String>,
+        #[arg(long, default_value_t = 72)]
+        hours: u32,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Как стенд видит инструмент или серию фьючерсов `futures:BR`: тип, лот,
+    /// стоимость единицы цены, текущий контракт и дневная история (только чтение,
+    /// токен Sandbox `TINKOFF_TOKEN`).
+    Inspect {
+        /// UID инструмента или `futures:<код>`.
+        #[arg(long)]
+        id: String,
+        /// Глубина дневной истории.
+        #[arg(long, default_value_t = 120)]
+        days: i64,
+    },
 }
 
 /// Роль инструмента в universe. Значение сохраняется в конфигурации стратегии,
@@ -139,7 +188,8 @@ enum UniverseGroup {
     PairCandidate,
 }
 
-/// Одна запись `[[universe]]`; `uid` — стабильный UID инструмента T-Invest.
+/// Одна запись `[[universe]]`: стабильный UID инструмента T-Invest или
+/// непрерывная серия фьючерсов `futures:BR` (см. [`instruments`]).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UniverseEntry {
@@ -156,10 +206,10 @@ struct UniverseEntry {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BotConfig {
-    /// Всегда `sandbox`; иное значение не десериализуется.
-    #[serde(default, rename = "contour")]
-    _contour: Contour,
-    /// Отдельный Sandbox-счёт, закреплённый за этим ансамблем.
+    /// `sandbox` (по умолчанию) или `production` — реальный счёт.
+    #[serde(default)]
+    contour: Contour,
+    /// Отдельный счёт выбранного контура, закреплённый за этим ансамблем.
     account_id: String,
     /// Уникальный ID конкретного экземпляра ансамбля.
     strategy_id: String,
@@ -233,6 +283,15 @@ impl BotConfig {
             ));
         }
         self.risk.validate()?;
+        // На реальном счёте стопы не опциональны: без них риск ограничен лишь бюджетом.
+        if self.contour == Contour::Production
+            && (self.risk.daily_loss_percent.is_none() || self.risk.max_drawdown_percent.is_none())
+        {
+            return Err(Error::Configuration(
+                "a production config requires risk.daily_loss_percent and risk.max_drawdown_percent"
+                    .to_owned(),
+            ));
+        }
         let account_id = AccountId::new(self.account_id.clone())?;
         let strategy_id = StrategyId::new(self.strategy_id.clone())?;
         let universe = self
@@ -240,6 +299,16 @@ impl BotConfig {
             .iter()
             .map(|entry| InstrumentId::new(entry.uid.clone()))
             .collect::<Result<Vec<_>>>()?;
+        for id in &universe {
+            if id.as_str().starts_with(instruments::SERIES_PREFIX)
+                && instruments::series_code(id)
+                    .is_none_or(|code| instruments::dated_code(&format!("{code}Z6")) != Some(code))
+            {
+                return Err(Error::Configuration(format!(
+                    "`{id}` is not a futures series: expected futures:<two-character MOEX code>"
+                )));
+            }
+        }
         let unique: HashSet<_> = universe.iter().map(InstrumentId::as_str).collect();
         if unique.len() != universe.len() {
             return Err(Error::Configuration(
@@ -271,7 +340,7 @@ async fn main() -> std::process::ExitCode {
                 .unwrap_or_else(|_| "tinkoff_bot=info,tinkoff_rs=info".into()),
         )
         .init();
-    match dispatch().await {
+    match Box::pin(dispatch()).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "command failed");
@@ -296,7 +365,8 @@ async fn dispatch() -> Result<()> {
         Command::CheckConfig => {
             let (config, ids) = BotConfig::load(&cli.config)?;
             println!(
-                "valid: contour=sandbox strategy={} components={} kinds={} instruments={} budget_rub={}",
+                "valid: contour={} strategy={} components={} kinds={} instruments={} budget_rub={}",
+                config.contour.label(),
                 ids.strategy_id,
                 config.strategies.len(),
                 strategy_kinds(&config).join(","),
@@ -329,6 +399,128 @@ async fn dispatch() -> Result<()> {
             );
             Ok(())
         }
+        Command::AiProfiles => {
+            let summary = match ai::Profiles::load() {
+                Ok(profiles) => profiles.summary(),
+                Err(error) => serde_json::json!({"error": error.to_string()}),
+            };
+            println!(
+                "{}",
+                serde_json::json!({"path": ai::Profiles::path(), "profiles": summary})
+            );
+            Ok(())
+        }
+        Command::AiCheck { profile } => {
+            println!("{}", ai::check(profile.as_deref()).await?);
+            Ok(())
+        }
+        Command::AiPreview => {
+            let (config, ids) = BotConfig::load(&cli.config)?;
+            ai_preview(&config, &ids).await
+        }
+        Command::Inspect { id, days } => {
+            let (api, broker) = venue::connect(Contour::Sandbox, DEFAULT_APP_NAME).await?;
+            let id = InstrumentId::new(id)?;
+            let now = Utc::now();
+            api.series()
+                .load(api.instruments(), std::slice::from_ref(&id), now)
+                .await?;
+            let (info, tick) = instruments::describe(&api, &broker, &id).await?;
+            let candles = history::load(
+                broker.as_ref(),
+                CandleHistoryRequest {
+                    instrument_id: id.clone(),
+                    interval: CandleInterval::OneDay,
+                    from: now - Duration::days(days),
+                    to: now,
+                    limit: None,
+                },
+                None,
+            )
+            .await?;
+            let contract =
+                instruments::series_code(&id).and_then(|code| api.series().bound_contract(code));
+            // Крупнейшие дневные движения: проверка склейки истории серии.
+            let mut changes: Vec<(Decimal, DateTime<Utc>)> = candles
+                .windows(2)
+                .filter(|w| w[0].close.0 > Decimal::ZERO)
+                .map(|w| {
+                    (
+                        (w[1].close.0 / w[0].close.0 - Decimal::ONE) * Decimal::ONE_HUNDRED,
+                        w[1].time,
+                    )
+                })
+                .collect();
+            changes.sort_by_key(|(change, _)| std::cmp::Reverse(change.abs()));
+            let moves: Vec<serde_json::Value> = changes
+                .iter()
+                .take(5)
+                .map(|(change, time)| serde_json::json!({"time": time, "percent": change.round_dp(2).to_string()}))
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "info": info,
+                    "price_step": tick.map(|t| t.to_string()),
+                    "contract": contract.as_ref().map(|c| serde_json::json!({
+                        "uid": c.uid, "ticker": c.ticker, "last_trade": c.last_trade, "roll_at": c.roll_at(),
+                    })),
+                    "candles": candles.len(),
+                    "first": candles.first().map(|c| serde_json::json!({"time": c.time, "close": c.close.0.to_string()})),
+                    "last": candles.last().map(|c| serde_json::json!({"time": c.time, "close": c.close.0.to_string()})),
+                    "largest_daily_moves": moves,
+                })
+            );
+            Ok(())
+        }
+        Command::Collect => {
+            let storage = documents_storage().await?;
+            // Без токена Sandbox сборщик работает с остальными источниками.
+            let api = match venue::connect(Contour::Sandbox, DEFAULT_APP_NAME).await {
+                Ok((api, _)) => Some(api),
+                Err(Error::Configuration(message)) => {
+                    warn!(%message, "T-Invest news are off: no sandbox token");
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            documents::collect::run(api, &storage).await
+        }
+        Command::Documents {
+            query,
+            ticker,
+            hours,
+            limit,
+        } => {
+            let storage = documents_storage().await?;
+            let (from, to) = documents::search::default_window(hours);
+            let filter = documents::search::Filter {
+                text: query,
+                subjects: ticker
+                    .iter()
+                    .map(|t| documents::search::Subject {
+                        uid: String::new(),
+                        ticker: t.to_uppercase(),
+                        name: String::new(),
+                    })
+                    .collect(),
+                kinds: Vec::new(),
+                sources: Vec::new(),
+                topics: Vec::new(),
+                min_importance: None,
+                from,
+                to,
+                limit: limit.clamp(1, 100),
+            };
+            let sources = documents::sources::Sources::load()?;
+            let vectors = documents::embed::Vectors::from_sources(&sources);
+            let hits = documents::search::search(&storage, &filter, vectors.as_ref()).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&hits).unwrap_or_default()
+            );
+            Ok(())
+        }
         Command::RiskReset { reason } => {
             let (config, ids) = BotConfig::load(&cli.config)?;
             risk_reset(&config, &ids, &reason).await
@@ -351,6 +543,15 @@ async fn dispatch() -> Result<()> {
     }
 }
 
+/// Хранилище документов: та же база, без конфигурации стратегии.
+async fn documents_storage() -> Result<PostgresStorage> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| Error::Configuration("DATABASE_URL is required".to_owned()))?;
+    let storage = PostgresStorage::connect(&database_url, 4).await?;
+    storage.migrate().await?;
+    Ok(storage)
+}
+
 /// Создаёт пул `PostgreSQL`. URL намеренно берётся из окружения, а не хранится в TOML.
 async fn connect_storage(config: &BotConfig) -> Result<Arc<PostgresStorage>> {
     let database_url = std::env::var("DATABASE_URL")
@@ -360,27 +561,23 @@ async fn connect_storage(config: &BotConfig) -> Result<Arc<PostgresStorage>> {
     ))
 }
 
-/// Создаёт исключительно Sandbox API и Sandbox-брокера.
-///
-/// В этой функции нет ветки Production; даже корректный боевой токен не меняет
-/// тип клиента и не позволяет этому binary отправлять реальные заявки.
-async fn connect_sandbox(config: &BotConfig) -> Result<(SandboxApi, Arc<SandboxBroker>)> {
-    let token = std::env::var("TINKOFF_TOKEN")
-        .map_err(|_| Error::Configuration("TINKOFF_TOKEN is required".to_owned()))?;
-    if token.trim().is_empty() {
-        return Err(Error::Configuration(
-            "TINKOFF_TOKEN cannot be empty".to_owned(),
-        ));
-    }
-    let api = SandboxApi::builder(SecretString::new(token))
-        .app_name(config.app_name.clone())
-        .connect()
+/// Подключает контур из TOML: Sandbox — токеном `TINKOFF_TOKEN`, реальный счёт —
+/// токеном `TINKOFF_TOKEN_PRODUCTION`.
+async fn connect_venue(config: &BotConfig) -> Result<(VenueApi, Arc<VenueBroker>)> {
+    let (api, broker) = venue::connect(config.contour, &config.app_name).await?;
+    // Непрерывные фьючерсы universe привязываются к текущим контрактам.
+    let ids = config
+        .universe
+        .iter()
+        .map(|entry| InstrumentId::new(entry.uid.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    api.series()
+        .load(api.instruments(), &ids, Utc::now())
         .await?;
-    let broker = Arc::new(SandboxBroker::new(api.clone()));
     Ok((api, broker))
 }
 
-/// Запускает полный Sandbox-runtime после локальной и сетевой проверки окружения.
+/// Запускает полный runtime выбранного контура после локальной и сетевой проверки окружения.
 ///
 /// Временная потеря сети не завершает процесс: при обрыве во время запуска или
 /// потере потока данных сессия создаётся заново с задержкой до минуты, а в живом
@@ -441,7 +638,11 @@ async fn start_session(
     // Lease удерживается до конца сессии. Поэтому второй процесс не
     // успеет ни восстановить те же batch-и, ни отправить заявку с того же счёта.
     let mut runtime_lease = storage.acquire_runtime_lease(&ids.account_id).await?;
-    let (api, broker) = connect_sandbox(config).await?;
+    // Прогрев только читает; торговый цикл реального счёта при аварийной остановке не стартует.
+    if !startup_only {
+        venue::ensure_not_halted(&storage, config.contour).await?;
+    }
+    let (api, broker) = connect_venue(config).await?;
     ensure_account_exists(&broker, &ids.account_id).await?;
 
     // Для engine ансамбль остаётся одной stateful PortfolioStrategy. Внутри него
@@ -453,9 +654,9 @@ async fn start_session(
         config.strategies.clone(),
     )?;
     let engine = PortfolioEngine::new(Box::new(strategy), storage.clone()).await?;
-    control::register(&storage, ids).await?;
+    control::register(&storage, ids, config.contour).await?;
     let requirements = engine.data_requirements().await;
-    let instruments = inspect_instruments(
+    let mut instruments = inspect_instruments(
         &api,
         &broker,
         &ids.universe,
@@ -463,9 +664,13 @@ async fn start_session(
         config
             .strategies
             .iter()
-            .any(|component| strategy_requires_short(component.strategy.kind())),
+            .any(|component| strategy_requires_short(&component.strategy)),
+        &share_only_instruments(config, ids),
     )
     .await?;
+    // Комиссия контура закладывается в расчёт лотов, мелкие изменения не торгуются.
+    let costs = instruments::ExecutionCosts::load(&storage, config.contour.label()).await;
+    costs.apply(&mut instruments);
 
     // Подписка запускается до исторических запросов. События временно буферизуются
     // stream runner-ом, поэтому свеча, закрывшаяся во время последовательного
@@ -474,7 +679,7 @@ async fn start_session(
         .iter()
         .map(|requirement| {
             MarketDataSubscription::candles(
-                vec![requirement.instrument_id.clone()],
+                vec![api.series().contract(&requirement.instrument_id)],
                 requirement.interval,
             )
         })
@@ -525,6 +730,23 @@ async fn start_session(
         &ids.strategy_id,
     )
     .await?;
+
+    // Мультипликаторы и дивиденды нужны до первого решения. В preflight их
+    // недоступность — ошибка проверки; в обычном запуске стратегия дождётся
+    // следующего открытия сессии, где загрузка повторится.
+    if let Err(error) = absorb_reference(
+        &api,
+        &engine,
+        &share_ids(&instruments),
+        Utc::now().date_naive(),
+    )
+    .await
+    {
+        if startup_only {
+            return Err(error);
+        }
+        warn!(%error, "reference data unavailable at startup; retrying at the next session open");
+    }
 
     if startup_only {
         market_stream
@@ -614,6 +836,12 @@ async fn start_session(
             risk,
             health: resilience::NetworkHealth::default(),
             pending_session_date: None,
+            pending_open: None,
+            ai_jobs: ai_jobs(config, ids),
+            ai_done: HashSet::new(),
+            ai_failures: HashMap::new(),
+            ai_watch: ai::Watch::default(),
+            costs,
         },
         market_stream,
         requirements,
@@ -648,13 +876,18 @@ impl LiveSession {
         risk_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut control_tick = tokio::time::interval(StdDuration::from_secs(1));
         control_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // ИИ-модель: сторож скачков цен и всплесков новостей, только в основную сессию.
+        let mut ai_tick = tokio::time::interval(StdDuration::from_secs(60));
+        ai_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut sessions = session_windows(&triggers);
         let mut stream_ready = true;
 
         info!(
             strategy_id = %runtime.strategy_id,
             components = config.strategies.len(),
             kinds = %strategy_kinds(config).join(","),
-            "warmup complete; Sandbox runtime is live"
+            "warmup complete; {} runtime is live",
+            runtime.api.contour().title()
         );
         loop {
             tokio::select! {
@@ -669,7 +902,8 @@ impl LiveSession {
                     let Some(response) = message else {
                         return Err(Error::StreamClosed("market data channel closed".to_owned()));
                     };
-                    if let Some(MarketDataEvent::Candle(candle)) = market_event(response?, true)? {
+                    if let Some(MarketDataEvent::Candle(mut candle)) = market_event(response?, true)? {
+                        candle.instrument_id = runtime.api.series().of_broker(candle.instrument_id);
                         // market_event(..., true) отбрасывает незакрытые свечи. Цена
                         // обновляется до вызова стратегии, чтобы planner видел close.
                         runtime.latest_prices.insert(candle.instrument_id.clone(), candle.close);
@@ -698,6 +932,7 @@ impl LiveSession {
                     if now.date_naive() != schedule_loaded_on {
                         match load_schedule_triggers(&runtime.api, &schedule_requirements, now).await {
                             Ok(loaded) => {
+                                sessions = session_windows(&loaded);
                                 triggers = loaded;
                                 schedule_loaded_on = now.date_naive();
                                 fired.clear();
@@ -711,14 +946,41 @@ impl LiveSession {
                     if ready {
                         continuity.restore(&mut runtime, &requirements, &market_stream.handle).await?;
                     }
-                    for trigger in take_due_triggers(&mut triggers, &mut fired, now) {
+                    for (trigger, late) in take_due_triggers(&mut triggers, &mut fired, now) {
+                        let retry_until = trigger.retry_until();
+                        // Сессия уже закончилась (процесс запущен позже): одно сообщение
+                        // об открытии, плановые пересмотры прошедших часов — без шума.
+                        let quiet = late
+                            && trigger.offset_seconds != 0
+                            && trigger.session_end.is_some_and(|end| end <= now);
                         let event = trigger.event();
-                        if ready {
-                            runtime.handle(event).await?;
-                        } else {
-                            warn!(event_id = %event.id, "decision uncovered: market data stream is reconnecting");
-                            runtime.absorb(event).await?;
+                        // После перезапуска уже увиденное сегодня открытие не повторяется.
+                        if late && runtime.event_seen(&event.id).await? {
+                            continue;
                         }
+                        let handled = if quiet {
+                            tracing::debug!(event_id = %event.id, "review of a finished session skipped");
+                            runtime.note_missed(event.clone()).await?;
+                            Handled::Skipped
+                        } else if late {
+                            warn!(event_id = %event.id, "session event missed: the computer was asleep or the process was busy");
+                            runtime.note_missed(event.clone()).await?;
+                            Handled::Deferred
+                        } else if !ready {
+                            warn!(event_id = %event.id, "decision uncovered: market data stream is reconnecting");
+                            runtime.absorb(event.clone()).await?;
+                            Handled::Deferred
+                        } else {
+                            runtime.handle(event.clone()).await?
+                        };
+                        if handled == Handled::Deferred {
+                            if let Some(until) = retry_until {
+                                runtime.defer_open(event, until, now);
+                            }
+                        }
+                    }
+                    if ready {
+                        runtime.retry_deferred_open(now).await?;
                     }
                 }
                 _ = risk_tick.tick() => {
@@ -731,6 +993,12 @@ impl LiveSession {
                         occurred_at: now,
                         payload: StrategyEventKind::RiskCheck,
                     }).await?;
+                }
+                _ = ai_tick.tick(), if !runtime.ai_jobs.is_empty() => {
+                    let now = Utc::now();
+                    if market_stream.handle.is_ready() && sessions.iter().any(|(start, end)| *start <= now && now < *end) {
+                        runtime.watch_models(now).await?;
+                    }
                 }
                 _ = control_tick.tick() => {
                     match runtime.poll_controls().await {
@@ -788,18 +1056,37 @@ impl StreamContinuity {
     }
 }
 
-/// Зависимости живого цикла. Тип брокера фиксирован как `SandboxBroker`.
+/// Итог обработки события: нужен ли повтор решения открытия сессии.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Handled {
+    /// Стратегия получила planning context; повтор не нужен.
+    Decided,
+    /// Решение не принято по временной причине: торги, сеть, незавершённый пакет.
+    Deferred,
+    /// Решение не нужно: стратегия выключена или счёт закрывает позиции.
+    Skipped,
+}
+
+/// Отложенное решение открытия сессии, которое повторяется до конца этой сессии.
+struct PendingOpen {
+    event: StrategyEvent,
+    until: DateTime<Utc>,
+    attempts: u32,
+    next_at: DateTime<Utc>,
+}
+
+/// Зависимости живого цикла. Тип брокера фиксирован как `VenueBroker`.
 struct LiveRuntime {
     account_id: AccountId,
     strategy_id: StrategyId,
     universe: Vec<InstrumentId>,
     instruments: Vec<InstrumentInfo>,
     latest_prices: HashMap<InstrumentId, Price>,
-    api: SandboxApi,
-    broker: Arc<SandboxBroker>,
+    api: VenueApi,
+    broker: Arc<VenueBroker>,
     storage: Arc<PostgresStorage>,
     engine: PortfolioEngine<PostgresStorage>,
-    executor: BatchExecutor<SandboxBroker, SandboxBroker, PostgresStorage>,
+    executor: BatchExecutor<VenueBroker, VenueBroker, PostgresStorage>,
     /// Отдельное PostgreSQL-соединение, удерживающее account advisory lock.
     runtime_lease: RuntimeLease,
     risk: RiskManager,
@@ -808,6 +1095,17 @@ struct LiveRuntime {
     /// Торговая дата из события расписания, которое не удалось обработать без сети.
     /// Следующее событие применит её, чтобы дневной лимит не остался во вчерашнем дне.
     pending_session_date: Option<NaiveDate>,
+    /// Открытие сессии, решение которого ещё не принято.
+    pending_open: Option<PendingOpen>,
+    /// Компоненты `ai-model` и сессии, по которым решение модели уже получено.
+    ai_jobs: Vec<ai::AiJob>,
+    /// Пересмотры по расписанию (компонента, время), по которым решение уже получено.
+    ai_done: HashSet<(usize, DateTime<Utc>)>,
+    ai_failures: HashMap<DateTime<Utc>, u32>,
+    /// Сторож внеочередных решений: скачки цен и всплески новостей.
+    ai_watch: ai::Watch,
+    /// Комиссии контура и порог минимальной сделки; обновляются на открытии сессии.
+    costs: instruments::ExecutionCosts,
 }
 
 impl LiveRuntime {
@@ -818,7 +1116,35 @@ impl LiveRuntime {
     /// пропускается, свеча и границы сессии сохраняются в состоянии стратегии,
     /// а следующее событие заново читает портфель и восстанавливает незавершённые
     /// пакеты заявок. Остальные ошибки по-прежнему останавливают процесс.
-    async fn handle(&mut self, event: StrategyEvent) -> Result<()> {
+    async fn handle(&mut self, event: StrategyEvent) -> Result<Handled> {
+        if let StrategyEventKind::Schedule(ScheduleEvent {
+            anchor: ScheduleAnchor::SessionOpen,
+            session_date,
+            scheduled_at,
+        }) = &event.payload
+        {
+            // Ставки комиссии наблюдатель уточняет по фактическим списаниям.
+            self.costs =
+                instruments::ExecutionCosts::load(&self.storage, self.api.contour().label()).await;
+            self.costs.apply(&mut self.instruments);
+            // Свежий снимок справочных данных подаётся до решения этой сессии;
+            // при сбое стратегия работает на прошлом снимке.
+            if let Err(error) = absorb_reference(
+                &self.api,
+                &self.engine,
+                &share_ids(&self.instruments),
+                *session_date,
+            )
+            .await
+            {
+                warn!(%error, "reference data unavailable; strategy keeps the previous snapshot");
+            }
+            // Решение ИИ-модели нужно до решения сессии; сбой повторяется через минуту.
+            if !self.consult_models(*session_date, *scheduled_at).await? {
+                self.pending_session_date = self.pending_session_date.max(Some(*session_date));
+                return Ok(Handled::Deferred);
+            }
+        }
         let result = self.process(event.clone()).await;
         if result.is_err() {
             if let StrategyEventKind::Schedule(schedule) = &event.payload {
@@ -832,9 +1158,9 @@ impl LiveRuntime {
             self.pending_session_date = None;
         }
         match result {
-            Ok(()) => {
+            Ok(handled) => {
                 self.health.success();
-                Ok(())
+                Ok(handled)
             }
             Err(error) if error.is_transient() => {
                 self.health.failure(&event.id, &error);
@@ -843,14 +1169,357 @@ impl LiveRuntime {
                     // а после возврата сети стратегия заново прогревается.
                     return Err(error);
                 }
-                self.absorb(event).await
+                self.absorb(event).await?;
+                Ok(Handled::Deferred)
             }
             Err(Error::RiskRejected(reason)) => {
-                warn!(event_id = %event.id, %reason, "decision uncovered: risk check rejected execution; runtime continues");
-                self.absorb(event).await
+                // Плановая проверка риска — не торговое решение: её отказ не шумит в журнале.
+                if is_risk_check(&event) {
+                    tracing::debug!(event_id = %event.id, %reason, "risk check skipped execution data");
+                } else {
+                    warn!(event_id = %event.id, %reason, "decision uncovered: risk check rejected execution; runtime continues");
+                }
+                self.absorb(event).await?;
+                Ok(Handled::Deferred)
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Учитывает пропущенное событие расписания. Открытие только переносит
+    /// торговую дату риска: intraday-сигналы не включаются посреди сессии.
+    /// Закрытие подаётся как Warmup и снимает intraday-вклад.
+    async fn note_missed(&mut self, event: StrategyEvent) -> Result<()> {
+        if let StrategyEventKind::Schedule(ScheduleEvent {
+            anchor: ScheduleAnchor::SessionOpen,
+            session_date,
+            ..
+        }) = &event.payload
+        {
+            self.pending_session_date = self.pending_session_date.max(Some(*session_date));
+            return Ok(());
+        }
+        self.absorb(event).await
+    }
+
+    /// Получает решения моделей для компонент `ai-model` к пересмотру `scheduled_at`.
+    ///
+    /// Каждая компонента опрашивается один раз за пересмотр (открытие или плановый
+    /// час). Возвращает `false`, если решение нужно повторить: сбой модели или сети,
+    /// не больше `AI_ATTEMPTS` попыток. Затем компонента сохраняет позиции. Решение
+    /// «держать» не подаётся стратегии: цель на этом пересмотре не появится.
+    async fn consult_models(
+        &mut self,
+        session_date: NaiveDate,
+        scheduled_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        if self.ai_jobs.is_empty() || !self.control_settings().await?.enabled {
+            return Ok(true);
+        }
+        let mut ready = true;
+        for index in 0..self.ai_jobs.len() {
+            let job = self.ai_jobs[index].clone();
+            let now = Utc::now();
+            if self.ai_done.contains(&(index, scheduled_at))
+                || !self.ai_watch.allowed(index, &job, now, false)
+            {
+                continue;
+            }
+            // Первый пересмотр торговой даты — открытие сессии, остальные — плановые.
+            let opening = !self
+                .ai_done
+                .iter()
+                .any(|(_, time)| time.date_naive() == session_date);
+            if opening {
+                self.review_memory(&job).await;
+            }
+            let trigger = ai::Trigger::new(if opening { "session_open" } else { "scheduled" }, "");
+            if let Some(run) = self.ask_model(index, &job, session_date, trigger).await? {
+                if !run.hold {
+                    let event = StrategyEvent {
+                        id: format!(
+                            "advice:{session_date}:{index}:{}",
+                            Utc::now().timestamp_millis()
+                        ),
+                        phase: EventPhase::Warmup,
+                        occurred_at: run.advice.observed_at,
+                        payload: StrategyEventKind::Advice(run.advice.clone()),
+                    };
+                    self.engine.process_event(&event, None).await?;
+                }
+                self.ai_done.insert((index, scheduled_at));
+            } else {
+                let failures = self.ai_failures.entry(scheduled_at).or_default();
+                *failures += 1;
+                if *failures < AI_ATTEMPTS {
+                    ready = false;
+                } else {
+                    warn!(
+                        "ai model decision failed; the ai component keeps its positions until the next review"
+                    );
+                    self.ai_done.insert((index, scheduled_at));
+                }
+            }
+        }
+        Ok(ready)
+    }
+
+    /// Перед первым решением дня: итоги прошлых решений против индекса,
+    /// измеренная чувствительность бумаг к темам и, раз в неделю, разбор с
+    /// выводами. Сбой не мешает самому решению.
+    async fn review_memory(&self, job: &ai::AiJob) {
+        match ai::compute_outcomes(
+            &self.storage,
+            self.broker.as_ref(),
+            self.strategy_id.as_str(),
+        )
+        .await
+        {
+            Ok(count) if count > 0 => info!(count, "ai decision outcomes computed"),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "ai decision outcomes skipped"),
+        }
+        match ai::calibrate(&self.storage, self.broker.as_ref()).await {
+            Ok(count) if count > 0 => info!(count, "exposure calibration suggestions computed"),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "exposure calibration skipped"),
+        }
+        let meter = ai::usage::meter();
+        let result = ai::review_if_due(&self.storage, self.strategy_id.as_str(), job, &meter).await;
+        if let Err(error) = ai::usage::store(
+            &self.storage,
+            "reflection",
+            Some(self.strategy_id.as_str()),
+            &ai::usage::snapshot(&meter),
+        )
+        .await
+        {
+            warn!(%error, "ai review usage was not recorded");
+        }
+        match result {
+            Ok(Some(summary)) => info!(%summary, "ai model reviewed its results"),
+            Ok(None) => {}
+            Err(error) => warn!(%error, "ai model review skipped"),
+        }
+    }
+
+    /// Один запрос к модели с записью в журнал. `None` — модель не ответила.
+    async fn ask_model(
+        &mut self,
+        index: usize,
+        job: &ai::AiJob,
+        session_date: NaiveDate,
+        trigger: ai::Trigger,
+    ) -> Result<Option<ai::AdviceRun>> {
+        let started = std::time::Instant::now();
+        let context = ai::Context {
+            api: &self.api,
+            broker: self.broker.as_ref(),
+            account_id: &self.account_id,
+            storage: Some(self.storage.as_ref()),
+            strategy_id: self.strategy_id.as_str(),
+            persist_memory: true,
+        };
+        let meter = ai::usage::meter();
+        ai::activity_started(&self.storage, self.strategy_id.as_str(), job, &trigger).await;
+        let result = ai::advise(&context, job, session_date, trigger.clone(), &meter).await;
+        ai::activity_finished(
+            &self.storage,
+            self.strategy_id.as_str(),
+            if result.is_ok() { "ok" } else { "failed" },
+        )
+        .await;
+        self.ai_watch.decided(index, Utc::now());
+        let spend = ai::usage::snapshot(&meter);
+        ai::record(
+            &self.storage,
+            &ai::Entry {
+                strategy_id: self.strategy_id.as_str(),
+                account_id: self.account_id.as_str(),
+                kind: "decision",
+                session_date: Some(session_date),
+                job,
+                trigger: &trigger,
+                duration: started.elapsed(),
+                spend: &spend,
+            },
+            result.as_ref(),
+        )
+        .await?;
+        match result {
+            Ok(run) => {
+                let summary = run
+                    .weights
+                    .iter()
+                    .map(|w| {
+                        format!(
+                            "{}={}%",
+                            w["ticker"].as_str().unwrap_or("?"),
+                            w["weight_percent"]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                info!(model = %run.advice.model, trigger = trigger.kind, hold = run.hold, weights = %summary, tools = run.tool_calls.len(), "ai model decision received");
+                Ok(Some(run))
+            }
+            Err(error) => {
+                warn!(%error, trigger = trigger.kind, "ai model decision failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Раз в минуту в торговую сессию: всплеск новостей или скачок цены вызывает
+    /// внеочередное решение модели, которое исполняется сразу через обычный
+    /// risk pipeline (`Advice` в live-фазе).
+    async fn watch_models(&mut self, now: DateTime<Utc>) -> Result<()> {
+        if self.ai_jobs.is_empty() || !self.control_settings().await?.enabled {
+            return Ok(());
+        }
+        let context = ai::Context {
+            api: &self.api,
+            broker: self.broker.as_ref(),
+            account_id: &self.account_id,
+            storage: Some(self.storage.as_ref()),
+            strategy_id: self.strategy_id.as_str(),
+            persist_memory: true,
+        };
+        let triggers = match self.ai_watch.check(&context, &self.ai_jobs, now).await {
+            Ok(triggers) => triggers,
+            Err(error) if error.is_transient() => {
+                self.health.failure("ai watch", &error);
+                return Ok(());
+            }
+            Err(error) => {
+                warn!(%error, "ai watch skipped this minute");
+                return Ok(());
+            }
+        };
+        let session_date = self.known_session_date();
+        // Дневной лимит расходов останавливает только внеочередные решения:
+        // плановые пересмотры продолжаются.
+        let budget = if triggers.is_empty() {
+            None
+        } else {
+            Some(ai::usage::budget(&self.storage).await?)
+        };
+        for (index, trigger) in triggers {
+            let job = self.ai_jobs[index].clone();
+            if let Some(budget) = budget.filter(ai::usage::BudgetState::exhausted) {
+                // Пауза как после решения: повод не повторяется каждую минуту.
+                self.ai_watch.decided(index, now);
+                let error = Error::Configuration(format!(
+                    "daily AI budget exhausted: {:.0} of {:.0} RUB spent; out-of-schedule decisions resume tomorrow",
+                    budget.spent_rub,
+                    budget.limit_rub.unwrap_or_default()
+                ));
+                warn!(%error, trigger = trigger.kind, "ai model not asked out of schedule");
+                ai::record(
+                    &self.storage,
+                    &ai::Entry {
+                        strategy_id: self.strategy_id.as_str(),
+                        account_id: self.account_id.as_str(),
+                        kind: "decision",
+                        session_date: Some(session_date),
+                        job: &job,
+                        trigger: &trigger,
+                        duration: std::time::Duration::ZERO,
+                        spend: &ai::usage::Spend::default(),
+                    },
+                    Err(&error),
+                )
+                .await?;
+                continue;
+            }
+            info!(trigger = trigger.kind, details = %trigger.details, "ai model asked out of schedule");
+            let Some(run) = self
+                .ask_model(index, &job, session_date, trigger.clone())
+                .await?
+            else {
+                continue;
+            };
+            if run.hold {
+                continue;
+            }
+            let event = StrategyEvent {
+                id: format!("advice:{}:{index}:{}", trigger.kind, now.timestamp_millis()),
+                phase: EventPhase::Live,
+                occurred_at: run.advice.observed_at,
+                payload: StrategyEventKind::Advice(run.advice),
+            };
+            self.handle(event).await?;
+        }
+        Ok(())
+    }
+
+    /// Было ли событие уже учтено стратегией (до перезапуска процесса).
+    async fn event_seen(&self, event_id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM processed_events WHERE strategy_id=$1 AND event_id=$2)",
+        )
+        .bind(self.strategy_id.as_str())
+        .bind(event_id)
+        .fetch_one(self.storage.pool())
+        .await?)
+    }
+
+    /// Запоминает открытие сессии, решение по которому нужно повторить.
+    fn defer_open(&mut self, event: StrategyEvent, until: DateTime<Utc>, now: DateTime<Utc>) {
+        if now >= until {
+            warn!(event_id = %event.id, "session-open decision missed; the next decision waits for the next session open");
+            return;
+        }
+        if self
+            .pending_open
+            .as_ref()
+            .is_some_and(|pending| pending.event.id == event.id)
+        {
+            return;
+        }
+        info!(event_id = %event.id, %until, "session-open decision deferred; retrying every minute until the session closes");
+        self.pending_open = Some(PendingOpen {
+            event,
+            until,
+            attempts: 0,
+            next_at: now + Duration::seconds(OPEN_RETRY_SECONDS),
+        });
+    }
+
+    /// Повторяет отложенное решение открытия, пока идёт та же сессия.
+    ///
+    /// Повтор получает новый id, а payload сохраняет дату сессии: месячная
+    /// стратегия отмечает месяц только после реального target, поэтому успешный
+    /// повтор не исполнит решение дважды.
+    async fn retry_deferred_open(&mut self, now: DateTime<Utc>) -> Result<()> {
+        let Some(pending) = self.pending_open.as_mut() else {
+            return Ok(());
+        };
+        if now >= pending.until {
+            warn!(event_id = %pending.event.id, attempts = pending.attempts, "deferred session-open decision expired; the next decision waits for the next session open");
+            self.pending_open = None;
+            return Ok(());
+        }
+        if now < pending.next_at {
+            return Ok(());
+        }
+        pending.attempts += 1;
+        pending.next_at = now + Duration::seconds(OPEN_RETRY_SECONDS);
+        let event = StrategyEvent {
+            id: format!("{}:retry:{}", pending.event.id, pending.attempts),
+            phase: EventPhase::Live,
+            occurred_at: now,
+            payload: pending.event.payload.clone(),
+        };
+        info!(event_id = %event.id, "retrying deferred session-open decision");
+        match self.handle(event).await? {
+            Handled::Deferred => {}
+            handled => {
+                info!(?handled, "deferred session-open decision completed");
+                self.pending_open = None;
+            }
+        }
+        Ok(())
     }
 
     /// Текущая торговая дата риска с учётом пропущенного из-за сети открытия сессии.
@@ -886,7 +1555,7 @@ impl LiveRuntime {
     /// Сначала читается свежий портфель и сохраняется решение риска. Затем
     /// восстанавливаются старые заявки; если они изменили позиции, risk observation
     /// строится повторно. Только после этого стратегия получает planning context.
-    async fn process(&mut self, event: StrategyEvent) -> Result<()> {
+    async fn process(&mut self, event: StrategyEvent) -> Result<Handled> {
         // Проверка выполняется до чтения портфеля, recovery и любой новой
         // отправки. Ошибка heartbeat завершает run, потому что эксклюзивное
         // владение счётом больше нельзя доказать.
@@ -945,13 +1614,13 @@ impl LiveRuntime {
                 }
                 Err(error) => return Err(error),
             }
-            return Ok(());
+            return Ok(Handled::Skipped);
         }
         if !controls.enabled {
             let mut warmup = event;
             warmup.phase = EventPhase::Warmup;
             self.engine.process_event(&warmup, None).await?;
-            return Ok(());
+            return Ok(Handled::Skipped);
         }
 
         // Single-flight barrier: новый target нельзя планировать, пока исход
@@ -997,7 +1666,14 @@ impl LiveRuntime {
                 warmup_event.phase = EventPhase::Warmup;
                 self.engine.process_event(&warmup_event, None).await?;
             }
-            return Ok(());
+            return Ok(Handled::Deferred);
+        }
+        // Непрерывные фьючерсы переходят на следующий контракт до решения; после
+        // переноса сессия пересоздаётся и привязывается к новому контракту.
+        if self.roll_futures().await? {
+            return Err(Error::StreamClosed(
+                "futures series moved to the next contract; the session restarts on it".to_owned(),
+            ));
         }
         self.latest_prices = refresh_execution_data(&self.api, &mut self.instruments).await?;
         if self
@@ -1005,11 +1681,16 @@ impl LiveRuntime {
             .iter()
             .any(|i| !i.api_trade_available || !i.market_order_available)
         {
-            warn!(event_id = %event.id, "decision uncovered: market orders unavailable");
+            // Вне торгов это нормально: проверка риска не шумит, решение ждёт повтора.
+            if is_risk_check(&event) {
+                tracing::debug!(event_id = %event.id, "risk check outside trading hours");
+            } else {
+                warn!(event_id = %event.id, "decision uncovered: market orders unavailable");
+            }
             let mut warmup = event;
             warmup.phase = EventPhase::Warmup;
             self.engine.process_event(&warmup, None).await?;
-            return Ok(());
+            return Ok(Handled::Deferred);
         }
         prepare_planning_portfolio(&mut portfolio, &self.universe, decision.mode)?;
         if decision.mode == RiskMode::CloseOnly {
@@ -1020,11 +1701,16 @@ impl LiveRuntime {
             instruments: self.instruments.clone(),
             prices: self.latest_prices.clone(),
             risk: decision,
+            min_trade_fraction: self.costs.min_trade_fraction,
         };
         // Engine атомарно сохраняет target и legs. Executor получает только ID уже
         // сохранённого batch, поэтому процесс можно безопасно восстановить после сбоя.
         let outcome = self.engine.process_event(&event, Some(&context)).await?;
-        info!(event_id = %event.id, duplicate = outcome.duplicate, target = outcome.target.is_some(), legs = outcome.intents.len(), "live decision observed");
+        if is_risk_check(&event) && outcome.target.is_none() && outcome.intents.is_empty() {
+            tracing::debug!(event_id = %event.id, "risk check passed; no target change");
+        } else {
+            info!(event_id = %event.id, duplicate = outcome.duplicate, target = outcome.target.is_some(), legs = outcome.intents.len(), "live decision observed");
+        }
         if let Some(batch) = outcome.batch {
             let execution = if context.risk.mode == RiskMode::CloseOnly {
                 self.executor.execute_batch_close_only(batch.id).await?
@@ -1033,21 +1719,26 @@ impl LiveRuntime {
             };
             info!(batch_id = %batch.id, ?execution, "rebalance batch processed");
         }
-        Ok(())
+        Ok(Handled::Decided)
     }
+}
+
+/// Плановая проверка риска раз в 30 секунд: не торговое решение стратегии.
+fn is_risk_check(event: &StrategyEvent) -> bool {
+    matches!(event.payload, StrategyEventKind::RiskCheck)
 }
 
 /// Execution prices are queried independently from daily/monthly signal history.
 async fn refresh_execution_data(
-    api: &SandboxApi,
+    api: &VenueApi,
     instruments: &mut [InstrumentInfo],
 ) -> Result<HashMap<InstrumentId, Price>> {
+    // Серия котируется по привязанному контракту.
     let ids = instruments
         .iter()
-        .map(|i| i.instrument_id.to_string())
+        .map(|i| api.series().contract(&i.instrument_id).to_string())
         .collect::<Vec<_>>();
-    let response = api
-        .raw()
+    let mut response = api
         .market_data()
         .get_last_prices(tinkoff_rs::proto::GetLastPricesRequest {
             instrument_id: ids.clone(),
@@ -1055,17 +1746,22 @@ async fn refresh_execution_data(
         })
         .await?
         .into_inner();
+    for price in &mut response.last_prices {
+        if let Ok(uid) = InstrumentId::new(price.instrument_uid.clone()) {
+            price.instrument_uid = api.series().of_broker(uid).to_string();
+        }
+    }
     let statuses = api
-        .raw()
         .market_data()
         .get_trading_statuses(tinkoff_rs::proto::GetTradingStatusesRequest { instrument_id: ids })
         .await?
         .into_inner()
         .trading_statuses;
     for instrument in instruments.iter_mut() {
+        let contract = api.series().contract(&instrument.instrument_id);
         let status = statuses
             .iter()
-            .find(|s| s.instrument_uid == instrument.instrument_id.as_str());
+            .find(|s| s.instrument_uid == contract.as_str());
         instrument.api_trade_available = status.is_some_and(|s| s.api_trade_available_flag);
         instrument.market_order_available = status.is_some_and(|s| s.market_order_available_flag);
     }
@@ -1110,7 +1806,9 @@ fn event_session_date(event: &StrategyEvent, current: NaiveDate) -> NaiveDate {
         StrategyEventKind::Schedule(schedule) => schedule.session_date,
         StrategyEventKind::Candle(_)
         | StrategyEventKind::Order(_)
-        | StrategyEventKind::RiskCheck => current,
+        | StrategyEventKind::RiskCheck
+        | StrategyEventKind::Reference(_)
+        | StrategyEventKind::Advice(_) => current,
     }
 }
 
@@ -1118,7 +1816,7 @@ fn event_session_date(event: &StrategyEvent, current: NaiveDate) -> NaiveDate {
 /// После создания сразу выполняется observation, чтобы внешний перевод между anchor
 /// и запуском процесса не оказался ошибочно принят за торговую прибыль или убыток.
 async fn initialize_risk(
-    api: &SandboxApi,
+    api: &VenueApi,
     storage: &PostgresStorage,
     config: &RiskConfig,
     ids: &RuntimeIds,
@@ -1159,14 +1857,14 @@ async fn initialize_risk(
 /// Создаёт новую risk epoch после строгих проверок безопасного состояния счёта.
 ///
 /// Reset разрешён только для пустого выделенного портфеля без локальных pending legs
-/// и без активных Sandbox-заявок. Это исключает смену anchor посреди исполнения.
+/// и без активных заявок у брокера. Это исключает смену anchor посреди исполнения.
 async fn risk_reset(config: &BotConfig, ids: &RuntimeIds, reason: &str) -> Result<()> {
     let storage = connect_storage(config).await?;
     storage.migrate().await?;
     // Тот же account-level lock, что у `run`, делает reset и смену владельца
     // невозможными, пока старый процесс ещё работает.
     let mut runtime_lease = storage.acquire_runtime_lease(&ids.account_id).await?;
-    let (api, broker) = connect_sandbox(config).await?;
+    let (api, broker) = connect_venue(config).await?;
     ensure_account_exists(&broker, &ids.account_id).await?;
     let portfolio = broker.portfolio(&ids.account_id).await?.data;
     validate_dedicated_portfolio(&portfolio, &ids.universe)?;
@@ -1180,19 +1878,9 @@ async fn risk_reset(config: &BotConfig, ids: &RuntimeIds, reason: &str) -> Resul
             "risk-reset requires no pending durable orders".to_owned(),
         ));
     }
-    let active_orders = api
-        .raw()
-        .sandbox()
-        .get_sandbox_orders(GetOrdersRequest {
-            account_id: ids.account_id.to_string(),
-            advanced_filters: None,
-        })
-        .await?
-        .into_inner()
-        .orders;
-    if !active_orders.is_empty() {
+    if !api.active_orders(&ids.account_id).await?.is_empty() {
         return Err(Error::RiskRejected(
-            "risk-reset requires no active Sandbox orders".to_owned(),
+            "risk-reset requires no active broker orders".to_owned(),
         ));
     }
     let state = storage
@@ -1285,54 +1973,51 @@ fn ensure_risk_owner(state: &AccountRiskState, ids: &RuntimeIds) -> Result<()> {
     Ok(())
 }
 
-/// Проверяет, что указанный `account_id` действительно является доступным Sandbox-счётом.
-async fn ensure_account_exists(broker: &SandboxBroker, account_id: &AccountId) -> Result<()> {
-    let accounts = broker.accounts().await?.data;
-    if accounts.iter().any(|account| &account.id == account_id) {
-        Ok(())
-    } else {
-        Err(Error::Configuration(format!(
-            "Sandbox account `{account_id}` is unavailable to this token"
-        )))
-    }
+/// Проверяет, что счёт доступен токену; реальный счёт — открыт и с полным доступом.
+async fn ensure_account_exists(broker: &VenueBroker, account_id: &AccountId) -> Result<()> {
+    venue::ensure_account(broker, account_id).await
 }
 
 /// Загружает метаданные инструментов и проверяет их до начала live-цикла.
 ///
-/// Торговля разрешается только RUB-инструментами MOEX с корректным размером лота,
-/// доступными API market orders и, для long/short стратегий, разрешённым шортом.
+/// Торговля разрешается RUB-инструментами MOEX поддерживаемых типов (акции,
+/// фонды, облигации, фьючерсы, валюта) с корректным размером лота, доступными
+/// API market orders и, для long/short стратегий, разрешённым шортом. Стратегии
+/// на отчётности и дивидендах получают только акции.
 async fn inspect_instruments(
-    api: &SandboxApi,
-    broker: &SandboxBroker,
+    api: &VenueApi,
+    broker: &VenueBroker,
     universe: &[InstrumentId],
     requirements: &[DataRequirement],
     requires_short: bool,
+    shares_only: &HashSet<InstrumentId>,
 ) -> Result<Vec<InstrumentInfo>> {
+    // Инструменты только для данных (ориентир рынка) тоже должны быть рублёвыми MOEX.
     let mut seen = HashSet::new();
-    let mut raw = HashMap::new();
-    // Один инструмент может встречаться в нескольких требованиях к таймфреймам;
-    // сетевые метаданные для него достаточно запросить один раз.
     for requirement in requirements {
-        if !seen.insert(requirement.instrument_id.clone()) {
+        if universe.contains(&requirement.instrument_id)
+            || !seen.insert(requirement.instrument_id.clone())
+        {
             continue;
         }
-        let response = api
-            .raw()
+        let contract = api.series().contract(&requirement.instrument_id);
+        let instrument = api
             .instruments()
             .get_instrument_by(InstrumentRequest {
                 id_type: InstrumentIdType::Uid as i32,
                 class_code: None,
-                id: requirement.instrument_id.to_string(),
+                id: contract.to_string(),
             })
             .await?
-            .into_inner();
-        let instrument = response.instrument.ok_or_else(|| {
-            Error::Configuration(format!(
-                "instrument `{}` was not returned by T-Invest",
-                requirement.instrument_id
-            ))
-        })?;
-        if instrument.uid != requirement.instrument_id.as_str()
+            .into_inner()
+            .instrument
+            .ok_or_else(|| {
+                Error::Configuration(format!(
+                    "instrument `{}` was not returned by T-Invest",
+                    requirement.instrument_id
+                ))
+            })?;
+        if instrument.uid != contract.as_str()
             || instrument.real_exchange != RealExchange::Moex as i32
             || !instrument.currency.eq_ignore_ascii_case("rub")
         {
@@ -1341,47 +2026,157 @@ async fn inspect_instruments(
                 requirement.instrument_id
             )));
         }
-        raw.insert(requirement.instrument_id.clone(), instrument);
     }
-
     let mut result = Vec::with_capacity(universe.len());
-    // Проверяем именно торгуемый universe: benchmark может быть нужен как источник
-    // данных, но не обязан превращаться в InstrumentInfo для planner.
     for instrument_id in universe {
-        let instrument = raw.get(instrument_id).ok_or_else(|| {
-            Error::Configuration(format!(
-                "tradable instrument `{instrument_id}` has no data requirement"
-            ))
-        })?;
-        let availability = broker.trading_availability(instrument_id).await?.data;
-        if instrument.lot <= 0
-            || !instrument.api_trade_available_flag
-            || (requires_short && !instrument.short_enabled_flag)
+        if !requirements
+            .iter()
+            .any(|r| &r.instrument_id == instrument_id)
         {
             return Err(Error::Configuration(format!(
-                "tradable instrument `{instrument_id}` lacks lot, API market-order or required short availability"
+                "tradable instrument `{instrument_id}` has no data requirement"
             )));
         }
-        result.push(InstrumentInfo {
-            instrument_id: instrument_id.clone(),
-            lot_size: i64::from(instrument.lot),
-            currency: instrument.currency.clone(),
-            exchange: "moex".to_owned(),
-            short_enabled: instrument.short_enabled_flag,
-            api_trade_available: instrument.api_trade_available_flag
-                && availability.api_trade_available,
-            market_order_available: availability.market_order_available,
-        });
+        let (info, _) = instruments::describe(api, broker, instrument_id).await?;
+        if requires_short && !info.short_enabled {
+            return Err(Error::Configuration(format!(
+                "tradable instrument `{instrument_id}` lacks the required short availability"
+            )));
+        }
+        if shares_only.contains(instrument_id) && info.kind != InstrumentKind::Share {
+            return Err(Error::Configuration(format!(
+                "`{instrument_id}`: strategies computed from company reports and dividends trade shares only"
+            )));
+        }
+        result.push(info);
     }
     Ok(result)
 }
 
+/// Инструменты компонент, которые считают сигнал по отчётности и дивидендам.
+fn share_only_instruments(config: &BotConfig, ids: &RuntimeIds) -> HashSet<InstrumentId> {
+    config
+        .strategies
+        .iter()
+        .filter(|component| {
+            matches!(
+                component.strategy.kind(),
+                "value-composite"
+                    | "quality-profitability"
+                    | "value-momentum"
+                    | "multi-factor"
+                    | "dividend-month"
+            )
+        })
+        .flat_map(|component| {
+            component
+                .instruments
+                .clone()
+                .unwrap_or_else(|| ids.universe.clone())
+        })
+        .collect()
+}
+
+/// Акции universe: только для них есть мультипликаторы и дивиденды.
+fn share_ids(instruments: &[InstrumentInfo]) -> Vec<InstrumentId> {
+    instruments
+        .iter()
+        .filter(|info| info.kind == InstrumentKind::Share)
+        .map(|info| info.instrument_id.clone())
+        .collect()
+}
+
 /// Сообщает preflight, требуется ли стратегии возможность открывать короткие позиции.
-fn strategy_requires_short(kind: &str) -> bool {
-    !matches!(
-        kind,
-        "low-volatility" | "equal-risk-contribution" | "volatility-managed"
-    )
+fn strategy_requires_short(strategy: &BuiltinStrategySpec) -> bool {
+    match strategy {
+        // Модель открывает short только с явным allow_short.
+        BuiltinStrategySpec::AiModel(config) => config.allow_short,
+        _ => !matches!(
+            strategy.kind(),
+            "low-volatility" | "equal-risk-contribution" | "volatility-managed"
+        ),
+    }
+}
+
+/// Компоненты `ai-model` конфига и их инструменты.
+fn ai_jobs(config: &BotConfig, ids: &RuntimeIds) -> Vec<ai::AiJob> {
+    config
+        .strategies
+        .iter()
+        .filter_map(|component| match &component.strategy {
+            BuiltinStrategySpec::AiModel(model) => Some(ai::AiJob {
+                universe: component
+                    .instruments
+                    .clone()
+                    .unwrap_or_else(|| ids.universe.clone()),
+                config: model.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `ai-preview`: решение модели без заявок; при `DATABASE_URL` пишется в журнал.
+async fn ai_preview(config: &BotConfig, ids: &RuntimeIds) -> Result<()> {
+    let jobs = ai_jobs(config, ids);
+    if jobs.is_empty() {
+        return Err(Error::Configuration(
+            "the config has no ai-model strategy".to_owned(),
+        ));
+    }
+    let storage = if std::env::var("DATABASE_URL").is_ok() {
+        let storage = connect_storage(config).await?;
+        storage.migrate().await?;
+        Some(storage)
+    } else {
+        None
+    };
+    let (api, broker) = connect_venue(config).await?;
+    let context = ai::Context {
+        api: &api,
+        broker: broker.as_ref(),
+        account_id: &ids.account_id,
+        storage: storage.as_deref(),
+        strategy_id: ids.strategy_id.as_str(),
+        persist_memory: false,
+    };
+    let session_date = Utc::now().date_naive();
+    let mut out = Vec::new();
+    let mut failed = None;
+    for job in &jobs {
+        let started = std::time::Instant::now();
+        let trigger = ai::Trigger::new("preview", "");
+        let meter = ai::usage::meter();
+        let result = ai::advise(&context, job, session_date, trigger.clone(), &meter).await;
+        if let Some(storage) = &storage {
+            ai::record(
+                storage,
+                &ai::Entry {
+                    strategy_id: ids.strategy_id.as_str(),
+                    account_id: ids.account_id.as_str(),
+                    kind: "preview",
+                    session_date: Some(session_date),
+                    job,
+                    trigger: &trigger,
+                    duration: started.elapsed(),
+                    spend: &ai::usage::snapshot(&meter),
+                },
+                result.as_ref(),
+            )
+            .await?;
+        }
+        match result {
+            Ok(run) => out.push(serde_json::to_value(&run).map_err(|error| {
+                Error::Configuration(format!("cannot serialize preview: {error}"))
+            })?),
+            Err(error) => {
+                out.push(serde_json::json!({"error": error.to_string()}));
+                failed = Some(error);
+            }
+        }
+    }
+    println!("{}", serde_json::json!({"previews": out}));
+    failed.map_or(Ok(()), Err)
 }
 
 /// Загружает минимальную историю закрытых свечей и прогревает состояние стратегии.
@@ -1391,7 +2186,7 @@ fn strategy_requires_short(kind: &str) -> bool {
 /// планирование/исполнение заявок во время воспроизведения истории.
 async fn warm_up(
     engine: &PortfolioEngine<PostgresStorage>,
-    broker: &SandboxBroker,
+    broker: &VenueBroker,
     requirements: &[DataRequirement],
     cutoff: DateTime<Utc>,
     storage: &PostgresStorage,
@@ -1482,7 +2277,7 @@ async fn warm_up(
 /// Повторы безопасны благодаря event ID, а `Warmup` не разрешает торговый target.
 async fn catch_up_warmup(
     engine: &PortfolioEngine<PostgresStorage>,
-    broker: &SandboxBroker,
+    broker: &VenueBroker,
     requirements: &[DataRequirement],
     from: DateTime<Utc>,
     latest_prices: &mut HashMap<InstrumentId, Price>,
@@ -1628,15 +2423,152 @@ const fn candle_interval_key(interval: CandleInterval) -> &'static str {
     }
 }
 
+/// Загружает справочные данные, если они нужны стратегии, и сохраняет их в state.
+///
+/// Событие подаётся в фазе Warmup: стратегия обновляет снимок, но не может
+/// выставить заявку. ID включает дату, поэтому повтор в тот же день не дублируется.
+async fn absorb_reference(
+    api: &VenueApi,
+    engine: &PortfolioEngine<PostgresStorage>,
+    universe: &[InstrumentId],
+    date: NaiveDate,
+) -> Result<()> {
+    let requirements = engine.reference_requirements().await;
+    if requirements.is_empty() {
+        return Ok(());
+    }
+    let reference = load_reference(api, universe, &requirements).await?;
+    let (fundamentals, dividends) = (reference.fundamentals.len(), reference.dividends.len());
+    let event = StrategyEvent {
+        id: format!("reference:{date}"),
+        phase: EventPhase::Warmup,
+        occurred_at: reference.observed_at,
+        payload: StrategyEventKind::Reference(reference),
+    };
+    let outcome = engine.process_event(&event, None).await?;
+    if !outcome.duplicate {
+        info!(fundamentals, dividends, "reference data loaded");
+    }
+    Ok(())
+}
+
+/// T-Invest кодирует отсутствующий показатель нулём: такой ноль не является данными.
+fn reported(value: f64) -> Option<Decimal> {
+    (value.is_finite() && value != 0.0)
+        .then(|| Decimal::try_from(value).ok())
+        .flatten()
+        .map(|value| value.round_dp(6))
+}
+
+async fn load_reference(
+    api: &VenueApi,
+    universe: &[InstrumentId],
+    requirements: &[ReferenceRequirement],
+) -> Result<ReferenceData> {
+    let now = Utc::now();
+    let mut reference = ReferenceData {
+        observed_at: now,
+        ..ReferenceData::default()
+    };
+    if requirements.contains(&ReferenceRequirement::Fundamentals) {
+        // Показатели привязаны к активу, а не к торгуемому UID.
+        let mut assets = Vec::with_capacity(universe.len());
+        for instrument_id in universe {
+            let share = api
+                .instruments()
+                .share_by(InstrumentRequest {
+                    id_type: InstrumentIdType::Uid as i32,
+                    class_code: None,
+                    id: instrument_id.to_string(),
+                })
+                .await?
+                .into_inner()
+                .instrument
+                .ok_or_else(|| {
+                    Error::Configuration(format!("share `{instrument_id}` not found"))
+                })?;
+            assets.push((instrument_id.clone(), share.asset_uid));
+        }
+        let response = api
+            .instruments()
+            .get_asset_fundamentals(GetAssetFundamentalsRequest {
+                assets: assets.iter().map(|(_, asset)| asset.clone()).collect(),
+            })
+            .await?
+            .into_inner();
+        for row in response.fundamentals {
+            let Some((instrument_id, _)) = assets.iter().find(|(_, asset)| *asset == row.asset_uid)
+            else {
+                continue;
+            };
+            reference.fundamentals.push(InstrumentFundamentals {
+                instrument_id: instrument_id.clone(),
+                price_to_book: reported(row.price_to_book_ttm),
+                price_to_earnings: reported(row.pe_ratio_ttm),
+                ev_to_ebitda: reported(row.ev_to_ebitda_mrq),
+                return_on_equity: reported(row.roe),
+                return_on_assets: reported(row.roa),
+                net_margin: reported(row.net_margin_mrq),
+                debt_to_equity: reported(row.total_debt_to_equity_mrq),
+            });
+        }
+    }
+    if requirements.contains(&ReferenceRequirement::Dividends) {
+        for instrument_id in universe {
+            let response = api
+                .instruments()
+                .get_dividends(GetDividendsRequest {
+                    instrument_id: instrument_id.to_string(),
+                    from: Some(datetime_to_timestamp(now - Duration::days(7))),
+                    to: Some(datetime_to_timestamp(now + Duration::days(200))),
+                    ..GetDividendsRequest::default()
+                })
+                .await?
+                .into_inner();
+            for dividend in response.dividends {
+                let Some(last_buy) = dividend
+                    .last_buy_date
+                    .map(timestamp_to_datetime)
+                    .transpose()?
+                else {
+                    continue;
+                };
+                reference.dividends.push(DividendEvent {
+                    instrument_id: instrument_id.clone(),
+                    last_buy_date: last_buy.date_naive(),
+                    dividend_net: dividend
+                        .dividend_net
+                        .map(Money::from_proto)
+                        .transpose()?
+                        .map(|money| money.amount.0),
+                });
+            }
+        }
+    }
+    Ok(reference)
+}
+
 /// Одно рассчитанное срабатывание относительно официальной сессии MOEX.
 #[derive(Clone)]
 struct ScheduledTrigger {
     anchor: ScheduleAnchor,
     session_date: NaiveDate,
     at: DateTime<Utc>,
+    offset_seconds: i64,
+    /// Конец основной сессии из официального расписания.
+    session_end: Option<DateTime<Utc>>,
 }
 
 impl ScheduledTrigger {
+    /// До какого момента повторять отложенное решение. Повторяется только
+    /// основное открытие сессии: offset-события intraday-стратегий привязаны к
+    /// конкретному времени и после него теряют смысл.
+    fn retry_until(&self) -> Option<DateTime<Utc>> {
+        (self.anchor == ScheduleAnchor::SessionOpen && self.offset_seconds == 0)
+            .then_some(self.session_end?)
+            .map(|end| end - Duration::minutes(OPEN_RETRY_MARGIN_MINUTES))
+    }
+
     /// Строит стабильный ID, чтобы одно расписание нельзя было исполнить дважды.
     fn id(&self) -> String {
         format!(
@@ -1669,7 +2601,7 @@ impl ScheduledTrigger {
 /// manager использует эту дату до первой заявки, поэтому после restart дневной
 /// stop не может случайно унаследовать вчерашнюю базу.
 async fn trading_schedules(
-    api: &SandboxApi,
+    api: &VenueApi,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<tinkoff_rs::proto::TradingSchedulesResponse> {
@@ -1679,7 +2611,6 @@ async fn trading_schedules(
         // The API counts calendar dates inclusively, so use a margin below fourteen days.
         let end = (cursor + Duration::days(12)).min(to);
         let page = api
-            .raw()
             .instruments()
             .trading_schedules(TradingSchedulesRequest {
                 exchange: Some("MOEX".to_owned()),
@@ -1695,7 +2626,7 @@ async fn trading_schedules(
 }
 
 async fn current_moex_session_date(
-    api: &SandboxApi,
+    api: &VenueApi,
     now: DateTime<Utc>,
     previous: Option<NaiveDate>,
 ) -> Result<NaiveDate> {
@@ -1744,7 +2675,7 @@ fn session_date_from_schedule(
 /// Время берётся из ответа биржевого календаря, а не вычисляется фиксированным
 /// московским часом: так учитываются выходные, сокращённые дни и особые сессии.
 async fn load_schedule_triggers(
-    api: &SandboxApi,
+    api: &VenueApi,
     requirements: &[ScheduleRequirement],
     now: DateTime<Utc>,
 ) -> Result<Vec<ScheduledTrigger>> {
@@ -1781,6 +2712,8 @@ async fn load_schedule_triggers(
                         session_date: date,
                         at: timestamp_to_datetime(timestamp)?
                             + Duration::seconds(requirement.offset_seconds),
+                        offset_seconds: requirement.offset_seconds,
+                        session_end: day.end_time.map(timestamp_to_datetime).transpose()?,
                     });
                 }
             }
@@ -1790,24 +2723,34 @@ async fn load_schedule_triggers(
     Ok(triggers)
 }
 
-/// Извлекает наступившие события, исключая дубликаты и слишком старые сигналы.
+/// Окна основных сессий `(открытие, конец)` из официального расписания.
+fn session_windows(triggers: &[ScheduledTrigger]) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    triggers
+        .iter()
+        .filter(|t| t.anchor == ScheduleAnchor::SessionOpen && t.offset_seconds == 0)
+        .filter_map(|t| t.session_end.map(|end| (t.at, end)))
+        .collect()
+}
+
+/// Извлекает наступившие события без дубликатов: `(trigger, late)`.
 /// Будущие triggers остаются в векторе, обработанные удаляются через `retain`.
+///
+/// Событие старше двух минут (компьютер спал, процесс был занят) возвращается
+/// с `late = true`: оно не исполняется сразу, но учитывается стратегией, а
+/// решение открытия сессии ставится в очередь повтора до конца этой сессии.
 fn take_due_triggers(
     triggers: &mut Vec<ScheduledTrigger>,
     fired: &mut HashSet<String>,
     now: DateTime<Utc>,
-) -> Vec<ScheduledTrigger> {
+) -> Vec<(ScheduledTrigger, bool)> {
     let mut due = Vec::new();
     triggers.retain(|trigger| {
         if trigger.at > now {
             return true;
         }
         let age = now.signed_duration_since(trigger.at).num_seconds();
-        let id = trigger.id();
-        // После паузы до двух минут сигнал ещё считается своевременным. Более
-        // старый сигнал не догоняется, чтобы не торговать по утратившей силу цене.
-        if age <= SCHEDULE_GRACE_SECONDS && fired.insert(id) {
-            due.push(trigger.clone());
+        if fired.insert(trigger.id()) {
+            due.push((trigger.clone(), age > SCHEDULE_GRACE_SECONDS));
         }
         false
     });
@@ -1821,7 +2764,7 @@ fn take_due_triggers(
 /// операция без суммы или движение в другой валюте делает `recognized = false`;
 /// это переводит runtime в close-only, поскольку безопасно восстановить P&L нельзя.
 async fn scan_external_cash_flows(
-    api: &SandboxApi,
+    api: &VenueApi,
     state: &AccountRiskState,
 ) -> Result<(Decimal, bool)> {
     let mut cursor = None;
@@ -1829,9 +2772,7 @@ async fn scan_external_cash_flows(
     let mut recognized = true;
     loop {
         let response = api
-            .raw()
-            .sandbox()
-            .get_sandbox_operations_by_cursor(GetOperationsByCursorRequest {
+            .operations_page(GetOperationsByCursorRequest {
                 account_id: state.account_id.to_string(),
                 instrument_id: None,
                 from: Some(datetime_to_timestamp(state.anchor_observed_at)),
@@ -1844,8 +2785,7 @@ async fn scan_external_cash_flows(
                 without_trades: Some(false),
                 without_overnights: Some(false),
             })
-            .await?
-            .into_inner();
+            .await?;
         for item in response.items {
             let operation_type = OperationType::try_from(item.r#type).unwrap_or_default();
             match operation_type {
@@ -1980,6 +2920,55 @@ fn portfolio_is_flat(portfolio: &PortfolioSnapshot) -> bool {
 #[cfg(test)]
 mod campaign_tests {
     use super::{InstrumentId, InstrumentInfo, execution_prices};
+
+    fn trigger(
+        anchor: super::ScheduleAnchor,
+        at: chrono::DateTime<chrono::Utc>,
+        offset_seconds: i64,
+    ) -> super::ScheduledTrigger {
+        super::ScheduledTrigger {
+            anchor,
+            session_date: at.date_naive(),
+            at,
+            offset_seconds,
+            session_end: Some(at + chrono::Duration::hours(9)),
+        }
+    }
+
+    #[test]
+    fn missed_triggers_are_reported_late_once_and_only_the_open_is_retried() {
+        use super::ScheduleAnchor::{ClosingAuctionStart, SessionOpen};
+        use chrono::{Duration, Utc};
+        let now = Utc::now();
+        let mut triggers = vec![
+            trigger(SessionOpen, now - Duration::hours(5), 0),
+            trigger(SessionOpen, now - Duration::seconds(30), 0),
+            trigger(ClosingAuctionStart, now - Duration::hours(1), -1800),
+            trigger(SessionOpen, now + Duration::hours(1), 0),
+        ];
+        let mut fired = std::collections::HashSet::new();
+        let due = super::take_due_triggers(&mut triggers, &mut fired, now);
+        assert_eq!(
+            due.iter().map(|(_, late)| *late).collect::<Vec<_>>(),
+            [true, false, true]
+        );
+        assert_eq!(triggers.len(), 1, "only the future trigger stays");
+        // The open of the session retries until 10 minutes before its end.
+        let (open, _) = &due[0];
+        assert_eq!(
+            open.retry_until(),
+            Some(open.at + Duration::hours(9) - Duration::minutes(10))
+        );
+        assert_eq!(due[2].0.retry_until(), None);
+        assert!(
+            super::take_due_triggers(
+                &mut due.into_iter().map(|(t, _)| t).collect(),
+                &mut fired,
+                now
+            )
+            .is_empty()
+        );
+    }
     use rust_decimal::Decimal;
     use tinkoff_rs::proto::{LastPrice, Quotation};
 
@@ -2037,6 +3026,10 @@ mod campaign_tests {
             short_enabled: true,
             api_trade_available: true,
             market_order_available: true,
+            kind: tinkoff_rs::engine::InstrumentKind::Share,
+            price_multiplier: Decimal::ONE,
+            accrued_interest: Decimal::ZERO,
+            commission_rate: Decimal::ZERO,
         };
         let mut price = LastPrice {
             instrument_uid: "uid".to_owned(),
@@ -2063,5 +3056,40 @@ mod campaign_tests {
         price.time = Some(super::datetime_to_timestamp(chrono::Utc::now()));
         price.price = Some(Quotation { units: 0, nano: 0 });
         assert!(execution_prices(&[price], &[info]).is_err());
+    }
+
+    #[test]
+    fn production_config_requires_both_stops_and_known_contour() {
+        let base = |contour: &str, stops: &str| {
+            format!(
+                "contour = \"{contour}\"\naccount_id = \"2000000001\"\nstrategy_id = \"live-test\"\n\
+                 [risk]\nbudget_rub = \"30000.00\"\n{stops}\n\
+                 [[universe]]\nuid = \"uid-1\"\n\
+                 [[strategies]]\nsignal_weight = \"1.0\"\nkind = \"moving-average-trend\"\n\
+                 fast_window = 50\nslow_window = 200\nband_percent = \"1.0\"\n"
+            )
+        };
+        let parse = |text: String| toml::from_str::<super::BotConfig>(&text);
+        let both = "daily_loss_percent = \"2.0\"\nmax_drawdown_percent = \"10.0\"";
+        let sandbox = parse(base("sandbox", "")).unwrap();
+        assert!(sandbox.validate().is_ok());
+        let live = parse(base("production", both)).unwrap();
+        assert_eq!(live.contour, super::Contour::Production);
+        assert!(live.validate().is_ok());
+        for partial in [
+            "",
+            "daily_loss_percent = \"2.0\"",
+            "max_drawdown_percent = \"10.0\"",
+        ] {
+            let Err(error) = parse(base("production", partial)).unwrap().validate() else {
+                panic!("a production config without both stops must be rejected");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires risk.daily_loss_percent")
+            );
+        }
+        assert!(parse(base("live", both)).is_err());
     }
 }

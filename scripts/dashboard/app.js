@@ -19,12 +19,59 @@ const badge = (text, type = "waiting") => `<span class="badge ${esc(type)}">${es
 const empty = (title, description) => `<div class="empty-state"><span class="empty-icon">⌁</span><strong>${esc(title)}</strong>${esc(description)}</div>`;
 const table = (headers, rows) => `<div class="table-wrap"><table><thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
 const side = value => /buy/i.test(value || "") ? '<span class="side-buy">Покупка</span>' : /sell/i.test(value || "") ? '<span class="side-sell">Продажа</span>' : "—";
-const statusNames = {prepared:"Ожидает сессию",running:"Запущена",cleaned:"Завершена",cleanup_pending:"Закрытие позиций","waiting for predecessor cleanup":"Ожидает счёт","failed; coverage incomplete":"Запуск не удался","restart backoff":"Пауза перед перезапуском",filled:"Исполнена",partially_filled:"Частично",pending:"Подготовлена",submitted:"Отправлена",cancelled:"Отменена",canceled:"Отменена",rejected:"Отклонена",failed:"Ошибка",new:"Новая"};
+const statusNames = {"real token not connected":"Нет токена реального счёта","live trading disabled":"Нет токена реального счёта","emergency stop":"Аварийная остановка","stopped; real positions kept":"Остановлена, позиции сохранены",prepared:"Ожидает сессию",running:"Запущена",cleaned:"Завершена",cleanup_pending:"Закрытие позиций","waiting for predecessor cleanup":"Ожидает счёт","failed; coverage incomplete":"Запуск не удался","restart backoff":"Пауза перед перезапуском","paused; risk monitor":"Служебный процесс",paused:"Выключена","waiting for runtime slot":"Ждёт свободного места","waiting for account owner":"Ждёт счёт",filled:"Исполнена",partially_filled:"Частично",pending:"Подготовлена",submitted:"Отправлена",cancelled:"Отменена",canceled:"Отменена",rejected:"Отклонена",failed:"Ошибка",new:"Новая"};
 const status = value => {
   const normalized = String(value || "").toLowerCase().replace("execution_report_status_", "");
   return statusNames[normalized] || value || "—";
 };
-let data = null, activeTab = "orders", busy = false, chartPoints = [];
+let data = null, activeTab = "orders", busy = false, chartPoints = [], strategiesArchive = false;
+const time = value => date(value, {day: undefined, month: undefined, hour: "2-digit", minute: "2-digit"});
+const weekday = value => new Intl.DateTimeFormat("ru-RU", {timeZone: "Europe/Moscow", weekday: "short", day: "numeric", month: "short"}).format(new Date(value));
+
+function duration(milliseconds) {
+  const minutes = Math.max(0, Math.round(milliseconds / 60000)), days = Math.floor(minutes / 1440), hours = Math.floor(minutes % 1440 / 60);
+  return days ? `${days} дн ${hours} ч` : hours ? `${hours} ч ${minutes % 60} мин` : `${minutes} мин`;
+}
+
+// Trading sessions of the MOEX calendar: the current one, else the next one.
+function tradingSessions() {
+  return (data?.campaign?.calendar || []).filter(d => d.isTradingDay && d.startTime && d.endTime);
+}
+function nearestSession() {
+  const now = Date.now();
+  return tradingSessions().find(d => Date.parse(d.endTime) > now);
+}
+
+function dayRange(days) {
+  if (!days?.length) return "";
+  const first = date(days[0] + "T12:00:00Z"), last = date(days.at(-1) + "T12:00:00Z");
+  return days.length === 1 ? first : `${first} – ${last}`;
+}
+// Operator schedule of one account, as computed by the supervisor.
+function scheduleSummary(c) {
+  const schedule = c.schedule || {};
+  if (schedule.run_mode === "always") return "Постоянно, пока включена";
+  const windows = (schedule.windows || []).filter(w => Date.parse(w.end) > Date.now());
+  if (!windows.length) return "Дни не выбраны";
+  return windows.slice(0, 3).map(w => dayRange(w.days)).join(", ") + (windows.length > 3 ? ` и ещё ${windows.length - 3}` : "");
+}
+const displayName = c => c.title || c.kind;
+// Russian plural: plural(2, ["счёт", "счёта", "счетов"]) → "счёта".
+const plural = (n, [one, few, many]) => {
+  const tens = Math.abs(n) % 100, units = tens % 10;
+  return tens > 10 && tens < 20 ? many : units === 1 ? one : units >= 2 && units <= 4 ? few : many;
+};
+
+// The supervisor records when the computer (and the whole stand) was asleep.
+// A sleep that overlapped a trading session in the last 36 hours is a missed session.
+function sleepWarnings() {
+  const recent = Date.now() - 36 * 3600000;
+  return (data?.campaign?.suspensions || []).filter(s => Date.parse(s.to) > recent).flatMap(s => {
+    const from = Date.parse(s.from), to = Date.parse(s.to);
+    const missed = tradingSessions().filter(d => Date.parse(d.startTime) < to && Date.parse(d.endTime) > from);
+    return missed.length ? [`Компьютер спал ${datetime(s.from)} – ${datetime(s.to)} МСК: стенд стоял, торговая сессия ${missed.map(d => date(d.date + "T12:00:00Z")).join(", ")} пропущена${Date.parse(missed[0].startTime) >= from && Date.parse(missed.at(-1).endTime) <= to ? "" : " частично"}. Во время торгов держите Mac включённым от сети и не закрывайте крышку.`] : [];
+  });
+}
 
 function options(id, items, first) {
   const select = $(id), old = select.value;
@@ -40,57 +87,82 @@ function scopedAccounts() {
 
 function render() {
   const {campaign, accounts, cases} = data;
-  $("campaign-id").textContent = campaign.id || "Кампания не подготовлена";
+  // Portfolios by contour; the campaign identifier stays in the tooltip.
+  const current = cases.filter(c => typeof isCurrentCase !== "function" || isCurrentCase(c));
+  const realCount = current.filter(c => c.contour === "production").length;
+  $("campaign-id").textContent = campaign.id ? `Портфелей: ${current.length} · в песочнице ${current.length - realCount} · на реальных счетах ${realCount}` : "Стенд не подготовлен";
+  $("campaign-id").title = campaign.id || "";
   const observing = campaign.supervisor_running;
   $("connection").textContent = observing ? "● Наблюдатель работает" : campaign.phase === "complete" ? "Наблюдение завершено" : "Наблюдатель остановлен";
   $("connection").className = `badge ${observing ? "" : "warn"}`;
   const warnings = [...data.warnings];
   if (age(data.updated.broker) > 600) warnings.push("Данные брокера старше 10 минут или отсутствуют. Значения ниже могут быть неактуальны.");
   if (age(data.updated.database) > 180) warnings.push("Отчёт стратегий не обновлялся более трёх минут.");
+  warnings.push(...sleepWarnings());
+  if (typeof storageWarnings === "function") warnings.push(...storageWarnings());
   $("notice").hidden = warnings.length === 0;
   $("notice").textContent = warnings.join(" ");
-  $("sessions").innerHTML = campaign.sessions.map((s, index) => {
-    const past = Date.now() > Date.parse(s.endTime), live = Date.now() >= Date.parse(s.startTime) && !past;
-    return `<div class="session ${past ? "past" : live ? "live" : ""}"><span class="number">0${index+1}</span><strong>${esc(date(s.date))}</strong><small>${past ? "прошла" : live ? "идёт" : "ожидание"}</small></div>`;
-  }).join("");
-  const next = campaign.sessions.find(s => Date.parse(s.startTime) > Date.now());
-  $("next-session").textContent = next ? `Следующее открытие: ${datetime(next.startTime)} МСК` : "Пять запланированных сессий";
-  const known = accounts.filter(a => a.equity != null);
-  $("total-equity").textContent = known.length === accounts.length && accounts.length ? fmt(known.reduce((sum,a) => sum+a.equity,0)) : "—";
-  $("account-count").textContent = `${accounts.length} уникальных счетов · виртуальные ₽${known.length < accounts.length ? ` · доступно ${known.length}` : ""}`;
-  $("strategy-count").textContent = cases.length;
-  $("runtime-count").textContent = `${cases.filter(c => c.running).length} работают · ${cases.filter(c => c.preflight_result === "passed" || c.readiness_observed).length} прогреты`;
-  const upcoming = cases.filter(c => c.launch_at && !c.running && c.state !== "cleaned" && Date.parse(c.launch_at) > Date.now()).sort((a,b) => Date.parse(a.launch_at)-Date.parse(b.launch_at));
-  const waiting = !cases.some(c => c.running) && upcoming.length > 0;
-  $("schedule-explanation").hidden = !waiting;
-  if (waiting) {
-    $("schedule-explanation").textContent = `Стратегии ожидают запланированные полные сессии. Ближайший запуск и прогрев: ${datetime(upcoming[0].launch_at)} МСК, открытие: ${datetime(upcoming[0].opening_at)} МСК.${observing ? " Наблюдатель запустит группу автоматически." : " Наблюдатель сейчас остановлен."} Графики инструментов доступны уже сейчас — нажмите на стратегию.`;
-    $("runtime-count").textContent = `Ожидание по расписанию · запуск ${datetime(upcoming[0].launch_at)}`;
-  }
+  const session = nearestSession(), live = session && Date.parse(session.startTime) <= Date.now();
+  $("session-hint").className = `session-hint${live ? " live" : ""}`;
+  $("session-hint").textContent = !session ? "Календарь торговых дней ещё не получен от T-Invest." : live
+    ? `Сейчас идёт торговая сессия: ${time(session.startTime)}–${time(session.endTime)} МСК, до закрытия ${duration(Date.parse(session.endTime) - Date.now())}.`
+    : `Ближайшая торговая сессия: ${weekday(session.startTime)}, ${time(session.startTime)}–${time(session.endTime)} МСК · через ${duration(Date.parse(session.startTime) - Date.now())}.`;
+  $("next-session").textContent = `${tradingSessions().filter(d => Date.parse(d.endTime) > Date.now()).length} торговых дней в календаре`;
+  // Virtual and real rubles are never added together.
+  const virtual = accounts.filter(a => a.contour !== "production"), real = accounts.filter(a => a.contour === "production");
+  const known = virtual.filter(a => a.equity != null);
+  $("total-equity").textContent = known.length === virtual.length && virtual.length ? fmt(known.reduce((sum,a) => sum+a.equity,0)) : "—";
+  $("account-count").textContent = `${virtual.length} ${plural(virtual.length, ["счёт", "счёта", "счетов"])} песочницы · виртуальные ₽${known.length < virtual.length ? ` · доступно ${known.length}` : ""}${real.length ? ` · ${plural(real.length, ["реальный счёт", "реальных счёта", "реальных счетов"])}: ${real.length} (${fmt(real.reduce((sum,a) => sum+(a.equity || 0),0))} ₽, отдельно)` : ""}`;
+  $("strategy-count").textContent = current.length;
+  const service = cases.filter(c => c.running && c.service_only).length;
+  $("runtime-count").textContent = `${cases.filter(c => c.running && !c.service_only).length} торгуют${service ? ` · ${service} служебных` : ""} · ${cases.filter(c => c.preflight_result === "passed" || c.readiness_observed).length} прогреты`;
+  const upcoming = cases.filter(c => c.launch_at && !c.running && Date.parse(c.launch_at) > Date.now()).sort((a,b) => Date.parse(a.launch_at)-Date.parse(b.launch_at));
+  if (!cases.some(c => c.running && !c.service_only) && upcoming.length) $("runtime-count").textContent = `Ближайший запуск по расписанию: ${datetime(upcoming[0].launch_at)}`;
   $("open-orders").textContent = accounts.every(a => a.available) && accounts.length ? accounts.reduce((sum,a) => sum+a.active_orders.length,0) : "—";
   const filled = data.orders.filter(o => o.status === "filled");
   $("filled-orders").textContent = data.updated.database ? filled.filter(o => !o.maintenance).length : "—";
   $("filled-note").textContent = `Стратегии · служебных закрытий: ${filled.filter(o => o.maintenance).length}`;
-  $("strategies-total").textContent = cases.length;
-  options("strategy-filter", cases.map(c => [c.kind,c.kind]), "Все стратегии");
+  $("strategies-total").textContent = current.length;
+  const archived = cases.filter(c => !current.includes(c));
+  $("strategies-archive").textContent = strategiesArchive ? "← Текущие" : `Архив (${archived.length})`;
+  $("strategies-archive").hidden = !archived.length && !strategiesArchive;
+  options("strategy-filter", [...current, ...archived].map(c => [c.kind, displayName(c) + (current.includes(c) ? "" : " · архив")]), "Все стратегии");
+  options("activity-filter", cases.map(c => [c.kind,displayName(c)]), "Все стратегии");
+  $("activity-filter").value = $("strategy-filter").value;
   options("chart-account", accounts.map(a => [a.id,`${a.id.slice(0,8)} · ${a.owner || a.cases[0] || "счёт"}`]), "Все счета");
   renderStrategies(); renderActivity(); renderAccounts(); renderChart();
+  if (typeof renderPortfolios === "function") renderPortfolios();
+  if (typeof renderAiBoard === "function") renderAiBoard();
   renderDetail();
+  if (typeof renderStorage === "function") renderStorage();
+  // The address may name a strategy whose data arrives only now.
+  if (typeof applyView === "function") applyView();
   $("db-updated").textContent = `Отчёт стратегий: ${datetime(data.updated.database)} МСК · ${ageText(data.updated.database)}`;
   $("broker-updated").textContent = `Брокер: ${datetime(data.updated.broker)} МСК · ${ageText(data.updated.broker)}`;
 }
 
+// What a portfolio process does now, as text and badge type.
+function caseState(c) {
+  let state = status(c.state), type = "waiting";
+  if (c.running && c.service_only) {state = "Служебный процесс";type = "warn";}
+  else if (c.running) {state = "Торгует";type = "";}
+  else if (c.state === "running") {state = "Процесс остановлен";type = "warn";}
+  // The supervisor keeps the last process state; without a live process it is only a schedule wait.
+  else if (c.state === "paused; risk monitor") state = Date.parse(c.launch_at) > Date.now() ? "Ожидает сессию" : "Не запущена";
+  if (/failed|pending/.test(c.state)) type = "warn";
+  return [state, type];
+}
+
 function renderStrategies() {
   const filter = $("strategy-filter").value;
-  $("strategy-rows").innerHTML = data.cases.filter(c => !filter || c.kind === filter).map(c => {
+  // Old scenarios that gave their accounts away are listed only in the archive.
+  const archived = c => typeof isCurrentCase === "function" && !isCurrentCase(c);
+  $("strategy-rows").innerHTML = data.cases.filter(c => filter ? c.kind === filter : archived(c) === strategiesArchive).map(c => {
     const ready = c.preflight_result === "passed" || c.readiness_observed;
-    let state = status(c.state), type = "waiting";
-    if (c.running) {state = "Работает";type = "";}
-    else if (c.state === "running") {state = "Процесс остановлен";type = "warn";}
-    if (/failed|pending/.test(c.state)) type = "warn";
+    const [state, type] = caseState(c);
     const zero = Math.max(0,(c.natural_target_count || 0)-(c.nonzero_target_count || 0));
     const riskText = c.risk.blocked ? '<span class="badge error">Риск: блокировка</span>' : c.risk.saved ? '<span class="good">Риск сохранён</span>' : '<span class="muted-text">Риск: ожидает</span>';
-    return `<tr data-strategy="${esc(c.kind)}"><td><button type="button" class="strategy-link" data-strategy="${esc(c.kind)}">${esc(c.kind)}</button><span class="subtext">${esc(c.account_id.slice(0,8))}${c.predecessor && !c.owns_account ? " · счёт после " + esc(c.predecessor) : ""}</span></td><td>${c.cohort === 0 ? "1–2" : c.cohort+2}</td><td>${badge(state,type)}${!c.running && c.launch_at && c.state !== "cleaned" ? `<span class="subtext">Запуск ${esc(datetime(c.launch_at))} МСК</span>` : ""}${c.failed_batches ? `<span class="subtext warning">Ошибок пакетов: ${fmt(c.failed_batches)}</span>` : ""}</td><td>${ready ? '<span class="good">✓ Подтверждён</span>' : '<span class="muted-text">Ожидает</span>'}</td><td class="num">${fmt(c.natural_decision_count || 0)} / ${fmt(c.natural_target_count || 0)}<span class="subtext">нулевых целей: ${fmt(zero)}</span></td><td class="num">${fmt(c.strategy_filled_intents || 0)}</td><td>${riskText}<span class="subtext">Перезапуск: ${c.restart === "passed" ? "проверен" : c.restart === "failed" ? "ошибка" : "не проверен"}</span></td></tr>`;
+    return `<tr data-strategy="${esc(c.kind)}" class="${c.contour === "production" ? "live-row" : ""}"><td><button type="button" class="strategy-link" data-strategy="${esc(c.kind)}">${esc(displayName(c))}</button>${c.contour === "production" ? ' <span class="badge live">РЕАЛЬНЫЙ</span>' : ""}<span class="subtext">${esc(c.account_id.slice(0,8))}${c.title && c.title !== c.kind ? " · " + esc(c.kind) : ""}${c.blocks?.length ? ` · блоков: ${c.blocks.length}` : ""}${c.predecessor && !c.owns_account ? " · счёт после " + esc(c.predecessor) : ""}</span></td><td>${esc(scheduleSummary(c))}${c.schedule?.active ? '<span class="subtext good">Окно идёт</span>' : ""}</td><td>${badge(state,type)}${c.running && c.service_only ? '<span class="subtext">Без автосигналов</span>' : ""}${(!c.running || c.service_only) && c.launch_at && c.state !== "cleaned" && Date.parse(c.launch_at) > Date.now() ? `<span class="subtext">Запуск ${esc(datetime(c.launch_at))} МСК</span>` : ""}${c.failed_batches ? `<span class="subtext warning">Ошибок пакетов: ${fmt(c.failed_batches)}</span>` : ""}</td><td>${ready ? '<span class="good">✓ Подтверждён</span>' : '<span class="muted-text">Ожидает</span>'}</td><td class="num">${fmt(c.natural_decision_count || 0)} / ${fmt(c.natural_target_count || 0)}<span class="subtext">нулевых целей: ${fmt(zero)}</span></td><td class="num">${fmt(c.strategy_filled_intents || 0)}</td><td>${riskText}<span class="subtext">Перезапуск: ${c.restart === "passed" ? "проверен" : c.restart === "failed" ? "ошибка" : "не проверен"}</span></td></tr>`;
   }).join("");
 }
 
@@ -110,9 +182,9 @@ function renderActivity() {
     orders.sort((a,b) => String(b.created_at || "").localeCompare(a.created_at || ""));
     rows = orders.map(o => `<tr><td>${esc(datetime(o.created_at))}</td><td>${esc(o.strategy)}</td><td>${esc(o.instrument)}</td><td>${side(o.side)}</td><td>${fmt(o.lots)} / ${fmt(o.lots_executed)}</td><td>${badge(status(o.status),/filled|fill$/.test(o.status) ? "" : /failed|reject/.test(o.status) ? "error" : "waiting")}</td><td>${o.fromApi ? badge("Активная в API") : o.maintenance ? badge("Служебное закрытие","warn") : o.manual ? badge("Ручная заявка","warn") : "Стратегия"}</td></tr>`);
   } else if (activeTab === "fills") {
-    headers = ["Время, МСК","Стратегия","Инструмент","Направление","Лоты","Цена","Назначение"];
+    headers = ["Время, МСК","Стратегия","Инструмент","Направление","Лоты","Цена","Назначение",""];
     const fills = data.fills.filter(f => !filter || f.strategy === filter).sort((a,b) => String(b.executed_at).localeCompare(a.executed_at));
-    rows = fills.map(f => `<tr><td>${esc(datetime(f.executed_at))}</td><td>${esc(f.strategy || "Не сопоставлена")}</td><td>${esc(f.instrument || "—")}</td><td>${side(f.side)}</td><td>${fmt(f.lots)}</td><td>${fmt(f.price,2)}</td><td>${f.maintenance ? badge("Служебное закрытие","warn") : f.strategy ? "Стратегия" : "Не сопоставлено"}</td></tr>`);
+    rows = fills.map(f => `<tr><td>${esc(datetime(f.executed_at))}</td><td>${esc(f.strategy || "Не сопоставлена")}</td><td>${esc(f.instrument || "—")}</td><td>${side(f.side)}</td><td>${fmt(f.lots)}</td><td>${fmt(f.price,2)}</td><td>${f.maintenance ? badge("Служебное закрытие","warn") : f.strategy ? "Стратегия" : "Не сопоставлено"}</td><td>${f.strategy && f.instrument_id ? `<button type="button" class="button small" data-trade-strategy="${esc(f.strategy)}" data-trade-instrument="${esc(f.instrument_id)}" data-trade-key="${esc(tradeKey(f))}">На графике</button>` : ""}</td></tr>`);
     title = "В журнале пока нет исполнений";description = "Фактические движения по счетам также доступны во вкладке «Операции брокера».";
   } else if (activeTab === "positions") {
     headers = ["Счёт / текущая стратегия","Инструмент","Количество","Лоты","Текущая цена","Валюта"];
@@ -138,12 +210,17 @@ function renderActivity() {
 
 function renderAccounts() {
   const selected = selectedCase();
-  $("account-cards").innerHTML = data.accounts.map((a,index) => `<article class="account-card ${selected && a.id !== selected.account_id ? "dim" : ""}"><div class="account-card-top"><span class="eyebrow">СЧЁТ ${String(index+1).padStart(2,"0")}</span><span class="account-id" title="${esc(a.id)}">${esc(a.id.slice(0,8))}</span></div><div class="account-equity">${fmt(a.equity)} ₽</div><div class="account-owner">${esc(a.owner || "Владелец ещё не назначен")}</div><span class="subtext">Рублёвый остаток: ${fmt(a.cash)} ₽</span><div class="account-bottom"><span>${a.available ? a.positions.length : "—"} позиций</span><span>${a.available ? a.active_orders.length : "—"} заявок</span><span>${a.cases.length} ${a.cases.length === 1 ? "сценарий" : "сценария"}</span></div>${!a.available ? '<span class="subtext warning">Снимок счёта недоступен</span>' : ""}</article>`).join("");
+  $("account-cards").innerHTML = data.accounts.map((a,index) => {
+    const portfolios = data.cases.filter(c => c.account_id === a.id);
+    const composition = portfolios.map(c => `<button type="button" class="account-portfolio" data-strategy="${esc(c.kind)}"><strong>${esc(displayName(c))}</strong><span>${esc(c.blocks?.length ? c.blocks.map(b => `${b.strategies.map(x => x.kind).join(" + ")} · ${b.instruments.map(i => i.ticker).join(", ")} · ${b.share}%`).join("; ") : (c.assets || []).filter(x => !x.benchmark).map(x => x.ticker).join(", "))}</span><span>${esc(scheduleSummary(c))}</span></button>`).join("");
+    return `<article class="account-card ${a.contour === "production" ? "live" : ""} ${selected && a.id !== selected.account_id ? "dim" : ""}"><div class="account-card-top"><span class="eyebrow">${a.contour === "production" ? "РЕАЛЬНЫЙ СЧЁТ" : "СЧЁТ " + String(index+1).padStart(2,"0")}</span><span class="account-id" title="${esc(a.id)}">${esc(a.id.slice(0,8))}</span></div><div class="account-equity">${fmt(a.equity)} ₽</div><div class="account-owner">${esc(a.owner ? "Торгует: " + a.owner : "Владелец ещё не назначен")}</div>${composition}<span class="subtext">Рублёвый остаток: ${fmt(a.cash)} ₽</span><div class="account-bottom"><span>${a.available ? a.positions.length : "—"} позиций</span><span>${a.available ? a.active_orders.length : "—"} заявок</span><span>${a.cases.length} ${a.cases.length === 1 ? "сценарий" : "сценария"}</span></div>${!a.available ? '<span class="subtext warning">Снимок счёта недоступен</span>' : ""}</article>`;
+  }).join("");
 }
 
 function renderChart() {
   const account = $("chart-account").value;
-  chartPoints = data.history.map(point => ({time:point.time,value:account ? point.accounts[account] : point.complete ? Object.values(point.accounts).reduce((a,b) => a+b,0) : null})).filter(p => p.value != null && Number.isFinite(p.value));
+  const real = new Set(data.accounts.filter(a => a.contour === "production").map(a => a.id));
+  chartPoints = data.history.map(point => ({time:point.time,value:account ? point.accounts[account] : point.complete ? Object.entries(point.accounts).filter(([id]) => !real.has(id)).reduce((a,[,b]) => a+b,0) : null})).filter(p => p.value != null && Number.isFinite(p.value));
   const svg = $("equity-chart");
   $("chart-empty").hidden = chartPoints.length >= 2;
   $("chart-tooltip").hidden = true;
@@ -175,7 +252,18 @@ async function refresh() {
 }
 
 $("refresh").addEventListener("click", refresh);
-$("strategy-filter").addEventListener("change", () => {if(data){renderStrategies();renderActivity();renderAccounts();renderDetail();}});
+$("strategies-archive").addEventListener("click", () => {strategiesArchive = !strategiesArchive; if (data) render();});
+$("account-cards").addEventListener("click", event => {
+  const button = event.target.closest("[data-strategy]");
+  if (button) chooseStrategy(button.dataset.strategy);
+});
+$("activity-content").addEventListener("click", event => {
+  const button = event.target.closest("[data-trade-key]");
+  if (button) showTradeOnChart(button.dataset.tradeStrategy, button.dataset.tradeInstrument, button.dataset.tradeKey);
+});
+$("strategy-filter").addEventListener("change", () => {if(data)chooseStrategy($("strategy-filter").value);});
+// Trades and positions of one strategy, without leaving the section.
+$("activity-filter").addEventListener("change", () => {if(data){$("strategy-filter").value = $("activity-filter").value;renderStrategies();renderActivity();renderAccounts();renderDetail();}});
 $("chart-account").addEventListener("change", () => {if(data)renderChart();});
 document.querySelectorAll("[data-tab]").forEach(button => button.addEventListener("click", () => {
   activeTab = button.dataset.tab;

@@ -1,11 +1,10 @@
 //! Durable commands. Every broker mutation runs inside the existing account lease.
 use super::{
-    AccountId, BatchExecutor, BotConfig, Decimal, Duration, Error, GetOrdersRequest, HashMap,
-    InstrumentId, InstrumentIdType, InstrumentInfo, InstrumentRequest, LiveRuntime, MarketData,
-    MissedTickBehavior, Money, PlanningContext, Portfolio, PortfolioEngine, PortfolioSnapshot,
-    PortfolioStrategy, PostgresStorage, Price, RealExchange, Result, RiskMode, RiskObservation,
-    RuntimeIds, SandboxApi, SandboxBroker, StdDuration, Storage, Utc, WeightedEnsembleStrategy,
-    connect_sandbox, connect_storage, current_moex_session_date, ensure_account_exists, info,
+    AccountId, BatchExecutor, BotConfig, Decimal, Duration, Error, HashMap, InstrumentId,
+    InstrumentInfo, LiveRuntime, MarketData, MissedTickBehavior, Money, PlanningContext, Portfolio,
+    PortfolioEngine, PortfolioSnapshot, PortfolioStrategy, PostgresStorage, Price, Result,
+    RiskMode, RiskObservation, RuntimeIds, StdDuration, Storage, Utc, WeightedEnsembleStrategy,
+    connect_storage, connect_venue, current_moex_session_date, ensure_account_exists, info,
     initialize_risk, portfolio_is_flat, refresh_execution_data, resilience, rub_equity,
     scan_external_cash_flows, validate_dedicated_portfolio, warn, watch,
 };
@@ -19,10 +18,12 @@ use tinkoff_rs::{
         PlannedBatch, RebalanceBatch, RebalanceBatchStatus, RiskDecision, TargetPlanner,
         TargetPortfolio, TargetWeight,
     },
-    proto::{CancelOrderRequest, SandboxPayInRequest},
+    proto::SandboxPayInRequest,
     storage::IntentStatus,
 };
 use uuid::Uuid;
+
+use super::{VenueApi, VenueBroker, instruments, venue::Contour};
 
 pub(super) struct Settings {
     pub enabled: bool,
@@ -32,16 +33,33 @@ pub(super) struct Settings {
     mode: String,
 }
 
-pub(super) async fn register(storage: &PostgresStorage, ids: &RuntimeIds) -> Result<()> {
-    sqlx::query("INSERT INTO strategy_controls(strategy_id,account_id,enabled) VALUES($1,$2,COALESCE((SELECT mode='campaign' FROM dashboard_settings WHERE id=true),true)) ON CONFLICT(strategy_id) DO NOTHING")
-        .bind(ids.strategy_id.as_str()).bind(ids.account_id.as_str()).execute(storage.pool()).await?;
-    let account: String =
-        sqlx::query_scalar("SELECT account_id FROM strategy_controls WHERE strategy_id=$1")
-            .bind(ids.strategy_id.as_str())
-            .fetch_one(storage.pool())
-            .await?;
+/// Регистрирует строку управления стратегии. Реальный счёт создаётся выключенным,
+/// с подтверждением каждого плана и без закрытия по расписанию; строка другого
+/// контура или реальная строка без подтверждения останавливают запуск.
+pub(super) async fn register(
+    storage: &PostgresStorage,
+    ids: &RuntimeIds,
+    contour: Contour,
+) -> Result<()> {
+    sqlx::query("INSERT INTO strategy_controls(strategy_id,account_id,enabled,contour,execution_mode,close_after) VALUES($1,$2,CASE WHEN $3='production' THEN false ELSE COALESCE((SELECT mode='campaign' FROM dashboard_settings WHERE id=true),true) END,$3,CASE WHEN $3='production' THEN 'confirm' ELSE 'auto' END,$3<>'production') ON CONFLICT(strategy_id) DO NOTHING")
+        .bind(ids.strategy_id.as_str()).bind(ids.account_id.as_str()).bind(contour.label()).execute(storage.pool()).await?;
+    let row = sqlx::query(
+        "SELECT account_id,contour,execution_mode FROM strategy_controls WHERE strategy_id=$1",
+    )
+    .bind(ids.strategy_id.as_str())
+    .fetch_one(storage.pool())
+    .await?;
+    let account: String = row.try_get("account_id")?;
+    let stored: String = row.try_get("contour")?;
+    let mode: String = row.try_get("execution_mode")?;
     if account != ids.account_id.as_str() {
         return Err(reject("control account does not match runtime"));
+    }
+    if stored != contour.label() {
+        return Err(reject("control contour does not match runtime"));
+    }
+    if contour == Contour::Production && mode != "confirm" {
+        return Err(reject("a real account must confirm every plan"));
     }
     Ok(())
 }
@@ -98,7 +116,8 @@ async fn start_service(config: &BotConfig, ids: &RuntimeIds) -> Result<LiveRunti
     let storage = connect_storage(config).await?;
     storage.migrate().await?;
     let lease = storage.acquire_runtime_lease(&ids.account_id).await?;
-    let (api, broker) = connect_sandbox(config).await?;
+    super::venue::ensure_not_halted(&storage, config.contour).await?;
+    let (api, broker) = connect_venue(config).await?;
     ensure_account_exists(&broker, &ids.account_id).await?;
     let strategy = WeightedEnsembleStrategy::new(
         ids.strategy_id.clone(),
@@ -108,7 +127,7 @@ async fn start_service(config: &BotConfig, ids: &RuntimeIds) -> Result<LiveRunti
     )?;
     let initial_state = strategy.state()?;
     let engine = PortfolioEngine::new(Box::new(strategy), storage.clone()).await?;
-    register(&storage, ids).await?;
+    register(&storage, ids, config.contour).await?;
     if storage
         .load_portfolio_strategy_state(&ids.strategy_id)
         .await?
@@ -143,6 +162,7 @@ async fn start_service(config: &BotConfig, ids: &RuntimeIds) -> Result<LiveRunti
         broker.clone(),
         storage.clone(),
     );
+    let costs = instruments::ExecutionCosts::load(&storage, config.contour.label()).await;
     Ok(LiveRuntime {
         account_id: ids.account_id.clone(),
         strategy_id: ids.strategy_id.clone(),
@@ -158,6 +178,12 @@ async fn start_service(config: &BotConfig, ids: &RuntimeIds) -> Result<LiveRunti
         risk,
         health: resilience::NetworkHealth::default(),
         pending_session_date: None,
+        pending_open: None,
+        ai_jobs: Vec::new(),
+        ai_done: std::collections::HashSet::new(),
+        ai_failures: HashMap::new(),
+        ai_watch: super::ai::Watch::default(),
+        costs,
     })
 }
 
@@ -317,6 +343,23 @@ impl LiveRuntime {
     }
 
     async fn execute_command(&mut self, id: Uuid, kind: &str, payload: &Value) -> Result<Value> {
+        // Реальный счёт: каждый план подтверждается, денег и ручных заявок стенд не трогает.
+        if self.api.contour() == Contour::Production {
+            match kind {
+                "pay_in" => return Err(reject("virtual pay-in exists only in Sandbox")),
+                "manual_order" => {
+                    return Err(reject(
+                        "manual orders on a real account are placed in the broker app",
+                    ));
+                }
+                "execution_mode"
+                    if payload.get("mode").and_then(Value::as_str) != Some("confirm") =>
+                {
+                    return Err(reject("a real account confirms every plan"));
+                }
+                _ => {}
+            }
+        }
         match kind {
             "pause" => {
                 self.pause().await?;
@@ -422,18 +465,7 @@ impl LiveRuntime {
         {
             return Err(Error::Storage("orders are still being reconciled".into()));
         }
-        let orders = self
-            .api
-            .raw()
-            .sandbox()
-            .get_sandbox_orders(GetOrdersRequest {
-                account_id: self.account_id.to_string(),
-                ..Default::default()
-            })
-            .await?
-            .into_inner()
-            .orders;
-        if !orders.is_empty() {
+        if !self.api.active_orders(&self.account_id).await?.is_empty() {
             return Err(reject(
                 "account contains broker orders that must be cancelled first",
             ));
@@ -511,15 +543,7 @@ impl LiveRuntime {
                             let Some(order_id) = response.data.exchange_order_id else {
                                 continue;
                             };
-                            self.api
-                                .raw()
-                                .sandbox()
-                                .cancel_sandbox_order(CancelOrderRequest {
-                                    account_id: self.account_id.to_string(),
-                                    order_id,
-                                    order_id_type: None,
-                                })
-                                .await?;
+                            self.api.cancel_order(&self.account_id, order_id).await?;
                             let after = self
                                 .broker
                                 .order_state(&self.account_id, intent.request_id)
@@ -582,6 +606,7 @@ impl LiveRuntime {
         for id in universe {
             instruments.push(load_instrument(&self.api, &self.broker, id).await?.0);
         }
+        self.costs.apply(&mut instruments);
         Ok(instruments)
     }
 
@@ -690,8 +715,13 @@ impl LiveRuntime {
             price.0 = price.0.max(limit.0);
         }
         if !is_reduction {
-            validate_exposure(&quantities, &conservative_prices, &decision)?;
+            validate_exposure(
+                &quantities,
+                &piece_prices(&conservative_prices, &instruments),
+                &decision,
+            )?;
         }
+        let values = piece_prices(&prices, &instruments);
         let now = Utc::now();
         let target = TargetPortfolio {
             batch_id: id,
@@ -710,7 +740,7 @@ impl LiveRuntime {
                             .get(&i.instrument_id)
                             .copied()
                             .unwrap_or_default()
-                            * prices[&i.instrument_id].0
+                            * values[&i.instrument_id].0
                             / decision.sizing_capital
                     } else {
                         Decimal::ZERO
@@ -739,6 +769,158 @@ impl LiveRuntime {
             self.executor.execute_batch(id).await?
         };
         Ok(json!({"batch_id":id,"outcome":format!("{outcome:?}"),"enabled":false}))
+    }
+
+    /// Непрерывные фьючерсы: когда наступил переход, позиция серии одним пакетом
+    /// переносится из привязанного контракта в следующий; позиции в других
+    /// контрактах серии (остаток прерванного переноса) закрываются. `true` —
+    /// сессию нужно пересоздать, чтобы история и подписки привязались к новому
+    /// контракту. Вне торгов перенос ждёт: до последнего дня торгов старого
+    /// контракта ещё есть время.
+    pub(super) async fn roll_futures(&mut self) -> Result<bool> {
+        let rolls = self.api.series().due_rolls(Utc::now());
+        let (portfolio, decision) = self.control_observation().await?;
+        let targets: Vec<&InstrumentId> = rolls.iter().map(|r| &r.to.uid).collect();
+        let leftovers: Vec<InstrumentId> = portfolio
+            .positions
+            .iter()
+            .filter(|p| {
+                !p.quantity.is_zero()
+                    && !targets.contains(&&p.instrument_id)
+                    && self
+                        .api
+                        .series()
+                        .other_contract_series(&p.instrument_id)
+                        .is_some()
+            })
+            .map(|p| p.instrument_id.clone())
+            .collect();
+        if rolls.is_empty() && leftovers.is_empty() {
+            return Ok(false);
+        }
+        let close_only = decision.mode == RiskMode::CloseOnly;
+        // (свойства, текущие лоты, целевые лоты)
+        let mut legs: Vec<(InstrumentInfo, i64, i64)> = Vec::new();
+        for roll in &rolls {
+            let (series, _) = load_instrument(&self.api, &self.broker, roll.series.clone()).await?;
+            let (next, _) = load_instrument(&self.api, &self.broker, roll.to.uid.clone()).await?;
+            let held = position_lots(&portfolio, &series)?;
+            let moved = position_lots(&portfolio, &next)?;
+            let total = held
+                .checked_add(moved)
+                .ok_or_else(|| reject("rolled position overflows"))?;
+            info!(series = %roll.series, from = %roll.from.ticker, to = %roll.to.ticker, lots = total, "futures roll is due");
+            legs.push((series, held, 0));
+            legs.push((next, moved, if close_only { 0 } else { total }));
+        }
+        for uid in leftovers {
+            let (info, _) = load_instrument(&self.api, &self.broker, uid).await?;
+            let held = position_lots(&portfolio, &info)?;
+            warn!(instrument_id = %info.instrument_id, lots = held, "closing a position left in another contract of a futures series");
+            legs.push((info, held, 0));
+        }
+        legs.retain(|(_, current, desired)| current != desired);
+        if legs.is_empty() {
+            return Ok(!rolls.is_empty());
+        }
+        let mut instruments: Vec<InstrumentInfo> =
+            legs.iter().map(|(info, ..)| info.clone()).collect();
+        let prices = refresh_execution_data(&self.api, &mut instruments).await?;
+        if prices.len() != instruments.len() {
+            info!("futures roll waits for trading in both contracts");
+            return Ok(false);
+        }
+        let event_id = format!(
+            "roll:{}",
+            legs.iter()
+                .map(|(info, current, desired)| format!(
+                    "{}:{current}>{desired}",
+                    info.instrument_id
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("{}:{event_id}", self.account_id).as_bytes(),
+        );
+        if self.storage.load_batch(id).await?.is_none() {
+            let now = Utc::now();
+            let values = piece_prices(&prices, &instruments);
+            let capital = decision.sizing_capital.max(Decimal::ONE);
+            let target = TargetPortfolio {
+                batch_id: id,
+                event_id: event_id.clone(),
+                strategy_id: self.strategy_id.clone(),
+                account_id: self.account_id.clone(),
+                source_as_of: now,
+                generated_at: now,
+                valid_until: now + Duration::minutes(5),
+                weights: legs
+                    .iter()
+                    .map(|(info, _, desired)| TargetWeight {
+                        instrument_id: info.instrument_id.clone(),
+                        weight: Decimal::from(*desired)
+                            * Decimal::from(info.lot_size)
+                            * values[&info.instrument_id].0
+                            / capital,
+                    })
+                    .collect(),
+            };
+            let mut intents = Vec::new();
+            for (info, current, desired) in &legs {
+                let side = if desired > current {
+                    OrderSide::Buy
+                } else {
+                    OrderSide::Sell
+                };
+                intents.extend(manual_intents(
+                    &target,
+                    info,
+                    side,
+                    *current,
+                    *desired,
+                    OrderKind::Market,
+                    None,
+                )?);
+            }
+            // Протокол исполнения: все сокращения раньше открытий.
+            intents.sort_by_key(|intent| intent.execution_phase != ExecutionPhase::Reduction);
+            for (index, intent) in intents.iter_mut().enumerate() {
+                intent.leg_index = i32::try_from(index).map_err(|_| reject("too many legs"))?;
+            }
+            for (info, ..) in &legs {
+                sqlx::query("INSERT INTO account_managed_instruments(account_id,instrument_id,metadata) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
+                    .bind(self.account_id.as_str())
+                    .bind(info.instrument_id.as_str())
+                    .bind(json!({"origin":"futures-roll"}))
+                    .execute(self.storage.pool())
+                    .await?;
+            }
+            let batch = RebalanceBatch {
+                id,
+                event_id,
+                strategy_id: self.strategy_id.clone(),
+                account_id: self.account_id.clone(),
+                target,
+                effective_risk: decision.effective.clone(),
+                sizing_capital: decision.sizing_capital,
+                status: RebalanceBatchStatus::Planned,
+                created_at: now,
+            };
+            self.commit_control_batch(&PlannedBatch { batch, intents }, &decision)
+                .await?;
+        }
+        let outcome = if close_only {
+            self.executor.execute_batch_close_only(id).await?
+        } else {
+            self.executor.execute_batch(id).await?
+        };
+        info!(batch_id = %id, ?outcome, "futures roll batch processed");
+        Ok(matches!(
+            outcome,
+            tinkoff_rs::engine::BatchExecutionOutcome::Completed
+        ) && !rolls.is_empty())
     }
 
     async fn commit_control_batch(
@@ -825,6 +1007,7 @@ impl LiveRuntime {
                 instruments,
                 prices,
                 risk: decision.clone(),
+                min_trade_fraction: self.costs.min_trade_fraction,
             },
         )?;
         self.mark_mixed(command, "approve_batch").await?;
@@ -861,11 +1044,8 @@ impl LiveRuntime {
     async fn change_budget(&mut self, id: Uuid, payload: &Value) -> Result<Value> {
         let amount = positive_decimal(payload, "amount")?;
         let settings = self.control_settings().await?;
-        let budget = next_budget(
-            settings.budget.unwrap_or(self.risk.state().budget_rub),
-            text_field(payload, "operation")?,
-            amount,
-        )?;
+        let previous = settings.budget.unwrap_or(self.risk.state().budget_rub);
+        let budget = next_budget(previous, text_field(payload, "operation")?, amount)?;
         // Reject an impossible request before cancelling any existing plan.
         self.check_budget_fits(budget).await?;
         self.cancel_batches(None).await?;
@@ -873,7 +1053,11 @@ impl LiveRuntime {
         // Cancellation may have raced with a fill, so validate the settled state again.
         let minimum_budget = self.check_budget_fits(budget).await?;
         self.mark_mixed(id, "budget").await?;
-        let result = json!({"execution_budget":budget.to_string(),"minimum_budget":minimum_budget.to_string(),"risk_epoch_preserved":true});
+        // The journal shows "was -> now" and the computed difference of a set request.
+        let delta = budget
+            .checked_sub(previous)
+            .ok_or_else(|| reject("budget difference overflowed"))?;
+        let result = json!({"execution_budget":budget.to_string(),"previous_budget":previous.to_string(),"delta":delta.to_string(),"minimum_budget":minimum_budget.to_string(),"risk_epoch_preserved":true});
         let mut tx = self.storage.pool().begin().await?;
         sqlx::query("UPDATE strategy_controls SET execution_budget=$2,revision=revision+1,updated_at=now() WHERE strategy_id=$1").bind(self.strategy_id.as_str()).bind(budget).execute(&mut *tx).await?;
         sqlx::query("UPDATE control_commands SET status='succeeded',result=$2,updated_at=now() WHERE id=$1 AND status='running'").bind(id).bind(&result).execute(&mut *tx).await?;
@@ -894,7 +1078,7 @@ impl LiveRuntime {
             .iter()
             .map(|p| (p.instrument_id.clone(), p.quantity))
             .collect();
-        let minimum = minimum_budget(&quantities, &prices, &decision)?;
+        let minimum = minimum_budget(&quantities, &piece_prices(&prices, &instruments), &decision)?;
         let pnl = decision.strategy_equity - decision.state.allocated_principal;
         let minimum_budget = (minimum - pnl.min(Decimal::ZERO)).max(Decimal::ZERO);
         if budget < minimum_budget {
@@ -929,6 +1113,7 @@ impl LiveRuntime {
         }
         let response = self
             .api
+            .sandbox()?
             .raw()
             .sandbox()
             .sandbox_pay_in(SandboxPayInRequest {
@@ -1015,6 +1200,8 @@ impl LiveRuntime {
                 instruments,
                 prices,
                 risk: decision.clone(),
+                // Защитное закрытие обнуляет позиции: порог сделки к нему не относится.
+                min_trade_fraction: Decimal::ZERO,
             },
         )?;
         self.commit_control_batch(&plan, &decision).await?;
@@ -1172,53 +1359,31 @@ fn next_budget(current: Decimal, operation: &str, amount: Decimal) -> Result<Dec
     Ok(value)
 }
 
+/// Свойства инструмента любого поддерживаемого типа (см. [`instruments::describe`]).
 async fn load_instrument(
-    api: &SandboxApi,
-    broker: &SandboxBroker,
+    api: &VenueApi,
+    broker: &VenueBroker,
     id: InstrumentId,
 ) -> Result<(InstrumentInfo, Option<Decimal>)> {
-    let instrument = api
-        .raw()
-        .instruments()
-        .get_instrument_by(InstrumentRequest {
-            id_type: InstrumentIdType::Uid as i32,
-            class_code: None,
-            id: id.to_string(),
+    instruments::describe(api, broker, &id)
+        .await
+        .map_err(|error| reject(&error.to_string()))
+}
+
+/// Рублёвая стоимость одной бумаги (контракта) вместо котировки: для облигаций
+/// и фьючерсов котировка — проценты номинала и пункты.
+fn piece_prices(
+    prices: &HashMap<InstrumentId, Price>,
+    instruments: &[InstrumentInfo],
+) -> HashMap<InstrumentId, Price> {
+    instruments
+        .iter()
+        .filter_map(|info| {
+            prices
+                .get(&info.instrument_id)
+                .map(|price| (info.instrument_id.clone(), Price(info.piece_value(price.0))))
         })
-        .await?
-        .into_inner()
-        .instrument
-        .ok_or_else(|| reject("instrument not found"))?;
-    if instrument.uid != id.as_str()
-        || instrument.real_exchange != RealExchange::Moex as i32
-        || !instrument.currency.eq_ignore_ascii_case("rub")
-        || instrument.instrument_type != "share"
-        || instrument.lot <= 0
-        || !instrument.api_trade_available_flag
-    {
-        return Err(reject(
-            "only MOEX RUB shares available through API are supported",
-        ));
-    }
-    let availability = broker.trading_availability(&id).await?.data;
-    let tick = instrument
-        .min_price_increment
-        .map(Price::from_quotation)
-        .transpose()?
-        .map(|p| p.0)
-        .filter(|p| *p > Decimal::ZERO);
-    Ok((
-        InstrumentInfo {
-            instrument_id: id,
-            lot_size: i64::from(instrument.lot),
-            currency: instrument.currency,
-            exchange: "moex".into(),
-            short_enabled: instrument.short_enabled_flag,
-            api_trade_available: availability.api_trade_available,
-            market_order_available: availability.market_order_available,
-        },
-        tick,
-    ))
+        .collect()
 }
 
 fn position_lots(portfolio: &PortfolioSnapshot, info: &InstrumentInfo) -> Result<i64> {
@@ -1395,6 +1560,10 @@ mod tests {
             short_enabled: true,
             api_trade_available: true,
             market_order_available: true,
+            kind: tinkoff_rs::engine::InstrumentKind::Share,
+            price_multiplier: Decimal::ONE,
+            accrued_interest: Decimal::ZERO,
+            commission_rate: Decimal::ZERO,
         };
         let legs = manual_intents(
             &target,

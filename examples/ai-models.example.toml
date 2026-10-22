@@ -1,0 +1,57 @@
+# Профили ИИ-моделей для стратегии `ai-model`.
+# Рабочая копия: docker/local/ai/models.toml (не в Git, права 0600).
+# Без Compose путь задаёт переменная AI_MODELS_FILE.
+# Файл перечитывается при каждом решении: правка применяется без перезапуска.
+#
+# provider = "anthropic"  — Anthropic Messages API (Claude)
+# provider = "openai"     — любой OpenAI-совместимый Chat Completions:
+#                           OpenAI, OpenRouter, DeepSeek, Ollama, LM Studio, vLLM, шлюзы
+# url    — базовый адрес API (по умолчанию официальный адрес провайдера)
+# model  — имя модели у провайдера
+# token  — токен прямо здесь, или token_env = "ИМЯ_ПЕРЕМЕННОЙ" — токен из окружения;
+#          для локальных моделей токен не нужен
+# Дополнительно: web_search = true (поиск в интернете, Anthropic),
+#   max_output_tokens = 4096, timeout_seconds = 120, temperature = 0.2,
+#   headers = { "HTTP-Referer" = "..." } — заголовки, которых требует шлюз,
+#   prompt_cache = false — отключить кэш промпта Anthropic.
+# Цены (для учёта расходов и лимита) у моделей Anthropic встроены; для других:
+#   prices = { input = 3, output = 15, cache_write = 3.75, cache_read = 0.3, web_search_per_1000 = 10 }
+#   (за миллион токенов; веб-поиск — за тысячу запросов). Валюта — доллары; цены
+#   в рублях (например, Cloud.ru) — с currency = "rub". Расходы стенд показывает в
+#   рублях по курсу доллара Мосбиржи.
+# Дневной лимит расходов задаётся в панели в рублях («Модели ИИ → Расходы»).
+
+default = "sonnet"
+
+[models.sonnet]
+provider = "anthropic"
+url = "https://api.anthropic.com/v1"
+model = "claude-sonnet-4-6"
+token = ""
+web_search = true
+
+[models.claude]
+provider = "anthropic"
+url = "https://api.anthropic.com/v1"
+model = "claude-opus-5-5"
+token = ""
+web_search = true
+
+[models.openai]
+provider = "openai"
+url = "https://api.openai.com/v1"
+model = "ИМЯ_МОДЕЛИ_OPENAI"
+token_env = "OPENAI_API_KEY"
+
+[models.openrouter]
+provider = "openai"
+url = "https://openrouter.ai/api/v1"
+model = "ИМЯ_МОДЕЛИ_НА_OPENROUTER"
+token = ""
+
+# Локальная модель на этом компьютере (Ollama). Из контейнера хост доступен
+# как host.docker.internal; без Compose — http://localhost:11434/v1.
+[models.local]
+provider = "openai"
+url = "http://host.docker.internal:11434/v1"
+model = "qwen2.5:14b"

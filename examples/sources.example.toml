@@ -1,0 +1,107 @@
+# Источники документов для стратегии `ai-model` (сборщик `tinkoff-bot collect`).
+# Рабочая копия: docker/local/ai/sources.toml; без Compose путь задаёт SOURCES_FILE.
+# Файл перечитывается каждые полминуты; без файла действуют значения ниже.
+
+# Новости T-Invest: Интерфакс, РИА Новости, ТАСС с полными текстами и раскрытие
+# информации эмитентов (существенные факты) с отметками инструментов.
+[tinvest]
+enabled = true
+interval_seconds = 120
+backfill_hours = 72        # глубина первой загрузки
+
+# Деловые ленты: анонс из RSS, полный текст — со страницы статьи (robots.txt
+# соблюдается; сайты с защитой от ботов и платные страницы остаются с анонсом).
+[rss]
+enabled = true
+interval_seconds = 300
+full_text = true
+feeds = [
+  "https://www.kommersant.ru/RSS/section-business.xml",
+  "https://www.kommersant.ru/RSS/section-finance.xml",
+  "https://www.vedomosti.ru/rss/rubric/finance",
+  "https://www.vedomosti.ru/rss/rubric/business",
+  "https://www.finam.ru/analysis/nslent/rsspoint/",
+  "https://www.finam.ru/analysis/conews/rsspoint/",
+]
+
+# Сообщения Московской биржи (RSS сайта с полным текстом).
+[moex]
+enabled = true
+interval_seconds = 300
+
+# Банк России: пресс-релизы и события.
+[cbr]
+enabled = true
+interval_seconds = 900
+feeds = ["https://www.cbr.ru/rss/RssPress", "https://www.cbr.ru/rss/eventrss"]
+
+# Сайты эмитентов: пресс-релизы (RSS или страница списка с шаблоном пути ссылки)
+# и отчётность в PDF. Первый обход только запоминает ссылки; документами
+# становятся новые публикации. Сайты с защитой от ботов и списками, которые
+# рисуются скриптами, не обходятся: их события приходят через раскрытие
+# информации в новостях T-Invest и ленту Интерфакса.
+[issuers]
+enabled = true
+interval_seconds = 3600
+
+[[issuers.sites]]
+ticker = "GAZP"
+feed = "https://www.gazprom.ru/rss/"
+
+[[issuers.sites]]
+ticker = "ROSN"
+feed = "https://www.rosneft.ru/press/releases/rss"
+
+[[issuers.sites]]
+ticker = "CHMF"
+page = "https://severstal.com/rus/media/archive/"
+link_pattern = '^/media/archive/[a-z0-9-]+/?$'
+
+[[issuers.sites]]
+ticker = "MTSS"
+page = "https://ir.mts.ru/news_and_events/corporate_releases"
+link_pattern = '^/news_and_events/corporate_releases/details/\d+$'
+
+[[issuers.sites]]
+ticker = "MAGN"
+page = "https://mmk.ru/ru/press-center/news/"
+link_pattern = '^/ru/press-center/news/[a-z0-9-]+/$'
+
+[web]
+seconds_between_requests = 3   # пауза между запросами к одному сайту
+max_page_bytes = 2000000
+# Основной текст для сайтов, где общий разбор ошибается (CSS-селектор):
+# selectors = { "example.ru" = "div.article-body" }
+
+# Разметка документов дешёвой моделью: важность, вид события, краткое содержание,
+# эмитенты и темы рынка (геополитика, санкции, нефть, рубль, ставка…). Подключение
+# и ключ — из файла профилей моделей; расход входит в общий дневной лимит.
+[tagging]
+enabled = true
+# profile = "sonnet"            # профиль подключения; по умолчанию — default файла моделей
+# model = "claude-haiku-5-5"    # для Anthropic по умолчанию Haiku 5.5
+# exposure_profile = "sonnet"   # кто пишет черновики чувствительности бумаг (по умолчанию default)
+batch = 15                      # документов в одном запросе
+per_tick = 60                   # событий за полминуты
+
+[retention]
+news_days = 365         # новости, статьи, сообщения биржи
+irrelevant_days = 7     # текст документов, не относящихся к рынку
+embeddings_days = 180   # векторы для поиска по смыслу
+
+# Поиск по смыслу (необязательно): OpenAI-совместимый /embeddings.
+# Локально — служба embeddings в compose (docker compose --profile embeddings up -d):
+# [embeddings]
+# url = "http://embeddings:11434/v1"
+# model = "bge-m3"
+# dimensions = 1024
+# Или внешний сервис, например Voyage (ключ — в переменной окружения):
+# url = "https://api.voyageai.com/v1"
+# model = "voyage-3.5-lite"
+# dimensions = 1024
+# input_type = true
+# token_env = "VOYAGE_API_KEY"
+# price_per_million = 0.02
+# Сообщение другого агентства с близостью первого фрагмента от этого порога —
+# то же событие (у моделей e5 ставьте 0.95; 1 — не склеивать):
+# same_event_similarity = 0.92

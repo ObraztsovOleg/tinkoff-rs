@@ -312,6 +312,14 @@ impl SandboxBroker {
 pub struct LiveTradingPermit(());
 
 impl LiveTradingPermit {
+    /// Разрешение, которое приложение выдаёт по собственной процедуре оператора:
+    /// например, явный реальный контур в конфигурации, отдельный токен счёта и
+    /// аварийная остановка. Вызов — явное решение кода приложения, а не окружения.
+    #[must_use]
+    pub const fn granted_by_operator() -> Self {
+        Self(())
+    }
+
     /// Возвращает permit только когда `TINKOFF_ALLOW_LIVE_TRADING` равно `true`
     /// без учёта регистра; иначе возвращает `LiveTradingDisabled`.
     pub fn from_env() -> Result<Self> {

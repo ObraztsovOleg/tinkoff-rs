@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -66,33 +67,87 @@ def persist(state):
     save(WORK / "campaign.json", state)
 
 
+def fish_literal(name):
+    """A literal `set ... NAME value` from the user's fish config; the config is never executed."""
+    with contextlib.suppress(OSError):
+        for line in (Path.home() / ".config/fish/conf.d/env.fish").read_text().splitlines():
+            if not line.lstrip().startswith("set "):
+                continue
+            with contextlib.suppress(ValueError):
+                words = shlex.split(line, comments=True)
+                if name in words:
+                    index = words.index(name)
+                    if len(words) == index + 2:
+                        value = words[index + 1].rstrip(";")
+                        if value and not any(c in value for c in "$()\n\r"):
+                            return value
+    return None
+
+
 def token():
     if os.environ.get("TINKOFF_TOKEN_FILE"):
         value = Path(os.environ["TINKOFF_TOKEN_FILE"]).read_text().strip()
         if not value or any(c in value for c in "\n\r"):
             raise RuntimeError("Sandbox token secret must contain one nonempty line")
         return value
-    # Parse only the requested literal assignment, never execute the user's shell config.
-    for line in (Path.home() / ".config/fish/conf.d/env.fish").read_text().splitlines():
-        if not line.lstrip().startswith("set "):
-            continue
-        with contextlib.suppress(ValueError):
-            words = shlex.split(line, comments=True)
-            if "TINKOFF_TOKEN_SANDBOX" in words:
-                index = words.index("TINKOFF_TOKEN_SANDBOX")
-                if len(words) == index + 2:
-                    value = words[index + 1].rstrip(";")
-                    if value and not any(c in value for c in "$()\n\r"):
-                        return value
+    value = fish_literal("TINKOFF_TOKEN_SANDBOX")
+    if value:
+        return value
     raise RuntimeError("TINKOFF_TOKEN_SANDBOX must be a nonempty literal fish assignment")
 
 
+def live_token():
+    """Real-account token: TINKOFF_TOKEN_PRODUCTION from the environment, the Compose
+    secret file or a literal fish assignment. Never argv, YAML or logs."""
+    value = os.environ.get("TINKOFF_TOKEN_PRODUCTION", "").strip()
+    if not value and os.environ.get("TINKOFF_TOKEN_PRODUCTION_FILE"):
+        try:
+            value = Path(os.environ["TINKOFF_TOKEN_PRODUCTION_FILE"]).read_text().strip()
+        except OSError:
+            raise RuntimeError("Real-account token secret is unreadable") from None
+    if not value and not os.environ.get("TINKOFF_TOKEN_PRODUCTION_FILE"):
+        value = fish_literal("TINKOFF_TOKEN_PRODUCTION") or ""
+    if not value or any(c in value for c in "\n\r"):
+        raise RuntimeError("Real-account token is not connected")
+    return value
+
+
+def is_live(case):
+    return bool(case) and case.get("contour") == "production"
+
+
+def live_status(state):
+    """Whether real accounts can trade: a token and no emergency stop. Never the secret itself."""
+    try:
+        live_token()
+        connected = True
+    except RuntimeError:
+        connected = False
+    halted = bool((state.get("live") or {}).get("halted"))
+    return {"token": connected, "halted": halted, "ready": connected and not halted}
+
+
+SANDBOX_REST = "https://sandbox-invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1."
+PRODUCTION_REST = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1."
+# The supervisor only reads real accounts; orders go through the bot's live permit.
+LIVE_READ_METHODS = {"UsersService/GetAccounts", "OperationsService/GetPortfolio", "OperationsService/GetPositions",
+                     "OrdersService/GetOrders", "OperationsService/GetOperationsByCursor",
+                     # Tariff and futures point values for the commission rates (read-only).
+                     "UsersService/GetInfo", "InstrumentsService/GetFuturesMargin"}
+# Commission rates (tariff and charged commissions) and the USD/RUB rate for AI spend.
+COMMISSIONS_SECONDS = 6 * 3600
+
+
 class API:
-    def __init__(self):
-        self.secret = token()
+    def __init__(self, production=False):
+        self.production = production
+        self.secret = live_token() if production else token()
+        self.base = PRODUCTION_REST if production else SANDBOX_REST
         self.last_call = 0.0
 
     def call(self, method, body=None, *, mutate=False):
+        if self.production and (mutate or method not in LIVE_READ_METHODS):
+            raise RuntimeError("Real-account access here is read-only: " + method)
         for attempt in range(4 if not mutate else 1):
             time.sleep(max(0, 0.4 - (time.monotonic() - self.last_call)))
             self.last_call = time.monotonic()
@@ -100,7 +155,7 @@ class API:
                 "/usr/bin/curl", "--silent", "--show-error", "--connect-timeout", "10", "--max-time", "30",
                 "--request", "POST", "--header", "Content-Type: application/json", "--data", json.dumps(body or {}),
                 "--config", "-", "--write-out", "\n%{http_code}",
-                "https://sandbox-invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1." + method,
+                self.base + method,
             ], input="header = " + json.dumps("Authorization: Bearer " + self.secret) + "\n", text=True, capture_output=True)
             if result.returncode:
                 raise RuntimeError(f"{method}: curl {result.returncode}: " + result.stderr.replace(self.secret, "[redacted]"))
@@ -118,10 +173,20 @@ def command(args, **kwargs):
     return subprocess.run(args, check=True, text=True, capture_output=True, **kwargs).stdout.strip()
 
 
-def environment(state):
+def environment(state, case=None):
+    """Child environment: a real-account case gets only TINKOFF_TOKEN_PRODUCTION,
+    a Sandbox case only the sandbox TINKOFF_TOKEN."""
     env = os.environ.copy()
-    env.pop("TINKOFF_ALLOW_LIVE_TRADING", None)
-    env.update(TINKOFF_TOKEN=token(), DATABASE_URL=database_url(state), RUST_LOG="tinkoff_bot=info,tinkoff_rs=info", NO_COLOR="1")
+    # TINKOFF_ALLOW_LIVE_TRADING is obsolete; a stray value never reaches a runtime.
+    for key in ("TINKOFF_TOKEN", "TINKOFF_TOKEN_FILE", "TINKOFF_TOKEN_PRODUCTION", "TINKOFF_TOKEN_PRODUCTION_FILE", "TINKOFF_ALLOW_LIVE_TRADING"):
+        env.pop(key, None)
+    env.update(DATABASE_URL=database_url(state), RUST_LOG="tinkoff_bot=info,tinkoff_rs=info", NO_COLOR="1")
+    if is_live(case):
+        # check-config and migrate need no token; the bot reports a missing one itself.
+        with contextlib.suppress(RuntimeError):
+            env["TINKOFF_TOKEN_PRODUCTION"] = live_token()
+    else:
+        env["TINKOFF_TOKEN"] = token()
     return env
 
 
@@ -153,7 +218,7 @@ def psql_environment(state):
 
 def bot(state, case, action, *args, timeout=180):
     return subprocess.run([str(BINARY), "--config", str(WORK / case["config"]), action, *args],
-                          env=environment(state), text=True, capture_output=True, timeout=timeout)
+                          env=environment(state, case), text=True, capture_output=True, timeout=timeout)
 
 
 def scheduled_sessions(api):
@@ -164,6 +229,53 @@ def scheduled_sessions(api):
     if len(days) < 5:
         raise RuntimeError("Fewer than five upcoming full sessions returned; rerun preparation later")
     return days[:5]
+
+
+def refresh_calendar(state, api):
+    """MOEX trading days two weeks ahead; recent past days stay for running windows.
+
+    The API rejects a `from` before the current date, so past days come only from
+    earlier refreshes and the prepared sessions.
+    """
+    start = now()
+    days = {}
+    # T-Invest serves the schedule at most 14 days ahead; hourly refreshes extend it.
+    data = api.call("InstrumentsService/TradingSchedules", {"exchange": "MOEX", "from": start.isoformat(), "to": (start + dt.timedelta(days=13)).isoformat()})
+    for exchange in data.get("exchanges", []):
+        for day in exchange.get("days", []):
+            days[day["date"][:10]] = {"date": day["date"][:10], "isTradingDay": bool(day.get("isTradingDay")),
+                                      "startTime": day.get("startTime"), "endTime": day.get("endTime")}
+    cutoff = (now() - dt.timedelta(days=7)).date().isoformat()
+    merged = {d["date"]: d for d in state.get("calendar", []) if d["date"] >= cutoff}
+    merged.update(days)
+    state["calendar"] = sorted(merged.values(), key=lambda d: d["date"])
+    state["calendar_updated"] = now().isoformat()
+
+
+def calendar(state):
+    """Known trading days: refreshed calendar, else the prepared campaign sessions."""
+    known = {d["date"]: d for d in ({"date": s["date"][:10], "isTradingDay": True, "startTime": s["startTime"], "endTime": s["endTime"]}
+                                    for s in state.get("sessions", []))}
+    known.update({d["date"]: d for d in state.get("calendar", [])})
+    return sorted(known.values(), key=lambda d: d["date"])
+
+
+def trading_windows(days_known, chosen):
+    """Consecutive chosen trading days form one window: warm-up 1 h before, stop 2 min after."""
+    chosen, windows, block = set(chosen or []), [], []
+    for day in days_known:
+        if not (day.get("isTradingDay") and day.get("startTime") and day.get("endTime")):
+            continue
+        if day["date"] in chosen:
+            block.append(day)
+        elif block:
+            windows.append(block)
+            block = []
+    if block:
+        windows.append(block)
+    return [{"begin": (timestamp(b[0]["startTime"]) - dt.timedelta(hours=1)).isoformat(), "open": b[0]["startTime"],
+             "end": (timestamp(b[-1]["endTime"]) + dt.timedelta(minutes=2)).isoformat(), "days": [d["date"] for d in b]}
+            for b in windows]
 
 
 def history(api, uid, interval, count, days, page_days, limit):
@@ -441,8 +553,13 @@ def stop_process(case):
 
 def launch(state, case, service_only=False, planned=False):
     """Start a runtime. A planned restart (restart check) does not spend the crash budget."""
-    if sum(process_alive(c.get("pid"), str(WORK / c["config"])) for c in state["cases"].values()) >= 4:
+    # The limit covers Sandbox runtimes; a real account uses its own token and API limits.
+    if not is_live(case) and sum(process_alive(c.get("pid"), str(WORK / c["config"])) for c in state["cases"].values()
+                                 if not is_live(c)) >= state.get("max_runtimes", 4):
         case["state"] = "waiting for runtime slot"
+        return False
+    if is_live(case) and not live_status(state)["ready"]:
+        case["state"] = "real token not connected"
         return False
     if case.get("predecessor") and not case.get("ownership_transferred"):
         previous = state["cases"][case["predecessor"]]
@@ -470,7 +587,7 @@ def launch(state, case, service_only=False, planned=False):
     case["log_offset"] = path.stat().st_size if path.exists() else 0
     with path.open("a") as log:
         child = subprocess.Popen([str(BINARY), "--config", str(WORK / case["config"]), "run"] + (["--service-only"] if service_only else []),
-                                 env=environment(state), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                                 env=environment(state, case), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     case.update(pid=child.pid, state="paused; risk monitor" if service_only else "running", service_only=service_only,
                 attempts=case["attempts"] + (0 if planned else 1), last_started=now().isoformat())
     case.pop("retry_at", None)
@@ -488,10 +605,13 @@ def runtime_ready(case):
         return False
     with path.open("rb") as log:
         log.seek(case.get("log_offset", 0))
-        return b"Sandbox runtime is live" in log.read()
+        return b"runtime is live" in log.read()
 
 
 def cleanup_case(state, case):
+    if is_live(case):
+        # Liquidating a real account is only the operator's explicit, confirmed command.
+        raise RuntimeError("Real account positions are closed only by an operator command: " + case["kind"])
     if case.get("predecessor") and not case.get("ownership_transferred"):
         case["state"] = "cleaned"
         case["coverage_note"] = "Not started; predecessor owns account and its cleanup"
@@ -578,7 +698,7 @@ def report(state):
         nonzero = [b for b in batches if any(float(w["weight"]) != 0 for w in b["target"]["weights"])]
         log_path = WORK / "logs" / (case["kind"] + ".log")
         log = log_path.read_bytes()[case.get("revision_log_offset", 0):].decode(errors="replace") if log_path.exists() else ""
-        case["readiness_observed"] = "Sandbox runtime is live" in log
+        case["readiness_observed"] = "runtime is live" in log
         case["natural_target_count"] = len(batches)
         case["nonzero_target_count"] = len(nonzero)
         orders = [o for o in (snapshot or {}).get("orders", []) if o["strategy_id"] == case["strategy_id"]]
@@ -639,21 +759,33 @@ def verify_restart(state, case):
     persist(state)
 
 
+SANDBOX_READS = {"operations": "SandboxService/GetSandboxOperationsByCursor", "portfolio": "SandboxService/GetSandboxPortfolio",
+                 "orders": "SandboxService/GetSandboxOrders"}
+LIVE_READS = {"operations": "OperationsService/GetOperationsByCursor", "portfolio": "OperationsService/GetPortfolio",
+              "orders": "OrdersService/GetOrders"}
+
+
 def audit_accounts(state, api):
     audit = {"observed_at": now().isoformat(), "accounts": {}}
     accounts = {}
+    live_api = None
     for kind, case in state["cases"].items():
         try:
             if case["account_id"] in accounts:
                 audit["accounts"][kind] = accounts[case["account_id"]]
                 continue
+            client, reads = api, SANDBOX_READS
+            if is_live(case):
+                # Read-only client: the real account is only observed here.
+                live_api = live_api or API(production=True)
+                client, reads = live_api, LIVE_READS
             body = {"accountId": case["account_id"]}
             operations, cursor = [], None
             while True:
-                request = dict(body, **{"from": state["created_at"], "to": audit["observed_at"], "limit": 1000})
+                request = dict(body, **{"from": case.get("promoted_at") or state["created_at"], "to": audit["observed_at"], "limit": 1000})
                 if cursor:
                     request["cursor"] = cursor
-                page = api.call("SandboxService/GetSandboxOperationsByCursor", request)
+                page = client.call(reads["operations"], request)
                 operations.extend(page.get("items", []))
                 if not page.get("hasNext"):
                     break
@@ -663,8 +795,8 @@ def audit_accounts(state, api):
                 cursor = next_cursor
             accounts[case["account_id"]] = audit["accounts"][kind] = {
                 "account_id": case["account_id"],
-                "portfolio": api.call("SandboxService/GetSandboxPortfolio", body),
-                "orders": api.call("SandboxService/GetSandboxOrders", body),
+                "portfolio": client.call(reads["portfolio"], body),
+                "orders": client.call(reads["orders"], body),
                 "operations": operations,
             }
         except RuntimeError as error:
@@ -699,47 +831,254 @@ def refill_restart_budget(case, current):
         case["attempts"] = 0
 
 
+# A wall-clock gap between supervisor passes means the computer (or its VM) was
+# asleep: every runtime was frozen and the trading sessions in between were missed.
+SUSPENSION_GAP = 120
+SUSPENSION_MERGE = dt.timedelta(minutes=5)
+
+
+def note_suspension(state, before, after):
+    """Record a sleep interval; short maintenance wakes merge into one interval."""
+    start, end = dt.datetime.fromtimestamp(before, UTC), dt.datetime.fromtimestamp(after, UTC)
+    history = state.setdefault("suspensions", [])
+    if history and start - timestamp(history[-1]["to"]) <= SUSPENSION_MERGE:
+        history[-1]["to"] = end.isoformat()
+    else:
+        history.append({"from": start.isoformat(), "to": end.isoformat()})
+    del history[:-20]
+    supervisor_log(f"stand was suspended from {start.isoformat()} to {end.isoformat()}; runtimes were frozen")
+
+
 def supervisor_log(message):
     with (WORK / "supervisor.log").open("a") as log:
         log.write(now().isoformat() + " " + message + "\n")
 
 
+# Nightly upkeep at 03:30 Moscow time, outside every trading session.
+MAINTENANCE_AT_UTC = dt.time(0, 30)
+MAINTENANCE_RETRY = dt.timedelta(hours=1)
+# Risk-check event ids carry their own timestamp and are never replayed, so an
+# old marker protects nothing. Candle, schedule and advice markers stay: warmup
+# and the session-open retry rely on them.
+RETENTION_SQL = """WITH events AS (
+    DELETE FROM processed_events WHERE event_id LIKE 'risk-check:%' AND processed_at < now() - interval '7 days' RETURNING 1),
+  samples AS (
+    DELETE FROM performance_samples p WHERE p.observed_at < now() - interval '30 days' AND EXISTS (
+      SELECT 1 FROM performance_samples q WHERE q.run_id = p.run_id AND q.observed_at > p.observed_at
+        AND date_trunc(CASE WHEN p.observed_at < now() - interval '365 days' THEN 'day' ELSE 'hour' END, q.observed_at)
+          = date_trunc(CASE WHEN p.observed_at < now() - interval '365 days' THEN 'day' ELSE 'hour' END, p.observed_at))
+    RETURNING 1),
+  usage AS (DELETE FROM ai_usage WHERE at < now() - interval '400 days' RETURNING 1)
+SELECT json_build_object('risk_check_events', (SELECT count(*) FROM events), 'performance_samples', (SELECT count(*) FROM samples),
+  'ai_usage', (SELECT count(*) FROM usage))"""
+# Text logs of runtimes and services: the newest LOG_KEEP_BYTES stay in `<name>.1`.
+LOG_LIMIT_BYTES = 50 * 1024 * 1024
+LOG_KEEP_BYTES = 10 * 1024 * 1024
+DISK_CHECK_SECONDS = 300
+
+
+# Document collector for the AI model strategy: one process for the stand.
+COLLECTOR_MARKER = "tinkoff-bot collect"
+COLLECTOR_RESTART = dt.timedelta(minutes=1)
+
+
+def uses_ai_model(case):
+    path = WORK / case["config"]
+    return path.exists() and 'kind = "ai-model"' in path.read_text()
+
+
+def collector_alive(state):
+    return process_alive(state.get("collector", {}).get("pid"), "collect")
+
+
+def stop_collector(state):
+    record = state.get("collector", {})
+    if collector_alive(state):
+        os.kill(record["pid"], signal.SIGINT)
+        for _ in range(30):
+            if not collector_alive(state):
+                break
+            time.sleep(1)
+    record.pop("pid", None)
+
+
+def supervise_collector(state, desired, stopping):
+    """Keep the collector running while an AI portfolio is on; stop it on a
+    stand stop, park or critically low disk space."""
+    record = state.setdefault("collector", {})
+    low_disk = state.get("disk", {}).get("level") == "critical"
+    wanted = desired and not stopping and not low_disk
+    if not wanted:
+        if collector_alive(state):
+            stop_collector(state)
+            supervisor_log("document collector stopped: " + ("disk space is critically low" if low_disk else "no AI portfolio is on"))
+        record["state"] = "disk space low" if low_disk and desired else "off"
+        return
+    if collector_alive(state):
+        record["state"] = "running"
+        return
+    if record.get("exited_at") and now() - timestamp(record["exited_at"]) < COLLECTOR_RESTART:
+        record["state"] = "restart backoff"
+        return
+    if record.get("pid"):
+        # It was running and exited: note it, restart after a pause.
+        record.update(pid=None, exited_at=now().isoformat(), restarts=record.get("restarts", 0) + 1, state="restart backoff")
+        supervisor_log("document collector exited; restarting in a minute")
+        return
+    path = WORK / "logs" / "collector.log"
+    path.parent.mkdir(exist_ok=True)
+    with path.open("a") as log:
+        child = subprocess.Popen([str(BINARY), "collect"], env=environment(state, None), stdout=log,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+    record.update(pid=child.pid, started=now().isoformat(), state="running", exited_at=None)
+
+
+def maintenance_due(state, current):
+    record = state.get("maintenance", {})
+    if record.get("retry_at") and current < timestamp(record["retry_at"]):
+        return False
+    due = dt.datetime.combine(current.date(), MAINTENANCE_AT_UTC, UTC)
+    return current >= due and record.get("day") != current.date().isoformat()
+
+
+def rotate_logs():
+    """Keep the newest part of a long log; writers append, so truncation is safe."""
+    rotated = []
+    for path in sorted(list((WORK / "logs").glob("*.log")) + list(WORK.glob("*.log"))):
+        if path.stat().st_size <= LOG_LIMIT_BYTES:
+            continue
+        with path.open("rb") as log:
+            log.seek(-LOG_KEEP_BYTES, os.SEEK_END)
+            tail = log.read()
+        previous = path.with_name(path.name + ".1")
+        previous.write_bytes(tail[tail.find(b"\n") + 1:])
+        previous.chmod(0o600)
+        with path.open("r+b") as log:
+            log.truncate(0)
+        rotated.append(path.name)
+    return rotated
+
+
+def maintenance(state):
+    """Retention, statistics and log rotation once a day; failures retry hourly."""
+    current = now()
+    record = state.setdefault("maintenance", {})
+    started = time.monotonic()
+    try:
+        deleted = json.loads(run_sql(state, RETENTION_SQL))
+        run_sql(state, "VACUUM (ANALYZE) processed_events, performance_samples, ai_usage")
+        rotated = rotate_logs()
+        for case in state["cases"].values():
+            if case["kind"] + ".log" in rotated:
+                case["log_offset"] = 0
+        size = int(run_sql(state, "SELECT pg_database_size(current_database())"))
+    except (RuntimeError, subprocess.SubprocessError, OSError, ValueError) as error:
+        record.update(retry_at=(current + MAINTENANCE_RETRY).isoformat(), error=str(error)[:500])
+        supervisor_log("maintenance failed; retrying in an hour: " + str(error))
+        return
+    state["maintenance"] = {"day": current.date().isoformat(), "at": current.isoformat(), "deleted": deleted,
+                            "rotated_logs": rotated, "database_bytes": size, "seconds": round(time.monotonic() - started, 1)}
+    supervisor_log("maintenance done: deleted " + json.dumps(deleted) + f", database {size // 1048576} MiB")
+
+
+def disk_paths():
+    """Watched file systems: in Compose a bind mount shows the Mac disk, /data the VM disk."""
+    raw = os.environ.get("DISK_WATCH_PATHS")
+    return [Path(p) for p in raw.split(":") if p] if raw else [WORK]
+
+
+def disk_status(state):
+    """Free space on the tightest watched disk. A critical level stops document
+    collection and backups; trading keeps running."""
+    warn = float(os.environ.get("DISK_WARN_GB", "3")) * 1024 ** 3
+    critical = float(os.environ.get("DISK_CRITICAL_GB", "1")) * 1024 ** 3
+    readings = []
+    for path in disk_paths():
+        with contextlib.suppress(OSError):
+            usage = shutil.disk_usage(path)
+            readings.append({"path": str(path), "free_bytes": usage.free, "total_bytes": usage.total})
+    if not readings:
+        return
+    tightest = min(readings, key=lambda r: r["free_bytes"])
+    level = "critical" if tightest["free_bytes"] < critical else "warn" if tightest["free_bytes"] < warn else "ok"
+    previous = state.get("disk", {}).get("level")
+    database = None
+    with contextlib.suppress(RuntimeError, subprocess.SubprocessError, OSError, ValueError, KeyError):
+        database = int(run_sql(state, "SELECT pg_database_size(current_database())"))
+    state["disk"] = {"level": level, "free_bytes": tightest["free_bytes"], "path": tightest["path"], "readings": readings,
+                     "database_bytes": database, "checked_at": now().isoformat()}
+    marker = WORK / "DISK_LOW"
+    if level == "critical":
+        marker.touch()
+    else:
+        marker.unlink(missing_ok=True)
+    if level != previous and level != "ok":
+        supervisor_log(f"disk space {level}: {tightest['free_bytes'] // 1048576} MiB free on {tightest['path']}")
+
+
+def backups():
+    """Nightly copies written by the backup service, newest first."""
+    directory = WORK / "backups"
+    files = sorted(directory.glob("*.dump"), key=lambda f: f.stat().st_mtime, reverse=True) if directory.is_dir() else []
+    status = None
+    with contextlib.suppress(OSError, ValueError):
+        status = json.loads((directory / "status.json").read_text())
+    return {"status": status, "files": [{"name": f.name, "bytes": f.stat().st_size,
+                                         "at": dt.datetime.fromtimestamp(f.stat().st_mtime, UTC).isoformat()} for f in files]}
+
+
 def supervise_tick(state, api, clocks):
     """One scheduling pass. Raises only for local failures; the caller retries."""
     controls = control_plane.process(SimpleNamespace(**globals()), state)
-    operating_mode = controls["mode"]
     desired = {c["strategy_id"]: c for c in controls["cases"]}
     owners = {c["account_id"]: c["strategy_id"] for c in controls["owners"]}
     pending_commands = {c["strategy_id"]: c["id"] for c in controls.get("pending", [])}
     current = now()
     stopping = (WORK / "STOP").exists()
-    sessions = state["sessions"]
+    days_known = calendar(state)
+    state["live"] = controls.get("live") or {}
+    live = live_status(state)
     for case in state["cases"].values():
         control = desired.get(case["strategy_id"], {})
         enabled = control.get("enabled", True)
         service = control.get("needs_service", False)
+        run_mode = control.get("run_mode", "schedule")
+        windows = trading_windows(days_known, control.get("trading_days", [])) if run_mode == "schedule" else []
+        window = next((w for w in windows if timestamp(w["begin"]) <= current < timestamp(w["end"])), None)
+        finished = max((w["end"] for w in windows if timestamp(w["end"]) <= current), default=None)
+        # The dashboard reads the operator schedule from here; no window is inferred elsewhere.
+        case["schedule"] = {"run_mode": run_mode, "windows": windows, "active": window is not None,
+                            "close_after": control.get("close_after", True)}
         pending_id = pending_commands.get(case["strategy_id"])
         if pending_id and pending_id != case.get("last_control_command"):
             case.update(attempts=0, last_control_command=pending_id)
         if case["strategy_id"] in controls.get("closed", []) and not pending_id:
             stop_process(case)
             case["state"] = "cleaned"
-        cohort = case["cohort"]
-        first, last = ((0, 1) if cohort == 0 else (cohort + 1, cohort + 1))
-        begin = timestamp(sessions[first]["startTime"]) - dt.timedelta(hours=1)
-        end = timestamp(sessions[last]["endTime"]) + dt.timedelta(minutes=2)
-        if case["state"] == "cleaned" and not (operating_mode == "free" and enabled) and not service:
+        active = enabled and (run_mode == "always" or window is not None)
+        if is_live(case) and (stopping or not live["ready"]):
+            # A real account is never liquidated by the stand: campaign stop, the
+            # emergency stop or a removed token only stop its runtime.
+            if process_alive(case.get("pid"), str(WORK / case["config"])):
+                stop_process(case)
+            case["state"] = ("stopped; real positions kept" if stopping else
+                             "emergency stop" if live["halted"] else "real token not connected")
             continue
-        if stopping or (operating_mode == "campaign" and current >= end):
+        if case["state"] == "cleaned" and not active and not service:
+            continue
+        window_closed = (not is_live(case) and run_mode == "schedule" and case["schedule"]["close_after"] and finished
+                         and not window and case.get("closed_window") != finished)
+        if stopping or window_closed:
             if case.get("last_cleanup") and current - timestamp(case["last_cleanup"]) < dt.timedelta(minutes=5):
                 continue
             try:
                 cleanup_case(state, case)
+                if case["state"] == "cleaned" and window_closed:
+                    case["closed_window"] = finished
             except (RuntimeError, subprocess.SubprocessError, OSError) as error:
                 case.update(state="cleanup_pending", last_cleanup=now().isoformat(), error=str(error))
                 persist(state)
             continue
-        active = enabled and (operating_mode == "free" or begin <= current < end)
         live = process_alive(case.get("pid"), str(WORK / case["config"]))
         if live and case.get("service_only") and active:
             stop_process(case)
@@ -751,12 +1090,17 @@ def supervise_tick(state, api, clocks):
                 stop_process(case)
                 case["state"] = "paused"
             continue
-        # Prepare all cohorts early by readiness/restart checks, at most four at once.
         if not active and not service:
+            if live:
+                # Outside the operator's window: stop trading, keep positions unless close_after.
+                stop_process(case)
+            if case["state"] not in {"cleaned", "cleanup_pending"}:
+                case["state"] = "paused" if not enabled else "waiting for window"
             continue
         owner = owners.get(case["account_id"])
         predecessor = state["cases"].get(case.get("predecessor"), {})
-        if operating_mode == "free" and owner and owner != case["strategy_id"]:
+        if owner and owner != case["strategy_id"]:
+            # Any owner that has closed its positions may hand the account over.
             previous = next((c for c in state["cases"].values() if c["strategy_id"] == owner), None)
             if previous and previous["state"] == "cleaned":
                 case.update(predecessor=previous["kind"], ownership_transferred=False)
@@ -777,7 +1121,8 @@ def supervise_tick(state, api, clocks):
                 continue
             if not launch(state, case, service_only=not active):
                 continue
-        if active and operating_mode == "campaign" and runtime_ready(case) and current < timestamp(sessions[first]["startTime"]) - dt.timedelta(minutes=15):
+        # The lease self-test starts a duplicate runtime; never against a real account.
+        if active and window and not is_live(case) and runtime_ready(case) and current < timestamp(window["open"]) - dt.timedelta(minutes=15):
             try:
                 verify_restart(state, case)
             except (RuntimeError, subprocess.SubprocessError, ValueError) as error:
@@ -788,15 +1133,41 @@ def supervise_tick(state, api, clocks):
             if result.returncode == 0:
                 case["restart_result"] = "passed" if json.loads(result.stdout)["epoch"] == case["epoch_before_restart"] else "failed"
                 persist(state)
-    if operating_mode == "campaign" and all(c["state"] == "cleaned" for c in state["cases"].values()):
-        state["phase"] = "complete"
-    elif operating_mode == "free":
-        state["phase"] = "interactive"
-    if (operating_mode == "campaign" and current > timestamp(sessions[-1]["endTime"]) and state["phase"] != "complete") or stopping:
-        state["phase"] = "cleanup_only"
+    if "collector" in clocks:
+        ai_on = any(desired.get(c["strategy_id"], {}).get("enabled", True) and uses_ai_model(c)
+                    for c in state["cases"].values() if c["state"] != "cleaned" or desired.get(c["strategy_id"], {}).get("enabled"))
+        supervise_collector(state, ai_on, stopping)
+    if stopping:
+        state["phase"] = "complete" if all(c["state"] == "cleaned" for c in state["cases"].values() if not is_live(c)) else "cleanup_only"
+    else:
+        state["phase"] = "observing"
+    if time.monotonic() - clocks["calendar"] > 3600:
+        clocks["calendar"] = time.monotonic()
+        try:
+            refresh_calendar(state, api)
+        except RuntimeError as error:
+            # Retry in five minutes instead of an hour; the last known days stay in use.
+            clocks["calendar"] = time.monotonic() - 3300
+            supervisor_log("calendar refresh failed; using the last known days: " + str(error))
     if time.monotonic() - clocks["audit"] > 300:
         clocks["audit"] = time.monotonic()
         audit_accounts(state, api)
+    # A pass without these clocks (tests, one-off ticks) skips disk and upkeep work.
+    if time.monotonic() - clocks.get("disk", float("inf")) > DISK_CHECK_SECONDS:
+        clocks["disk"] = time.monotonic()
+        disk_status(state)
+    if time.monotonic() - clocks.get("commissions", float("inf")) > COMMISSIONS_SECONDS:
+        clocks["commissions"] = time.monotonic()
+        try:
+            control_plane.refresh_usd_rub(SimpleNamespace(**globals()), state, api)
+            control_plane.calibrate_commissions(SimpleNamespace(**globals()), state, api)
+        except (RuntimeError, ValueError, KeyError, OSError) as error:
+            print("commission rates or the USD/RUB rate were not refreshed:", str(error)[:300], flush=True)
+            clocks["commissions"] = time.monotonic() - COMMISSIONS_SECONDS + 600
+    if time.monotonic() - clocks.get("maintenance", float("inf")) > 60:
+        clocks["maintenance"] = time.monotonic()
+        if maintenance_due(state, now()):
+            maintenance(state)
     if time.monotonic() - clocks["report"] > 60:
         clocks["report"] = time.monotonic()
         report(state)
@@ -817,14 +1188,22 @@ def supervise():
     # -i: без сна по простою, -m: диск не засыпает, -s: система не спит при питании
     # от сети. Закрытая крышка без внешнего монитора всё равно усыпит Mac.
     sleeper = subprocess.Popen(["/usr/bin/caffeinate", "-ims", "-w", str(os.getpid())]) if sys.platform == "darwin" else None
-    clocks = {"report": 0.0, "audit": 0.0}
+    # -inf: the first pass reports immediately even right after a VM boot (small monotonic clock).
+    clocks = {"report": float("-inf"), "audit": float("-inf"), "calendar": float("-inf"), "disk": float("-inf"), "maintenance": float("-inf"), "collector": 0,
+              "commissions": float("-inf")}
     api = API()
     control_plane.initialize(SimpleNamespace(**globals()), state)
     signal.signal(signal.SIGTERM, lambda *_: (WORK / "STOP").touch())
     signal.signal(signal.SIGINT, lambda *_: (WORK / "STOP").touch())
+    last_pass = time.time()
     try:
         while True:
+            if time.time() - last_pass > SUSPENSION_GAP:
+                note_suspension(state, last_pass, time.time())
+                persist(state)
+            last_pass = time.time()
             if (WORK / "PARK").exists():
+                stop_collector(state)
                 for case in state["cases"].values():
                     stop_process(case)
                 state["phase"] = "parked"

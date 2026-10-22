@@ -127,7 +127,7 @@ license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
 [[paper]]
 id = "daniel-moskowitz-2016"
 role = "critique"
-strategies = ["cross-sectional-momentum", "intermediate-momentum", "fifty-two-week-high", "residual-momentum"]
+strategies = ["cross-sectional-momentum", "intermediate-momentum", "fifty-two-week-high", "residual-momentum", "risk-managed-momentum"]
 title = "Momentum Crashes"
 authors = ["Kent Daniel", "Tobias J. Moskowitz"]
 year = 2016
@@ -409,7 +409,7 @@ license_url = "https://rpc.cfainstitute.org/en/about-rpc/copyright-and-permissio
 [[paper]]
 id = "moreira-muir-2017"
 role = "primary"
-strategies = ["volatility-managed"]
+strategies = ["volatility-managed", "risk-managed-momentum"]
 title = "Volatility-Managed Portfolios"
 authors = ["Alan Moreira", "Tyler Muir"]
 year = 2017
@@ -427,7 +427,7 @@ license_url = "https://www.nber.org/subscribe/information-libraries"
 [[paper]]
 id = "cederburg-odoherty-wang-yan-2020"
 role = "critique"
-strategies = ["volatility-managed"]
+strategies = ["volatility-managed", "risk-managed-momentum"]
 title = "On the Performance of Volatility-Managed Portfolios"
 authors = ["Scott Cederburg", "Michael S. O'Doherty", "Feifei Wang", "Xuemin Yan"]
 year = 2020
@@ -478,7 +478,7 @@ license_url = "https://creativecommons.org/licenses/by-nc/4.0/"
 [[paper]]
 id = "nazarova-leshchev-2023"
 role = "context"
-strategies = ["cross-sectional-momentum", "intermediate-momentum", "short-term-reversal"]
+strategies = ["cross-sectional-momentum", "intermediate-momentum", "short-term-reversal", "risk-managed-momentum"]
 title = "Study of the Momentum Effect in the Price Dynamics of Highly Liquid Shares on the Russian Securities Market"
 authors = ["Varvara V. Nazarova", "Sergei I. Leshchev"]
 year = 2023
@@ -491,3 +491,280 @@ retrieval = "personal-fetch"
 redistribution = "prohibited-without-permission"
 license_spdx = "LicenseRef-All-Rights-Reserved"
 license_url = "https://www.finjournal-nifi.ru/en/"
+
+[[paper]]
+id = "fama-french-1992"
+role = "primary"
+strategies = ["value-composite"]
+title = "The Cross-Section of Expected Stock Returns"
+authors = ["Eugene F. Fama", "Kenneth R. French"]
+year = 1992
+doi = "10.1111/j.1540-6261.1992.tb04398.x"
+doi_url = "https://doi.org/10.1111/j.1540-6261.1992.tb04398.x"
+landing_url = "https://doi.org/10.1111/j.1540-6261.1992.tb04398.x"
+pdf_url = ""
+expected_filename = "fama-french-1992.pdf"
+brief_pdf = "briefs/value-composite.ru.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "fama-french-2012"
+role = "primary"
+strategies = ["value-composite"]
+title = "Size, Value, and Momentum in International Stock Returns"
+authors = ["Eugene F. Fama", "Kenneth R. French"]
+year = 2012
+doi = "10.1016/j.jfineco.2012.05.011"
+doi_url = "https://doi.org/10.1016/j.jfineco.2012.05.011"
+landing_url = "https://doi.org/10.1016/j.jfineco.2012.05.011"
+pdf_url = ""
+expected_filename = "fama-french-2012.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "asness-moskowitz-pedersen-2013"
+role = "primary"
+strategies = ["value-composite", "cross-sectional-momentum"]
+title = "Value and Momentum Everywhere"
+authors = ["Clifford S. Asness", "Tobias J. Moskowitz", "Lasse Heje Pedersen"]
+year = 2013
+doi = "10.1111/jofi.12021"
+doi_url = "https://doi.org/10.1111/jofi.12021"
+landing_url = "https://www.aqr.com/Insights/Research/Journal-Article/Value-and-Momentum-Everywhere"
+pdf_url = ""
+expected_filename = "asness-moskowitz-pedersen-2013.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "jensen-kelly-pedersen-2023"
+role = "context"
+strategies = ["all"]
+title = "Is There a Replication Crisis in Finance?"
+authors = ["Theis Ingerslev Jensen", "Bryan Kelly", "Lasse Heje Pedersen"]
+year = 2023
+doi = "10.1111/jofi.13249"
+doi_url = "https://doi.org/10.1111/jofi.13249"
+landing_url = "https://www.nber.org/papers/w28432"
+pdf_url = ""
+expected_filename = "jensen-kelly-pedersen-2023.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "manushkin-2024"
+role = "critique"
+strategies = ["value-composite", "quality-profitability"]
+title = "Application of Fama-French Five Factor Model on the Russian Market"
+authors = ["Nikolai A. Manushkin"]
+year = 2024
+doi = "10.2139/ssrn.4845673"
+doi_url = "https://doi.org/10.2139/ssrn.4845673"
+landing_url = "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4845673"
+pdf_url = ""
+expected_filename = "manushkin-2024.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.ssrn.com/index.cfm/en/terms-of-use/"
+
+[[paper]]
+id = "novy-marx-2013"
+role = "primary"
+strategies = ["quality-profitability"]
+title = "The Other Side of Value: The Gross Profitability Premium"
+authors = ["Robert Novy-Marx"]
+year = 2013
+doi = "10.1016/j.jfineco.2013.01.003"
+doi_url = "https://doi.org/10.1016/j.jfineco.2013.01.003"
+landing_url = "https://doi.org/10.1016/j.jfineco.2013.01.003"
+pdf_url = ""
+expected_filename = "novy-marx-2013.pdf"
+brief_pdf = "briefs/quality-profitability.ru.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "asness-frazzini-pedersen-2019"
+role = "primary"
+strategies = ["quality-profitability"]
+title = "Quality Minus Junk"
+authors = ["Clifford S. Asness", "Andrea Frazzini", "Lasse Heje Pedersen"]
+year = 2019
+doi = "10.1007/s11142-018-9470-2"
+doi_url = "https://doi.org/10.1007/s11142-018-9470-2"
+landing_url = "https://doi.org/10.1007/s11142-018-9470-2"
+pdf_url = ""
+expected_filename = "asness-frazzini-pedersen-2019.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.springernature.com/gp/policies/terms"
+
+[[paper]]
+id = "fama-french-2015"
+role = "context"
+strategies = ["quality-profitability"]
+title = "A Five-Factor Asset Pricing Model"
+authors = ["Eugene F. Fama", "Kenneth R. French"]
+year = 2015
+doi = "10.1016/j.jfineco.2014.10.010"
+doi_url = "https://doi.org/10.1016/j.jfineco.2014.10.010"
+landing_url = "https://doi.org/10.1016/j.jfineco.2014.10.010"
+pdf_url = ""
+expected_filename = "fama-french-2015.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "barroso-santa-clara-2015"
+role = "primary"
+strategies = ["risk-managed-momentum"]
+title = "Momentum Has Its Moments"
+authors = ["Pedro Barroso", "Pedro Santa-Clara"]
+year = 2015
+doi = "10.1016/j.jfineco.2014.11.010"
+doi_url = "https://doi.org/10.1016/j.jfineco.2014.11.010"
+landing_url = "https://doi.org/10.1016/j.jfineco.2014.11.010"
+pdf_url = ""
+expected_filename = "barroso-santa-clara-2015.pdf"
+brief_pdf = "briefs/risk-managed-momentum.ru.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "heston-sadka-2008"
+role = "primary"
+strategies = ["return-seasonality"]
+title = "Seasonality in the Cross-Section of Stock Returns"
+authors = ["Steven L. Heston", "Ronnie Sadka"]
+year = 2008
+doi = "10.1016/j.jfineco.2007.02.003"
+doi_url = "https://doi.org/10.1016/j.jfineco.2007.02.003"
+landing_url = "https://doi.org/10.1016/j.jfineco.2007.02.003"
+pdf_url = ""
+expected_filename = "heston-sadka-2008.pdf"
+brief_pdf = "briefs/return-seasonality.ru.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "heston-sadka-2010"
+role = "primary"
+strategies = ["return-seasonality"]
+title = "Seasonality in the Cross Section of Stock Returns: The International Evidence"
+authors = ["Steven L. Heston", "Ronnie Sadka"]
+year = 2010
+doi = "10.1017/S0022109010000451"
+doi_url = "https://doi.org/10.1017/S0022109010000451"
+landing_url = "https://doi.org/10.1017/S0022109010000451"
+pdf_url = ""
+expected_filename = "heston-sadka-2010.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.cambridge.org/core/terms"
+
+[[paper]]
+id = "keloharju-linnainmaa-nyberg-2016"
+role = "primary"
+strategies = ["return-seasonality"]
+title = "Return Seasonalities"
+authors = ["Matti Keloharju", "Juhani T. Linnainmaa", "Peter Nyberg"]
+year = 2016
+doi = "10.1111/jofi.12398"
+doi_url = "https://doi.org/10.1111/jofi.12398"
+landing_url = "https://www.nber.org/papers/w20815"
+pdf_url = ""
+expected_filename = "keloharju-linnainmaa-nyberg-2016.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "hartzmark-solomon-2013"
+role = "primary"
+strategies = ["dividend-month"]
+title = "The Dividend Month Premium"
+authors = ["Samuel M. Hartzmark", "David H. Solomon"]
+year = 2013
+doi = "10.1016/j.jfineco.2013.02.015"
+doi_url = "https://doi.org/10.1016/j.jfineco.2013.02.015"
+landing_url = "https://doi.org/10.1016/j.jfineco.2013.02.015"
+pdf_url = ""
+expected_filename = "hartzmark-solomon-2013.pdf"
+brief_pdf = "briefs/dividend-month.ru.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://www.elsevier.com/about/policies-and-standards/copyright"
+
+[[paper]]
+id = "cherkasova-petrukhin-2017"
+role = "context"
+strategies = ["dividend-month"]
+title = "The Ex-Day Phenomenon and Share Price Performance on Emerging Markets"
+authors = ["Victoria Cherkasova", "Ilya Petrukhin"]
+year = 2017
+doi = ""
+doi_url = ""
+landing_url = "https://cfjournal.hse.ru/article/view/6529"
+pdf_url = ""
+expected_filename = "cherkasova-petrukhin-2017.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://cfjournal.hse.ru/"
+
+[[paper]]
+id = "mclean-pontiff-2016"
+role = "context"
+strategies = ["all"]
+title = "Does Academic Research Destroy Stock Return Predictability?"
+authors = ["R. David McLean", "Jeffrey Pontiff"]
+year = 2016
+doi = "10.1111/jofi.12365"
+doi_url = "https://doi.org/10.1111/jofi.12365"
+landing_url = "https://doi.org/10.1111/jofi.12365"
+pdf_url = ""
+expected_filename = "mclean-pontiff-2016.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://onlinelibrary.wiley.com/terms-and-conditions"
+
+[[paper]]
+id = "caporale-zakirova-2017"
+role = "context"
+strategies = ["all"]
+title = "Calendar Anomalies in the Russian Stock Market"
+authors = ["Guglielmo Maria Caporale", "Valentina Zakirova"]
+year = 2017
+doi = "10.1016/j.ruje.2017.02.007"
+doi_url = "https://doi.org/10.1016/j.ruje.2017.02.007"
+landing_url = "https://rujec.org/article/27979/"
+pdf_url = ""
+expected_filename = "caporale-zakirova-2017.pdf"
+retrieval = "manual"
+redistribution = "prohibited-without-permission"
+license_spdx = "LicenseRef-All-Rights-Reserved"
+license_url = "https://rujec.org/"

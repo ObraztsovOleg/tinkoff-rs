@@ -21,19 +21,22 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub use config::{
-    BettingAgainstBetaConfig, BuiltinStrategySpec, CrossSectionalMomentumConfig,
-    EqualRiskContributionConfig, FiftyTwoWeekHighConfig, IntermediateMomentumConfig,
-    IntradaySameClockConfig, LowVolatilityConfig, MarketIntradayMomentumConfig,
-    MovingAverageTrendConfig, PairsTradingConfig, RangeBreakoutConfig, ResidualMomentumConfig,
-    ShortTermReversalConfig, TimeSeriesMomentumConfig, VolatilityManagedConfig,
+    AiModelConfig, BettingAgainstBetaConfig, BuiltinStrategySpec, CrossSectionalMomentumConfig,
+    DividendMonthConfig, EqualRiskContributionConfig, FiftyTwoWeekHighConfig,
+    IntermediateMomentumConfig, IntradaySameClockConfig, LowVolatilityConfig,
+    MarketIntradayMomentumConfig, MovingAverageTrendConfig, PairsTradingConfig,
+    QualityProfitabilityConfig, RangeBreakoutConfig, ResidualMomentumConfig,
+    ReturnSeasonalityConfig, RiskManagedMomentumConfig, ShortTermReversalConfig,
+    TimeSeriesMomentumConfig, ValueCompositeConfig, VolatilityManagedConfig,
 };
 
 use crate::{
     Error, Result,
     domain::{AccountId, Candle, CandleInterval, InstrumentId, StrategyId},
     engine::{
-        DataRequirement, DataRole, EventPhase, PortfolioStrategy, ScheduleAnchor,
-        ScheduleRequirement, StrategyEvent, StrategyEventKind, TargetPortfolio, TargetWeight,
+        DataRequirement, DataRole, EventPhase, PortfolioStrategy, ReferenceRequirement,
+        ScheduleAnchor, ScheduleRequirement, StrategyEvent, StrategyEventKind, TargetPortfolio,
+        TargetWeight,
     },
 };
 use math::{
@@ -49,6 +52,8 @@ const DAILY_VALIDITY: Duration = Duration::hours(8);
 const MONTHLY_VALIDITY: Duration = Duration::days(7);
 /// Внутридневной прогноз действует только один 30-минутный слот.
 const INTRADAY_VALIDITY: Duration = Duration::minutes(30);
+/// Открытие сессии включает intraday-сигналы, только если пришло вовремя.
+const INTRADAY_OPEN_GRACE_SECONDS: i64 = 120;
 /// Закрывающий rebalance после истечения внутридневного сигнала должен быть
 /// отправлен быстро, но получает небольшой запас на сетевую задержку runtime.
 const EXPIRY_REBALANCE_VALIDITY: Duration = Duration::minutes(5);
@@ -84,6 +89,13 @@ pub struct WeightedStrategySpec {
     /// Относительный вклад полного target этой компоненты в общий target.
     #[serde(default = "default_signal_weight", with = "rust_decimal::serde::str")]
     pub signal_weight: Decimal,
+    /// Инструменты компоненты — подмножество общего universe; по умолчанию весь universe.
+    ///
+    /// Компоненты с одинаковым набором образуют комбинацию и складывают сигналы по
+    /// общим бумагам. Разные наборы на одном счёте не должны пересекаться, иначе две
+    /// независимые стратегии управляли бы одной позицией.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruments: Option<Vec<InstrumentId>>,
     /// Вид встроенной стратегии и её собственные параметры.
     #[serde(flatten)]
     pub strategy: BuiltinStrategySpec,
@@ -117,6 +129,9 @@ struct WeightedComponentState {
     signal_weight: Decimal,
     /// Не позволяет применить историю к другому набору параметров того же kind.
     strategy_config: Value,
+    /// Собственный набор инструментов; отсутствует, если компонента видит весь universe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instruments: Option<Vec<InstrumentId>>,
     strategy_state: Value,
     last_target: Option<CachedComponentTarget>,
 }
@@ -142,6 +157,8 @@ struct WeightedEnsembleConfig<'a> {
 /// Runtime-компонента ансамбля с независимым состоянием и последним сигналом.
 struct WeightedComponent {
     signal_weight: Decimal,
+    /// Инструменты компоненты в порядке общего universe.
+    universe: Vec<InstrumentId>,
     strategy: BuiltinStrategy,
     last_target: Option<CachedComponentTarget>,
 }
@@ -203,6 +220,7 @@ impl WeightedEnsembleStrategy {
                 spec,
             )?);
         }
+        Self::validate_component_sets(&universe, &components)?;
 
         Ok(Self {
             strategy_id,
@@ -232,15 +250,92 @@ impl WeightedEnsembleStrategy {
             index + 1,
             spec.strategy.kind()
         ))?;
-        let strategy =
-            spec.strategy
-                .clone()
-                .build(component_id, account_id.clone(), universe.to_vec())?;
+        let component_universe = Self::component_universe(universe, index, spec)?;
+        let strategy = spec.strategy.clone().build(
+            component_id,
+            account_id.clone(),
+            component_universe.clone(),
+        )?;
         Ok(WeightedComponent {
             signal_weight: spec.signal_weight,
+            universe: component_universe,
             strategy,
             last_target: None,
         })
+    }
+
+    /// Набор компоненты в порядке общего universe; без `instruments` — весь universe.
+    fn component_universe(
+        universe: &[InstrumentId],
+        index: usize,
+        spec: &WeightedStrategySpec,
+    ) -> Result<Vec<InstrumentId>> {
+        let Some(instruments) = &spec.instruments else {
+            return Ok(universe.to_vec());
+        };
+        let mut unique = HashSet::with_capacity(instruments.len());
+        if instruments.is_empty()
+            || instruments
+                .iter()
+                .any(|instrument_id| !unique.insert(instrument_id))
+        {
+            return Err(Error::Configuration(format!(
+                "strategies[{index}].instruments must be a nonempty list of distinct UIDs"
+            )));
+        }
+        if let Some(unknown) = instruments
+            .iter()
+            .find(|instrument_id| !universe.contains(instrument_id))
+        {
+            return Err(Error::Configuration(format!(
+                "strategies[{index}].instruments contains `{unknown}` outside the universe"
+            )));
+        }
+        Ok(universe
+            .iter()
+            .filter(|instrument_id| unique.contains(instrument_id))
+            .cloned()
+            .collect())
+    }
+
+    /// Наборы компонент либо совпадают (комбинация), либо не пересекаются.
+    ///
+    /// Каждый UID universe должен принадлежать хотя бы одной компоненте: иначе
+    /// бумага навсегда получила бы нулевую цель без стратегии-владельца.
+    fn validate_component_sets(
+        universe: &[InstrumentId],
+        components: &[WeightedComponent],
+    ) -> Result<()> {
+        for (left_index, left) in components.iter().enumerate() {
+            for (right_offset, right) in components[left_index + 1..].iter().enumerate() {
+                if left.universe != right.universe
+                    && left
+                        .universe
+                        .iter()
+                        .any(|instrument_id| right.universe.contains(instrument_id))
+                {
+                    return Err(Error::Configuration(format!(
+                        "strategies[{left_index}] and strategies[{}] share instruments but are not one combination; use identical or disjoint instrument sets",
+                        left_index + right_offset + 1
+                    )));
+                }
+            }
+        }
+        if let Some(uncovered) = universe.iter().find(|instrument_id| {
+            !components
+                .iter()
+                .any(|component| component.universe.contains(instrument_id))
+        }) {
+            return Err(Error::Configuration(format!(
+                "universe instrument `{uncovered}` is not traded by any strategy"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Сохраняемое представление набора: `None` для компоненты на всём universe.
+    fn stored_instruments(&self, component: &WeightedComponent) -> Option<Vec<InstrumentId>> {
+        (component.universe != self.universe).then(|| component.universe.clone())
     }
 
     /// Только эти targets описывают позицию на ограниченный внутридневной слот.
@@ -363,7 +458,12 @@ impl WeightedEnsembleStrategy {
                 // `1 * +1` и `2 * -0.5`, не округляя отдельно коэффициенты 1/3 и 2/3.
                 let mut weighted_sum = Decimal::ZERO;
                 for component in &self.components {
-                    let Some(target) = &component.last_target else {
+                    // Чужая для компоненты бумага: её вклад в этот UID равен нулю.
+                    let Some(target) = component
+                        .last_target
+                        .as_ref()
+                        .filter(|_| component.universe.contains(instrument_id))
+                    else {
                         continue;
                     };
                     let target_weight = target
@@ -589,6 +689,45 @@ impl BuiltinStrategySpec {
                     return configuration_error("max_leverage must be in (0, 2]");
                 }
             }
+            Self::ValueComposite(ValueCompositeConfig { quantile_percent })
+            | Self::QualityProfitability(QualityProfitabilityConfig { quantile_percent }) => {
+                validate_ranking_universe(universe)?;
+                validate_quantile(*quantile_percent)?;
+            }
+            Self::RiskManagedMomentum(config) => {
+                validate_ranking_universe(universe)?;
+                validate_formation_skip(config.formation_days, config.skip_days)?;
+                validate_warmup_window(
+                    config.formation_days.max(config.volatility_days),
+                    1,
+                    "formation_days",
+                )?;
+                validate_quantile(config.quantile_percent)?;
+                if config.volatility_days < 2 {
+                    return configuration_error("volatility_days must be at least 2");
+                }
+                validate_percent(
+                    config.target_annual_volatility_percent,
+                    "target_annual_volatility_percent",
+                    false,
+                )?;
+                if config.max_leverage <= Decimal::ZERO || config.max_leverage > Decimal::from(2) {
+                    return configuration_error("max_leverage must be in (0, 2]");
+                }
+            }
+            Self::ReturnSeasonality(config) => {
+                validate_ranking_universe(universe)?;
+                validate_quantile(config.quantile_percent)?;
+                if !(1..=20).contains(&config.years) {
+                    return configuration_error("years must be in 1..=20");
+                }
+            }
+            Self::DividendMonth(config) => {
+                if !(1..=120).contains(&config.entry_days) {
+                    return configuration_error("entry_days must be in 1..=120");
+                }
+            }
+            Self::AiModel(config) => validate_ai_model(config, universe)?,
         }
         Ok(())
     }
@@ -688,6 +827,19 @@ impl BuiltinStrategy {
             }
             BuiltinStrategySpec::VolatilityManaged(config) => {
                 (CandleInterval::OneDay, config.realized_variance_days + 1)
+            }
+            // Сигнал берётся из справочных данных; дневные свечи нужны для синхронности
+            // рядов и проверки, что инструмент торгуется.
+            BuiltinStrategySpec::ValueComposite(_)
+            | BuiltinStrategySpec::QualityProfitability(_)
+            | BuiltinStrategySpec::DividendMonth(_)
+            | BuiltinStrategySpec::AiModel(_) => (CandleInterval::OneDay, 2),
+            BuiltinStrategySpec::RiskManagedMomentum(config) => (
+                CandleInterval::OneDay,
+                config.formation_days.max(config.volatility_days) + 1,
+            ),
+            BuiltinStrategySpec::ReturnSeasonality(config) => {
+                (CandleInterval::OneMonth, config.years * 12 + 1)
             }
         };
 
@@ -806,6 +958,15 @@ impl BuiltinStrategy {
                     offset_seconds: 0,
                 },
             ],
+            // Модель пересматривает портфель на открытии и через каждый интервал.
+            BuiltinStrategySpec::AiModel(config) => config
+                .decision_offsets_seconds()
+                .into_iter()
+                .map(|offset_seconds| ScheduleRequirement {
+                    anchor: ScheduleAnchor::SessionOpen,
+                    offset_seconds,
+                })
+                .collect(),
             _ => vec![ScheduleRequirement {
                 anchor: ScheduleAnchor::SessionOpen,
                 offset_seconds: 0,
@@ -826,7 +987,23 @@ impl BuiltinStrategy {
                 | BuiltinStrategySpec::BettingAgainstBeta(_)
                 | BuiltinStrategySpec::EqualRiskContribution(_)
                 | BuiltinStrategySpec::VolatilityManaged(_)
+                | BuiltinStrategySpec::ValueComposite(_)
+                | BuiltinStrategySpec::QualityProfitability(_)
+                | BuiltinStrategySpec::RiskManagedMomentum(_)
+                | BuiltinStrategySpec::ReturnSeasonality(_)
         )
+    }
+
+    /// Справочные данные брокера, без которых стратегия не может построить сигнал.
+    fn references(&self) -> Vec<ReferenceRequirement> {
+        match &self.spec {
+            BuiltinStrategySpec::ValueComposite(_)
+            | BuiltinStrategySpec::QualityProfitability(_) => {
+                vec![ReferenceRequirement::Fundamentals]
+            }
+            BuiltinStrategySpec::DividendMonth(_) => vec![ReferenceRequirement::Dividends],
+            _ => Vec::new(),
+        }
     }
 
     /// Вычисляет веса выбранной стратегии и оборачивает их в полный target.
@@ -875,6 +1052,22 @@ impl BuiltinStrategy {
             }
             BuiltinStrategySpec::VolatilityManaged(config) => {
                 self.volatility_managed_weights(config)
+            }
+            BuiltinStrategySpec::ValueComposite(config) => Ok(self.value_composite_weights(config)),
+            BuiltinStrategySpec::QualityProfitability(config) => {
+                Ok(self.quality_profitability_weights(config))
+            }
+            BuiltinStrategySpec::RiskManagedMomentum(config) => {
+                self.risk_managed_momentum_weights(config)
+            }
+            BuiltinStrategySpec::ReturnSeasonality(config) => {
+                self.return_seasonality_weights(config, session_date)
+            }
+            BuiltinStrategySpec::DividendMonth(config) => {
+                Ok(self.dividend_month_weights(config, session_date))
+            }
+            BuiltinStrategySpec::AiModel(config) => {
+                Ok(self.ai_model_weights(config, session_date, scheduled_at(event)))
             }
         })?
         else {
@@ -1479,6 +1672,249 @@ impl BuiltinStrategy {
         ))
     }
 
+    /// Value: средний перцентиль B/P, E/P и EBITDA/EV; long дешёвых, short дорогих.
+    ///
+    /// Мультипликатор ≤ 0 или отсутствующий не участвует в своём ранге; бумага без
+    /// единого показателя не получает позиции. Сигнала нет, пока снимок не покрывает
+    /// хотя бы 80% universe.
+    fn value_composite_weights(
+        &self,
+        config: &ValueCompositeConfig,
+    ) -> Option<Vec<(InstrumentId, Decimal)>> {
+        self.state.fundamentals_observed_at?;
+        let inverse = |value: Option<Decimal>| {
+            value
+                .filter(|v| *v > Decimal::ZERO)
+                .map(|v| Decimal::ONE / v)
+        };
+        let rows = self
+            .universe
+            .iter()
+            .map(|instrument_id| {
+                let row = self.state.fundamentals_for(instrument_id);
+                (
+                    instrument_id.clone(),
+                    vec![
+                        inverse(row.and_then(|f| f.price_to_book)),
+                        inverse(row.and_then(|f| f.price_to_earnings)),
+                        inverse(row.and_then(|f| f.ev_to_ebitda)),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let scores = composite_scores(&rows, self.universe.len())?;
+        rank_long_short(&self.universe, scores, config.quantile_percent, true)
+    }
+
+    /// Quality: средний перцентиль ROE, ROA, чистой маржи и низкого долга к капиталу.
+    fn quality_profitability_weights(
+        &self,
+        config: &QualityProfitabilityConfig,
+    ) -> Option<Vec<(InstrumentId, Decimal)>> {
+        self.state.fundamentals_observed_at?;
+        let rows = self
+            .universe
+            .iter()
+            .map(|instrument_id| {
+                let row = self.state.fundamentals_for(instrument_id);
+                (
+                    instrument_id.clone(),
+                    vec![
+                        row.and_then(|f| f.return_on_equity),
+                        row.and_then(|f| f.return_on_assets),
+                        row.and_then(|f| f.net_margin),
+                        // Меньший долг лучше: знак инвертируется для общего направления ранга.
+                        row.and_then(|f| f.debt_to_equity)
+                            .filter(|v| *v >= Decimal::ZERO)
+                            .map(|v| -v),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let scores = composite_scores(&rows, self.universe.len())?;
+        rank_long_short(&self.universe, scores, config.quantile_percent, true)
+    }
+
+    /// Momentum 12–1, масштабированный до целевой волатильности (Barroso & Santa-Clara).
+    ///
+    /// Волатильность оценивается ex ante: текущие веса применяются к дневным
+    /// доходностям последних `volatility_days` свечей. Множитель
+    /// `target / realized` ограничен `max_leverage`; нулевая оценка закрывает портфель.
+    fn risk_managed_momentum_weights(
+        &self,
+        config: &RiskManagedMomentumConfig,
+    ) -> Result<Option<Vec<(InstrumentId, Decimal)>>> {
+        let mut scores = Vec::new();
+        for instrument_id in &self.universe {
+            let candles = self.state.candles(instrument_id, CandleInterval::OneDay);
+            let Some(score) = return_between(candles, config.formation_days, config.skip_days)
+            else {
+                return Ok(None);
+            };
+            scores.push((instrument_id.clone(), score));
+        }
+        let Some(base) = rank_long_short(&self.universe, scores, config.quantile_percent, true)
+        else {
+            return Ok(None);
+        };
+        let mut portfolio_returns = vec![Decimal::ZERO; config.volatility_days];
+        for (instrument_id, weight) in base.iter().filter(|(_, weight)| !weight.is_zero()) {
+            let candles = self.state.candles(instrument_id, CandleInterval::OneDay);
+            if candles.len() < config.volatility_days + 1 {
+                return Ok(None);
+            }
+            let returns = simple_returns(&candles[candles.len() - config.volatility_days - 1..])?;
+            for (total, value) in portfolio_returns.iter_mut().zip(returns) {
+                *total += *weight * value;
+            }
+        }
+        let annualized_variance = variance(&portfolio_returns)? * Decimal::from(252);
+        let target = config.target_annual_volatility_percent / Decimal::from(100);
+        let scale = if annualized_variance <= Decimal::ZERO {
+            Decimal::ZERO
+        } else {
+            (target / square_root(annualized_variance)?).clamp(Decimal::ZERO, config.max_leverage)
+        };
+        Ok(Some(
+            base.into_iter()
+                .map(|(instrument_id, weight)| (instrument_id, weight * scale))
+                .collect(),
+        ))
+    }
+
+    /// Сезонность: средняя доходность того же календарного месяца за `years` прошлых лет.
+    ///
+    /// Месяц сигнала — месяц сессии, в которую строится target. Доходность месяца
+    /// считается по закрытиям соседних месячных свечей; без полной истории по
+    /// каждой бумаге сигнал откладывается.
+    fn return_seasonality_weights(
+        &self,
+        config: &ReturnSeasonalityConfig,
+        session_date: chrono::NaiveDate,
+    ) -> Result<Option<Vec<(InstrumentId, Decimal)>>> {
+        use chrono::Datelike;
+        let mut scores = Vec::new();
+        for instrument_id in &self.universe {
+            let candles = self.state.candles(instrument_id, CandleInterval::OneMonth);
+            let mut returns = Vec::with_capacity(config.years);
+            for lag in 1..=config.years {
+                let year = session_date.year() - i32::try_from(lag).unwrap_or(i32::MAX);
+                let Some(index) = candles.iter().position(|candle| {
+                    candle.time.year() == year && candle.time.month() == session_date.month()
+                }) else {
+                    return Ok(None);
+                };
+                if index == 0 {
+                    return Ok(None);
+                }
+                let previous = candles[index - 1].close.0;
+                if previous <= Decimal::ZERO {
+                    return Ok(None);
+                }
+                returns.push(candles[index].close.0 / previous - Decimal::ONE);
+            }
+            scores.push((instrument_id.clone(), mean(&returns)?));
+        }
+        Ok(rank_long_short(
+            &self.universe,
+            scores,
+            config.quantile_percent,
+            true,
+        ))
+    }
+
+    /// Веса из решения ИИ-модели для этой сессии с лимитами стратегии.
+    ///
+    /// Без решения на эту дату сигнала нет и позиции не меняются. Инструменты вне
+    /// набора отбрасываются, доля каждого ограничена `max_weight_percent`, short
+    /// обнуляется без `allow_short`, а суммарная экспозиция не превышает 100%.
+    fn ai_model_weights(
+        &self,
+        config: &AiModelConfig,
+        session_date: chrono::NaiveDate,
+        not_before: DateTime<Utc>,
+    ) -> Option<Vec<(InstrumentId, Decimal)>> {
+        // Решение должно быть получено для этого пересмотра, а не прошлого часа.
+        let advice = self.state.ai_advice.as_ref().filter(|advice| {
+            advice.session_date == session_date
+                && advice.observed_at >= not_before - Duration::minutes(2)
+        })?;
+        let cap = config.max_weight_percent / Decimal::ONE_HUNDRED;
+        let floor = if config.allow_short {
+            -cap
+        } else {
+            Decimal::ZERO
+        };
+        let mut legs: Vec<(InstrumentId, Decimal)> = Vec::new();
+        for advice in &advice.weights {
+            if !self.universe.contains(&advice.instrument_id) {
+                continue;
+            }
+            let weight = advice.weight.clamp(floor, cap);
+            legs.retain(|(id, _)| id != &advice.instrument_id);
+            if !weight.is_zero() {
+                legs.push((advice.instrument_id.clone(), weight));
+            }
+        }
+        let gross: Decimal = legs.iter().map(|(_, weight)| weight.abs()).sum();
+        if gross > Decimal::ONE {
+            for leg in &mut legs {
+                leg.1 = (leg.1 / gross).round_dp(6);
+            }
+        }
+        Some(fill_universe(&self.universe, &legs))
+    }
+
+    /// Внеочередное решение модели (live): новая цель сразу, без ожидания расписания.
+    fn ai_model_target(
+        &self,
+        event: &StrategyEvent,
+        advice: &crate::engine::ModelAdvice,
+    ) -> Option<TargetPortfolio> {
+        let BuiltinStrategySpec::AiModel(config) = &self.spec else {
+            return None;
+        };
+        let weights = self.ai_model_weights(config, advice.session_date, advice.observed_at)?;
+        Some(self.make_target(event, weights, DAILY_VALIDITY))
+    }
+
+    /// Дивидендная премия: long бумаг за `entry_days` до последнего дня покупки.
+    ///
+    /// Позиция закрывается на открытии последнего дня покупки, до дивидендного
+    /// гэпа: Sandbox может не начислять сам дивиденд. Без календаря сигнала нет;
+    /// пустой календарь означает полностью закрытый портфель.
+    fn dividend_month_weights(
+        &self,
+        config: &DividendMonthConfig,
+        session_date: chrono::NaiveDate,
+    ) -> Option<Vec<(InstrumentId, Decimal)>> {
+        self.state.dividends_observed_at?;
+        let entry = chrono::Duration::days(i64::from(config.entry_days));
+        let mut selected = self
+            .universe
+            .iter()
+            .filter(|instrument_id| {
+                self.state.dividends.iter().any(|dividend| {
+                    &dividend.instrument_id == *instrument_id
+                        && session_date < dividend.last_buy_date
+                        && session_date >= dividend.last_buy_date - entry
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        selected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        if selected.is_empty() {
+            return Some(fill_universe(&self.universe, &[]));
+        }
+        let weight =
+            (Decimal::ONE / Decimal::from(selected.len() as u64)).min(MAX_INSTRUMENT_WEIGHT);
+        let legs = selected
+            .into_iter()
+            .map(|instrument_id| (instrument_id, weight))
+            .collect::<Vec<_>>();
+        Some(fill_universe(&self.universe, &legs))
+    }
+
     /// Строит BAB-портфель: long low-beta и short high-beta с gross до 2.
     ///
     /// Сначала OLS-beta притягивается к единице:
@@ -1785,6 +2221,11 @@ impl PortfolioStrategy for BuiltinStrategy {
         self.schedules()
     }
 
+    /// Передаёт runtime виды справочных данных, нужных сигналу.
+    fn reference_requirements(&self) -> Vec<ReferenceRequirement> {
+        self.references()
+    }
+
     /// Сериализует накопленные свечи и маркеры ребалансировки.
     fn state(&self) -> Result<Value> {
         serde_json::to_value(&self.state).map_err(|error| Error::Strategy {
@@ -1841,11 +2282,15 @@ impl PortfolioStrategy for BuiltinStrategy {
                     )
                 {
                     // Дата и время берутся только из официального расписания.
-                    // Запоздалое событие старой сессии не может вернуть state назад.
-                    if self
-                        .state
-                        .last_intraday_session_close
-                        .is_none_or(|closed| schedule.session_date > closed)
+                    // Запоздалое событие старой сессии не может вернуть state назад,
+                    // а повтор открытия посреди сессии не включает intraday-сигналы.
+                    let on_time = event.occurred_at - schedule.scheduled_at
+                        <= Duration::seconds(INTRADAY_OPEN_GRACE_SECONDS);
+                    if on_time
+                        && self
+                            .state
+                            .last_intraday_session_close
+                            .is_none_or(|closed| schedule.session_date > closed)
                         && self
                             .state
                             .active_intraday_session
@@ -1913,6 +2358,49 @@ impl PortfolioStrategy for BuiltinStrategy {
                 }
                 Ok(result)
             }
+            StrategyEventKind::Advice(advice) => {
+                // Решение относится к компоненте с тем же набором инструментов;
+                // само событие заявку не создаёт.
+                let same_universe = advice.universe.len() == self.universe.len()
+                    && advice
+                        .universe
+                        .iter()
+                        .all(|instrument_id| self.universe.contains(instrument_id));
+                if matches!(&self.spec, BuiltinStrategySpec::AiModel(_)) && same_universe {
+                    self.state.ai_advice = Some(advice.clone());
+                    // Live-решение (всплеск новостей, скачок цены) исполняется сразу.
+                    if event.phase == EventPhase::Live {
+                        return Ok(self.ai_model_target(event, advice));
+                    }
+                }
+                Ok(None)
+            }
+            StrategyEventKind::Reference(reference) => {
+                // Сохраняются только запрошенные этой стратегией данные; пустой ответ
+                // по виду, который она не запрашивала, не стирает прежний снимок.
+                let wanted = self.references();
+                if wanted.contains(&ReferenceRequirement::Fundamentals)
+                    && !reference.fundamentals.is_empty()
+                {
+                    self.state.fundamentals = reference
+                        .fundamentals
+                        .iter()
+                        .filter(|row| self.universe.contains(&row.instrument_id))
+                        .cloned()
+                        .collect();
+                    self.state.fundamentals_observed_at = Some(reference.observed_at);
+                }
+                if wanted.contains(&ReferenceRequirement::Dividends) {
+                    self.state.dividends = reference
+                        .dividends
+                        .iter()
+                        .filter(|row| self.universe.contains(&row.instrument_id))
+                        .cloned()
+                        .collect();
+                    self.state.dividends_observed_at = Some(reference.observed_at);
+                }
+                Ok(None)
+            }
             StrategyEventKind::Order(_) | StrategyEventKind::RiskCheck => Ok(None),
         }
     }
@@ -1957,6 +2445,21 @@ impl PortfolioStrategy for WeightedEnsembleStrategy {
         self.merged_schedule_requirements()
     }
 
+    /// Объединяет справочные данные, которые нужны хотя бы одной компоненте.
+    fn reference_requirements(&self) -> Vec<ReferenceRequirement> {
+        let mut merged = Vec::new();
+        for requirement in self
+            .components
+            .iter()
+            .flat_map(|component| component.strategy.reference_requirements())
+        {
+            if !merged.contains(&requirement) {
+                merged.push(requirement);
+            }
+        }
+        merged
+    }
+
     /// Сериализует независимое состояние и последний полный сигнал каждой компоненты.
     fn state(&self) -> Result<Value> {
         let components = self
@@ -1967,6 +2470,7 @@ impl PortfolioStrategy for WeightedEnsembleStrategy {
                     kind: component.strategy.kind().to_owned(),
                     signal_weight: component.signal_weight,
                     strategy_config: component.strategy.config()?,
+                    instruments: self.stored_instruments(component),
                     strategy_state: component.strategy.state()?,
                     last_target: component.last_target.clone(),
                 })
@@ -2022,10 +2526,11 @@ impl PortfolioStrategy for WeightedEnsembleStrategy {
             if restored_component.kind != staged.strategy.kind()
                 || restored_component.signal_weight != staged.signal_weight
                 || restored_component.strategy_config != staged.strategy.config()?
+                || restored_component.instruments != self.stored_instruments(&staged)
             {
                 return Err(Error::Strategy {
                     strategy: self.strategy_id.to_string(),
-                    message: "stored ensemble component order, kind, signal_weight, or parameters changed; use a new strategy_id".to_owned(),
+                    message: "stored ensemble component order, kind, signal_weight, instruments, or parameters changed; use a new strategy_id".to_owned(),
                 });
             }
             staged
@@ -2033,7 +2538,7 @@ impl PortfolioStrategy for WeightedEnsembleStrategy {
                 .restore_state(restored_component.strategy_state)?;
             if let Some(target) = &restored_component.last_target {
                 Self::validate_cached_target(
-                    &self.universe,
+                    &staged.universe,
                     staged.strategy.id(),
                     staged.strategy.kind(),
                     target,
@@ -2051,7 +2556,6 @@ impl PortfolioStrategy for WeightedEnsembleStrategy {
         let mut emitted = false;
         let mut valid_until: Option<DateTime<Utc>> = None;
         let account_id = self.account_id.clone();
-        let universe = self.universe.clone();
 
         for component in &mut self.components {
             let intraday = Self::is_intraday_kind(component.strategy.kind());
@@ -2086,7 +2590,7 @@ impl PortfolioStrategy for WeightedEnsembleStrategy {
             if let Some(target) = component.strategy.on_event(event).await? {
                 Self::validate_component_target(
                     &account_id,
-                    &universe,
+                    &component.universe,
                     &component_id,
                     event,
                     &target,
@@ -2144,6 +2648,54 @@ impl PortfolioStrategy for WeightedEnsembleStrategy {
             weights: self.aggregate_weights()?,
         }))
     }
+}
+
+/// Средний перцентильный ранг нескольких показателей, где большее значение лучше.
+///
+/// Каждый показатель ранжируется только среди бумаг, у которых он есть; ничьи
+/// получают средний ранг. Итог — среднее доступных перцентилей бумаги. `None`,
+/// если показатели есть меньше чем у 80% universe или меньше чем у четырёх бумаг.
+fn composite_scores(
+    rows: &[(InstrumentId, Vec<Option<Decimal>>)],
+    universe_len: usize,
+) -> Option<Vec<(InstrumentId, Decimal)>> {
+    let metrics = rows.first().map_or(0, |(_, values)| values.len());
+    let mut sums = vec![(Decimal::ZERO, 0_u32); rows.len()];
+    for metric in 0..metrics {
+        let mut present = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, (_, values))| values[metric].map(|value| (row, value)))
+            .collect::<Vec<_>>();
+        if present.len() < 2 {
+            continue;
+        }
+        present.sort_by(|left, right| left.1.cmp(&right.1));
+        let last = Decimal::from(present.len() as u64 - 1);
+        let mut start = 0;
+        while start < present.len() {
+            let mut end = start;
+            while end + 1 < present.len() && present[end + 1].1 == present[start].1 {
+                end += 1;
+            }
+            // Средняя позиция группы равных значений, нормированная в [0, 1].
+            let rank = Decimal::from((start + end) as u64) / Decimal::from(2) / last;
+            for (row, _) in &present[start..=end] {
+                sums[*row].0 += rank;
+                sums[*row].1 += 1;
+            }
+            start = end + 1;
+        }
+    }
+    let scores = rows
+        .iter()
+        .zip(sums)
+        .filter(|(_, (_, count))| *count > 0)
+        .map(|((instrument_id, _), (sum, count))| {
+            (instrument_id.clone(), sum / Decimal::from(count))
+        })
+        .collect::<Vec<_>>();
+    (scores.len() >= 4 && scores.len() * 5 >= universe_len * 4).then_some(scores)
 }
 
 /// Проверяет непустую вселенную и уникальность каждого UID.
@@ -2225,7 +2777,823 @@ fn validate_warmup_window(value: usize, extra_bars: usize, name: &str) -> Result
     Ok(())
 }
 
+/// Проверяет параметры `ai-model`; подключение к модели проверяет runtime.
+fn validate_ai_model(config: &AiModelConfig, universe: &[InstrumentId]) -> Result<()> {
+    if universe.is_empty() || universe.len() > 50 {
+        return configuration_error("ai-model needs 1..=50 instruments");
+    }
+    if config.model_profile.as_ref().is_some_and(|name| {
+        name.is_empty()
+            || name.len() > 40
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }) {
+        return configuration_error("model_profile must be 1..=40 latin letters, digits, - or _");
+    }
+    if config.instructions.chars().count() > 4000 {
+        return configuration_error("instructions must be at most 4000 characters");
+    }
+    if config.news_feeds.len() > 20
+        || config.news_feeds.iter().any(|url| {
+            url.len() > 500 || !(url.starts_with("https://") || url.starts_with("http://"))
+        })
+    {
+        return configuration_error("news_feeds: up to 20 http(s) URLs");
+    }
+    if !(1..=168).contains(&config.news_hours) {
+        return configuration_error("news_hours must be in 1..=168");
+    }
+    if !(1..=20).contains(&config.max_tool_rounds) {
+        return configuration_error("max_tool_rounds must be in 1..=20");
+    }
+    if config.decision_interval_minutes != 0
+        && !(15..=240).contains(&config.decision_interval_minutes)
+    {
+        return configuration_error("decision_interval_minutes must be 0 or 15..=240");
+    }
+    if config.news_burst_items > 50 || !(5..=240).contains(&config.news_burst_minutes) {
+        return configuration_error(
+            "news_burst_items must be 0..=50 and news_burst_minutes 5..=240",
+        );
+    }
+    if !(5..=240).contains(&config.min_minutes_between_decisions)
+        || !(1..=100).contains(&config.max_decisions_per_day)
+    {
+        return configuration_error(
+            "min_minutes_between_decisions must be 5..=240 and max_decisions_per_day 1..=100",
+        );
+    }
+    if config.material_importance > 5 {
+        return configuration_error("material_importance must be 0..=5");
+    }
+    for (name, value) in [
+        ("price_jump_percent", config.price_jump_percent),
+        ("fast_jump_percent", config.fast_jump_percent),
+        ("market_move_percent", config.market_move_percent),
+        ("commodity_move_percent", config.commodity_move_percent),
+        ("currency_move_percent", config.currency_move_percent),
+    ] {
+        if value < Decimal::ZERO || value > Decimal::from(50) {
+            return configuration_error(format!("{name} must be in 0..=50"));
+        }
+    }
+    validate_percent(config.max_weight_percent, "max_weight_percent", false)
+}
+
+/// Время пересмотра по расписанию; для прочих событий — момент события.
+fn scheduled_at(event: &StrategyEvent) -> DateTime<Utc> {
+    match &event.payload {
+        StrategyEventKind::Schedule(schedule) => schedule.scheduled_at,
+        _ => event.occurred_at,
+    }
+}
+
 /// Создаёт единообразную ошибку конфигурации с произвольным ожидаемым типом.
 fn configuration_error<T>(message: impl Into<String>) -> Result<T> {
     Err(Error::Configuration(message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uid(name: &str) -> InstrumentId {
+        InstrumentId::new(name).unwrap()
+    }
+
+    fn spec(weight: i64, instruments: Option<&[&str]>, trend: bool) -> WeightedStrategySpec {
+        WeightedStrategySpec {
+            signal_weight: Decimal::from(weight),
+            instruments: instruments.map(|names| names.iter().map(|name| uid(name)).collect()),
+            strategy: if trend {
+                BuiltinStrategySpec::MovingAverageTrend(MovingAverageTrendConfig::default())
+            } else {
+                BuiltinStrategySpec::RangeBreakout(RangeBreakoutConfig::default())
+            },
+        }
+    }
+
+    fn ensemble(specs: Vec<WeightedStrategySpec>) -> Result<WeightedEnsembleStrategy> {
+        WeightedEnsembleStrategy::new(
+            StrategyId::new("sleeves").unwrap(),
+            AccountId::new("account").unwrap(),
+            vec![uid("a"), uid("b"), uid("c")],
+            specs,
+        )
+    }
+
+    fn cached(weights: &[(&str, i64)]) -> CachedComponentTarget {
+        CachedComponentTarget {
+            source_as_of: Utc::now(),
+            holding_valid_until: None,
+            weights: weights
+                .iter()
+                .map(|(name, weight)| TargetWeight {
+                    instrument_id: uid(name),
+                    weight: Decimal::from(*weight),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn component_sets_must_be_identical_or_disjoint_and_cover_universe() {
+        // Combination on {a,b} plus an independent block on {c}.
+        let ok = ensemble(vec![
+            spec(1, Some(&["b", "a"]), true),
+            spec(1, Some(&["a", "b"]), false),
+            spec(2, Some(&["c"]), true),
+        ])
+        .unwrap();
+        assert_eq!(ok.components[0].universe, vec![uid("a"), uid("b")]);
+        assert_eq!(ok.components[1].universe, ok.components[0].universe);
+        assert!(
+            ensemble(vec![
+                spec(1, Some(&["a", "b"]), true),
+                spec(1, Some(&["b", "c"]), false)
+            ])
+            .is_err()
+        );
+        assert!(
+            ensemble(vec![spec(1, Some(&["a", "b"]), true)]).is_err(),
+            "c is not traded"
+        );
+        assert!(
+            ensemble(vec![
+                spec(1, Some(&["a", "x"]), true),
+                spec(1, Some(&["b", "c"]), false)
+            ])
+            .is_err()
+        );
+        assert!(
+            ensemble(vec![
+                spec(1, Some(&["a", "a"]), true),
+                spec(1, Some(&["b", "c"]), false)
+            ])
+            .is_err()
+        );
+        assert!(ensemble(vec![spec(1, Some(&[]), true), spec(1, None, false)]).is_err());
+        // Without instrument lists every component sees the whole universe, as before.
+        assert!(ensemble(vec![spec(1, None, true), spec(1, None, false)]).is_ok());
+    }
+
+    #[test]
+    fn disjoint_blocks_split_capital_by_signal_weight() {
+        let mut strategy = ensemble(vec![
+            spec(1, Some(&["a", "b"]), true),
+            spec(1, Some(&["c"]), false),
+        ])
+        .unwrap();
+        strategy.components[0].last_target = Some(cached(&[("a", 1), ("b", 0)]));
+        strategy.components[1].last_target = Some(cached(&[("c", -1)]));
+        let weights = strategy.aggregate_weights().unwrap();
+        let by_uid = |name: &str| {
+            weights
+                .iter()
+                .find(|w| w.instrument_id == uid(name))
+                .unwrap()
+                .weight
+        };
+        assert_eq!(by_uid("a"), Decimal::new(5, 1));
+        assert_eq!(by_uid("b"), Decimal::ZERO);
+        assert_eq!(by_uid("c"), Decimal::new(-5, 1));
+    }
+
+    #[test]
+    fn stored_state_keeps_component_instruments() {
+        let blocks = || {
+            vec![
+                spec(1, Some(&["a", "b"]), true),
+                spec(1, Some(&["c"]), false),
+            ]
+        };
+        let mut first = ensemble(blocks()).unwrap();
+        first.components[1].last_target = Some(cached(&[("c", 1)]));
+        let state = first.state().unwrap();
+        assert!(state["components"][0]["instruments"].is_array());
+        let mut restored = ensemble(blocks()).unwrap();
+        restored.restore_state(state.clone()).unwrap();
+        assert!(restored.components[1].last_target.is_some());
+        // Same components, other split of the universe: incompatible durable state.
+        let mut moved = ensemble(vec![
+            spec(1, Some(&["a"]), true),
+            spec(1, Some(&["b", "c"]), false),
+        ])
+        .unwrap();
+        assert!(moved.restore_state(state).is_err());
+        // Legacy state without instrument lists restores into a full-universe ensemble.
+        let legacy = ensemble(vec![spec(1, None, true)])
+            .unwrap()
+            .state()
+            .unwrap();
+        assert!(legacy["components"][0].get("instruments").is_none());
+        ensemble(vec![spec(1, None, true)])
+            .unwrap()
+            .restore_state(legacy)
+            .unwrap();
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn toml_component_accepts_instrument_list() {
+        let parsed: WeightedStrategySpec = toml::from_str(
+            "signal_weight = \"0.5\"\nkind = \"moving-average-trend\"\ninstruments = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.instruments, Some(vec![uid("a"), uid("b")]));
+        let plain: WeightedStrategySpec = toml::from_str("kind = \"range-breakout\"\n").unwrap();
+        assert!(plain.instruments.is_none());
+    }
+
+    // --- Strategies added from the evidence review: value, quality, risk-managed
+    // momentum, return seasonality and the dividend-month premium.
+
+    use crate::{
+        domain::Price,
+        engine::{DividendEvent, InstrumentFundamentals, ReferenceData, ScheduleEvent},
+    };
+    use chrono::{NaiveDate, TimeZone};
+
+    fn index(value: usize) -> i64 {
+        i64::try_from(value).unwrap()
+    }
+
+    fn ten() -> Vec<InstrumentId> {
+        (0..10).map(|i| uid(&format!("s{i}"))).collect()
+    }
+
+    fn builtin(spec: BuiltinStrategySpec) -> BuiltinStrategy {
+        BuiltinStrategy::new(
+            StrategyId::new("new-kinds").unwrap(),
+            AccountId::new("account").unwrap(),
+            ten(),
+            spec,
+        )
+        .unwrap()
+    }
+
+    fn candle(
+        id: &InstrumentId,
+        interval: CandleInterval,
+        time: DateTime<Utc>,
+        close: Decimal,
+    ) -> Candle {
+        Candle {
+            instrument_id: id.clone(),
+            interval,
+            open: Price(close),
+            high: Price(close),
+            low: Price(close),
+            close: Price(close),
+            volume: 1,
+            time,
+            complete: true,
+        }
+    }
+
+    fn fundamentals(
+        id: &InstrumentId,
+        pb: Option<i64>,
+        roe: Option<i64>,
+    ) -> InstrumentFundamentals {
+        InstrumentFundamentals {
+            instrument_id: id.clone(),
+            price_to_book: pb.map(Decimal::from),
+            price_to_earnings: None,
+            ev_to_ebitda: None,
+            return_on_equity: roe.map(Decimal::from),
+            return_on_assets: None,
+            net_margin: None,
+            debt_to_equity: None,
+        }
+    }
+
+    fn weight_of(weights: &[(InstrumentId, Decimal)], name: &str) -> Decimal {
+        weights.iter().find(|(id, _)| id == &uid(name)).unwrap().1
+    }
+
+    #[test]
+    fn value_ranks_cheap_long_and_expensive_short_and_needs_coverage() {
+        let mut strategy = builtin(BuiltinStrategySpec::ValueComposite(
+            ValueCompositeConfig::default(),
+        ));
+        assert!(
+            strategy
+                .value_composite_weights(&ValueCompositeConfig::default())
+                .is_none(),
+            "no snapshot yet"
+        );
+        // P/B 1..10: s0 cheapest, s9 most expensive.
+        strategy.state.fundamentals = ten()
+            .iter()
+            .enumerate()
+            .map(|(i, id)| fundamentals(id, Some(index(i) + 1), None))
+            .collect();
+        strategy.state.fundamentals_observed_at = Some(Utc::now());
+        let weights = strategy
+            .value_composite_weights(&ValueCompositeConfig::default())
+            .unwrap();
+        assert!(
+            weight_of(&weights, "s0") > Decimal::ZERO && weight_of(&weights, "s1") > Decimal::ZERO
+        );
+        assert!(
+            weight_of(&weights, "s9") < Decimal::ZERO && weight_of(&weights, "s8") < Decimal::ZERO
+        );
+        assert_eq!(weight_of(&weights, "s5"), Decimal::ZERO);
+        // Three of ten without any multiple: below the 80% coverage threshold.
+        for row in strategy.state.fundamentals.iter_mut().take(3) {
+            row.price_to_book = None;
+        }
+        assert!(
+            strategy
+                .value_composite_weights(&ValueCompositeConfig::default())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn quality_prefers_profitability_and_low_leverage() {
+        let mut strategy = builtin(BuiltinStrategySpec::QualityProfitability(
+            QualityProfitabilityConfig::default(),
+        ));
+        strategy.state.fundamentals = ten()
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut row = fundamentals(id, None, Some(index(i) * 3 - 5));
+                row.debt_to_equity = Some(Decimal::from(100 - index(i) * 10));
+                row
+            })
+            .collect();
+        strategy.state.fundamentals_observed_at = Some(Utc::now());
+        let weights = strategy
+            .quality_profitability_weights(&QualityProfitabilityConfig::default())
+            .unwrap();
+        assert!(
+            weight_of(&weights, "s9") > Decimal::ZERO,
+            "highest ROE, lowest debt"
+        );
+        assert!(
+            weight_of(&weights, "s0") < Decimal::ZERO,
+            "negative ROE, highest debt"
+        );
+    }
+
+    #[test]
+    fn composite_scores_average_available_percentiles_with_ties() {
+        let rows = vec![
+            (uid("a"), vec![Some(Decimal::ONE), Some(Decimal::from(3))]),
+            (uid("b"), vec![Some(Decimal::ONE), None]),
+            (
+                uid("c"),
+                vec![Some(Decimal::from(2)), Some(Decimal::from(1))],
+            ),
+            (uid("d"), vec![None, None]),
+            (
+                uid("e"),
+                vec![Some(Decimal::from(4)), Some(Decimal::from(2))],
+            ),
+        ];
+        let scores = composite_scores(&rows, 5).unwrap();
+        let score = |name: &str| scores.iter().find(|(id, _)| id == &uid(name)).unwrap().1;
+        // a and b tie on metric 1 (ranks 0 and 1 → 0.5 / 3).
+        assert_eq!(score("b"), Decimal::new(5, 1) / Decimal::from(3));
+        assert_eq!(
+            score("e"),
+            (Decimal::ONE + Decimal::new(5, 1)) / Decimal::from(2)
+        );
+        assert!(!scores.iter().any(|(id, _)| id == &uid("d")));
+        assert!(composite_scores(&rows, 6).is_none(), "4 of 6 is below 80%");
+    }
+
+    #[test]
+    fn risk_managed_momentum_scales_to_target_volatility_with_cap() {
+        let config = RiskManagedMomentumConfig {
+            formation_days: 30,
+            skip_days: 5,
+            volatility_days: 20,
+            ..RiskManagedMomentumConfig::default()
+        };
+        let mut strategy = builtin(BuiltinStrategySpec::RiskManagedMomentum(config.clone()));
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        for (i, id) in ten().iter().enumerate() {
+            for day in 0..=40_i64 {
+                // Distinct trends with an alternating wiggle so the long/short book has variance.
+                let wiggle = if day % 2 == 0 {
+                    Decimal::ONE
+                } else {
+                    -Decimal::ONE
+                };
+                let close = Decimal::from(100)
+                    + Decimal::from(day) * Decimal::from(index(i)) / Decimal::from(10)
+                    + wiggle * Decimal::from(index(i) % 3);
+                strategy.state.insert_candle(
+                    candle(
+                        id,
+                        CandleInterval::OneDay,
+                        start + chrono::Duration::days(day),
+                        close,
+                    ),
+                    100,
+                );
+            }
+        }
+        let gross = |weights: &[(InstrumentId, Decimal)]| {
+            weights.iter().map(|(_, w)| w.abs()).sum::<Decimal>()
+        };
+        let scaled = strategy
+            .risk_managed_momentum_weights(&config)
+            .unwrap()
+            .unwrap();
+        assert!(
+            gross(&scaled) > Decimal::ZERO && gross(&scaled) <= Decimal::ONE + Decimal::new(1, 9)
+        );
+        assert!(
+            weight_of(&scaled, "s9") > Decimal::ZERO && weight_of(&scaled, "s0") < Decimal::ZERO
+        );
+        // A tiny target leaves the cap and scales weights proportionally.
+        let low = RiskManagedMomentumConfig {
+            target_annual_volatility_percent: Decimal::new(1, 2),
+            ..config.clone()
+        };
+        let lower = RiskManagedMomentumConfig {
+            target_annual_volatility_percent: Decimal::new(2, 2),
+            ..config
+        };
+        let a = gross(
+            &strategy
+                .risk_managed_momentum_weights(&low)
+                .unwrap()
+                .unwrap(),
+        );
+        let b = gross(
+            &strategy
+                .risk_managed_momentum_weights(&lower)
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(a > Decimal::ZERO && (b / a - Decimal::from(2)).abs() < Decimal::new(1, 6));
+    }
+
+    #[test]
+    fn seasonality_ranks_same_calendar_month_returns_of_past_years() {
+        let config = ReturnSeasonalityConfig {
+            years: 3,
+            ..ReturnSeasonalityConfig::default()
+        };
+        let mut strategy = builtin(BuiltinStrategySpec::ReturnSeasonality(config.clone()));
+        for (i, id) in ten().iter().enumerate() {
+            let mut close = Decimal::from(100);
+            for year in 2022..=2026 {
+                for month in 1..=12_u32 {
+                    // October return grows with the index; other months are flat.
+                    if month == 10 {
+                        close *= Decimal::ONE + Decimal::from(index(i) - 5) / Decimal::from(100);
+                    }
+                    let time = Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0).unwrap();
+                    strategy
+                        .state
+                        .insert_candle(candle(id, CandleInterval::OneMonth, time, close), 200);
+                }
+            }
+        }
+        let october = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let weights = strategy
+            .return_seasonality_weights(&config, october)
+            .unwrap()
+            .unwrap();
+        assert!(
+            weight_of(&weights, "s9") > Decimal::ZERO && weight_of(&weights, "s0") < Decimal::ZERO
+        );
+        // Not enough years of history for a 20-year average.
+        let long = ReturnSeasonalityConfig {
+            years: 20,
+            ..config
+        };
+        assert!(
+            strategy
+                .return_seasonality_weights(&long, october)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dividend_month_holds_until_the_last_buy_day() {
+        let config = DividendMonthConfig::default();
+        let mut strategy = builtin(BuiltinStrategySpec::DividendMonth(config.clone()));
+        let day = |d: u32| NaiveDate::from_ymd_opt(2026, 11, d).unwrap();
+        assert!(
+            strategy.dividend_month_weights(&config, day(1)).is_none(),
+            "no calendar yet"
+        );
+        strategy.state.dividends = vec![DividendEvent {
+            instrument_id: uid("s3"),
+            last_buy_date: day(20),
+            dividend_net: None,
+        }];
+        strategy.state.dividends_observed_at = Some(Utc::now());
+        let inside = strategy.dividend_month_weights(&config, day(1)).unwrap();
+        assert_eq!(weight_of(&inside, "s3"), MAX_INSTRUMENT_WEIGHT);
+        assert_eq!(
+            weight_of(
+                &strategy.dividend_month_weights(&config, day(20)).unwrap(),
+                "s3"
+            ),
+            Decimal::ZERO,
+            "exit before the ex-dividend gap"
+        );
+        let early = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        assert!(
+            strategy
+                .dividend_month_weights(&config, early)
+                .unwrap()
+                .iter()
+                .all(|(_, w)| w.is_zero())
+        );
+    }
+
+    #[test]
+    fn ai_model_config_of_running_portfolios_keeps_its_stored_form() {
+        // strategy_instances.config is compared as JSON: options added later must
+        // not appear with their default values, or a running portfolio would be
+        // refused as a different immutable configuration.
+        let value = serde_json::to_value(AiModelConfig::default()).unwrap();
+        for key in [
+            "material_importance",
+            "market_move_percent",
+            "commodity_move_percent",
+            "currency_move_percent",
+        ] {
+            assert!(
+                value.get(key).is_none(),
+                "{key} must not be serialized by default"
+            );
+        }
+        let custom = AiModelConfig {
+            material_importance: 5,
+            market_move_percent: Decimal::from(3),
+            ..AiModelConfig::default()
+        };
+        let value = serde_json::to_value(custom).unwrap();
+        assert_eq!(
+            (
+                value["material_importance"].as_u64(),
+                value["market_move_percent"].as_str()
+            ),
+            (Some(5), Some("3"))
+        );
+        let back: AiModelConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(back.material_importance, 5);
+    }
+
+    #[tokio::test]
+    async fn ai_model_trades_only_fresh_advice_within_its_limits() {
+        use crate::engine::{AdviceWeight, ModelAdvice};
+        let spec: WeightedStrategySpec = toml::from_str(
+            "signal_weight = \"1\"\nkind = \"ai-model\"\nmodel_profile = \"claude\"\nmax_weight_percent = \"30\"\ninstructions = \"Покупай на новостях\"",
+        )
+        .unwrap();
+        let BuiltinStrategySpec::AiModel(config) = spec.strategy.clone() else {
+            panic!("ai-model expected");
+        };
+        assert_eq!(
+            (
+                config.model_profile.as_deref(),
+                config.news_hours,
+                config.allow_short
+            ),
+            (Some("claude"), 24, false)
+        );
+        assert!(
+            toml::from_str::<WeightedStrategySpec>(
+                "signal_weight = \"1\"\nkind = \"ai-model\"\ntoken = \"x\""
+            )
+            .is_err(),
+            "tokens never live in a strategy"
+        );
+        let mut strategy = builtin(spec.strategy);
+        let open = Utc.with_ymd_and_hms(2026, 10, 20, 6, 10, 0).unwrap();
+        let session = open.date_naive();
+        let advice = |universe: Vec<InstrumentId>, date: chrono::NaiveDate| StrategyEvent {
+            id: format!("advice:{date}:{}", universe.len()),
+            phase: EventPhase::Warmup,
+            occurred_at: open,
+            payload: StrategyEventKind::Advice(ModelAdvice {
+                observed_at: open,
+                session_date: date,
+                universe,
+                model: "claude:claude-opus-5-5".to_owned(),
+                weights: [
+                    ("s0", "0.6"),
+                    ("s1", "-0.2"),
+                    ("s2", "0.3"),
+                    ("s3", "0.3"),
+                    ("outside", "0.5"),
+                ]
+                .into_iter()
+                .map(|(id, weight)| AdviceWeight {
+                    instrument_id: uid(id),
+                    weight: weight.parse().unwrap(),
+                })
+                .collect(),
+                rationale: "test".to_owned(),
+            }),
+        };
+        let open_event = StrategyEvent {
+            id: "schedule:open".to_owned(),
+            phase: EventPhase::Live,
+            occurred_at: open,
+            payload: StrategyEventKind::Schedule(ScheduleEvent {
+                anchor: ScheduleAnchor::SessionOpen,
+                session_date: session,
+                scheduled_at: open,
+            }),
+        };
+        // Advice for another block or another session never trades.
+        strategy
+            .on_event(&advice(ten()[..3].to_vec(), session))
+            .await
+            .unwrap();
+        assert!(strategy.state.ai_advice.is_none());
+        strategy
+            .on_event(&advice(ten(), session.pred_opt().unwrap()))
+            .await
+            .unwrap();
+        for i in 0..10 {
+            strategy
+                .on_event(&StrategyEvent {
+                    id: format!("c{i}"),
+                    phase: EventPhase::Warmup,
+                    occurred_at: open,
+                    payload: StrategyEventKind::Candle(candle(
+                        &uid(&format!("s{i}")),
+                        CandleInterval::OneDay,
+                        open - Duration::days(1),
+                        Decimal::from(100),
+                    )),
+                })
+                .await
+                .unwrap();
+        }
+        assert!(
+            strategy.on_event(&open_event).await.unwrap().is_none(),
+            "stale advice"
+        );
+        strategy.on_event(&advice(ten(), session)).await.unwrap();
+        let target = strategy.on_event(&open_event).await.unwrap().unwrap();
+        let weights: Vec<(InstrumentId, Decimal)> = target
+            .weights
+            .iter()
+            .map(|w| (w.instrument_id.clone(), w.weight))
+            .collect();
+        // 0.6 → cap 0.3, short → 0, outside → dropped; gross 0.9 stays below 100%.
+        assert_eq!(weight_of(&weights, "s0"), "0.3".parse::<Decimal>().unwrap());
+        assert_eq!(weight_of(&weights, "s1"), Decimal::ZERO);
+        assert_eq!(weights.len(), 10);
+        assert_eq!(
+            weights.iter().map(|(_, w)| w.abs()).sum::<Decimal>(),
+            "0.9".parse::<Decimal>().unwrap()
+        );
+        // An hourly review an hour later ignores the advice of the open.
+        let hour = StrategyEvent {
+            id: "schedule:hour".to_owned(),
+            phase: EventPhase::Live,
+            occurred_at: open + Duration::hours(1),
+            payload: StrategyEventKind::Schedule(ScheduleEvent {
+                anchor: ScheduleAnchor::SessionOpen,
+                session_date: session,
+                scheduled_at: open + Duration::hours(1),
+            }),
+        };
+        assert!(
+            strategy.on_event(&hour).await.unwrap().is_none(),
+            "stale hourly advice"
+        );
+        // An out-of-schedule (live) decision trades at once.
+        let mut live = advice(ten(), session);
+        live.phase = EventPhase::Live;
+        live.id = "advice:news_burst".to_owned();
+        let target = strategy
+            .on_event(&live)
+            .await
+            .unwrap()
+            .expect("live advice trades");
+        assert_eq!(target.event_id, "advice:news_burst");
+    }
+
+    #[tokio::test]
+    async fn late_session_open_does_not_enable_intraday_signals() {
+        let open = Utc.with_ymd_and_hms(2026, 10, 19, 6, 10, 0).unwrap();
+        let event = |occurred_at: DateTime<Utc>| StrategyEvent {
+            id: format!("schedule:open:{occurred_at}"),
+            phase: EventPhase::Live,
+            occurred_at,
+            payload: StrategyEventKind::Schedule(ScheduleEvent {
+                anchor: ScheduleAnchor::SessionOpen,
+                session_date: open.date_naive(),
+                scheduled_at: open,
+            }),
+        };
+        let mut strategy = builtin(BuiltinStrategySpec::IntradaySameClock(
+            IntradaySameClockConfig::default(),
+        ));
+        // A retry after the computer slept through the open keeps intraday off.
+        strategy
+            .on_event(&event(open + Duration::minutes(30)))
+            .await
+            .unwrap();
+        assert_eq!(strategy.state.active_intraday_session, None);
+        strategy
+            .on_event(&event(open + Duration::seconds(5)))
+            .await
+            .unwrap();
+        assert_eq!(
+            strategy.state.active_intraday_session,
+            Some(open.date_naive())
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_events_update_only_requested_data_and_never_trade() {
+        let reference = ReferenceData {
+            observed_at: Utc::now(),
+            fundamentals: ten()
+                .iter()
+                .map(|id| fundamentals(id, Some(2), Some(10)))
+                .chain([fundamentals(&uid("outside"), Some(1), None)])
+                .collect(),
+            dividends: vec![DividendEvent {
+                instrument_id: uid("s1"),
+                last_buy_date: NaiveDate::from_ymd_opt(2026, 12, 1).unwrap(),
+                dividend_net: None,
+            }],
+        };
+        let event = StrategyEvent {
+            id: "reference:test".to_owned(),
+            phase: EventPhase::Warmup,
+            occurred_at: Utc::now(),
+            payload: StrategyEventKind::Reference(reference),
+        };
+        let mut value = builtin(BuiltinStrategySpec::ValueComposite(
+            ValueCompositeConfig::default(),
+        ));
+        assert!(value.on_event(&event).await.unwrap().is_none());
+        assert_eq!(
+            value.state.fundamentals.len(),
+            10,
+            "instruments outside the universe are dropped"
+        );
+        assert!(value.state.dividends.is_empty());
+        let mut dividends = builtin(BuiltinStrategySpec::DividendMonth(
+            DividendMonthConfig::default(),
+        ));
+        dividends.on_event(&event).await.unwrap();
+        assert_eq!(
+            (
+                dividends.state.fundamentals.len(),
+                dividends.state.dividends.len()
+            ),
+            (0, 1)
+        );
+        let mut trend = builtin(BuiltinStrategySpec::MovingAverageTrend(
+            MovingAverageTrendConfig::default(),
+        ));
+        trend.on_event(&event).await.unwrap();
+        assert!(trend.state.fundamentals.is_empty() && trend.reference_requirements().is_empty());
+        // The ensemble asks for the union of its components' data.
+        let combination = WeightedEnsembleStrategy::new(
+            StrategyId::new("combo").unwrap(),
+            AccountId::new("account").unwrap(),
+            ten(),
+            vec![
+                WeightedStrategySpec {
+                    signal_weight: Decimal::ONE,
+                    instruments: None,
+                    strategy: BuiltinStrategySpec::ValueComposite(ValueCompositeConfig::default()),
+                },
+                WeightedStrategySpec {
+                    signal_weight: Decimal::ONE,
+                    instruments: None,
+                    strategy: BuiltinStrategySpec::DividendMonth(DividendMonthConfig::default()),
+                },
+                WeightedStrategySpec {
+                    signal_weight: Decimal::ONE,
+                    instruments: None,
+                    strategy: BuiltinStrategySpec::CrossSectionalMomentum(
+                        CrossSectionalMomentumConfig::default(),
+                    ),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            combination.reference_requirements(),
+            vec![
+                ReferenceRequirement::Fundamentals,
+                ReferenceRequirement::Dividends
+            ]
+        );
+    }
 }

@@ -74,12 +74,84 @@ class ControlTests(unittest.TestCase):
             control.validate(command("mode", {"mode": "free"}), STATE)
         self.assertEqual(control.validate({"id": str(uuid.uuid4()), "kind": "mode", "payload": {"mode": "free"}}, STATE)["payload"]["mode"], "free")
 
-    def test_catalog_checks_currency_and_exchange_and_type(self):
+    def test_catalog_describes_any_type_and_says_what_the_stand_trades(self):
         raw = {"uid": UID, "instrumentType": "share", "currency": "rub", "realExchange": "REAL_EXCHANGE_MOEX", "apiTradeAvailableFlag": True, "ticker": "SBER", "lot": 10}
-        self.assertEqual(control.instrument_metadata(raw)["lot"], 10)
-        for changes in [{"currency": "usd"}, {"realExchange": "REAL_EXCHANGE_RTS"}, {"instrumentType": "bond"}, {"apiTradeAvailableFlag": False}]:
+        share = control.instrument_metadata(raw)
+        self.assertEqual((share["lot"], share["kind"], share["tradable"]), (10, "share", True))
+        for changes, reason in [({"currency": "usd"}, "не в рублях"), ({"realExchange": "REAL_EXCHANGE_RTS"}, "не на Мосбирже"),
+                                ({"instrumentType": "option"}, "не торгует"), ({"apiTradeAvailableFlag": False}, "через API")]:
+            meta = control.instrument_metadata({**raw, **changes})
+            self.assertFalse(meta["tradable"])
+            self.assertIn(reason, meta["reason"])
+        # A futures contract: its series, the ruble value of a point and margins; a short is a sale.
+        future = control.instrument_metadata({**raw, "instrumentType": "futures", "ticker": "BRX6", "lot": 1, "shortEnabledFlag": False},
+                                             {"basicAsset": "Brent", "lastTradeDate": "2026-11-02T18:45:00Z", "minPriceIncrement": {"units": "0", "nano": 10000000},
+                                              "minPriceIncrementAmount": {"units": "7", "nano": 500000000}, "initialMarginOnBuy": {"units": "9000", "nano": 0}})
+        self.assertEqual((future["series"], future["point_value"], future["margin_buy"], future["short_enabled"], future["tradable"]), ("BR", 750.0, 9000.0, True, True))
+        self.assertIsNone(control.series_code("USDRUBF"), "a perpetual future has no series to roll")
+        bond = control.instrument_metadata({**raw, "instrumentType": "bond", "ticker": "SU26238RMFS4", "lot": 1},
+                                           {"nominal": {"currency": "rub", "units": "1000", "nano": 0}, "aciValue": {"units": "12", "nano": 340000000}, "maturityDate": "2041-05-15T00:00:00Z"})
+        self.assertEqual((bond["nominal"], bond["aci"], bond["tradable"]), (1000.0, 12.34, True))
+        self.assertEqual(control.instrument_id("futures:BR"), "futures:BR")
+        with self.assertRaises(control.ClientError):
+            control.instrument_id("futures:BR; DROP")
+
+    def test_budget_is_set_only_and_difference_is_computed_by_runtime(self):
+        self.assertEqual(control.validate(command("budget", {"amount": "900000"}), STATE)["payload"], {"amount": "900000", "operation": "set"})
+        for operation in ["add", "subtract"]:
+            with self.assertRaisesRegex(control.ClientError, "новой суммой"):
+                control.validate(command("budget", {"operation": operation, "amount": "1"}), STATE)
+
+    def test_schedule_requires_known_future_trading_days_without_account_overlap(self):
+        future = "2099-10-19"
+        state = dict(STATE, calendar=[{"date": future, "isTradingDay": True, "startTime": future + "T06:50:00Z", "endTime": future + "T15:39:59Z"},
+                                      {"date": "2099-10-20", "isTradingDay": False, "startTime": None, "endTime": None},
+                                      {"date": "2020-01-10", "isTradingDay": True, "startTime": "2020-01-10T06:50:00Z", "endTime": "2020-01-10T15:39:59Z"}])
+        payload = control.validate(command("schedule", {"run_mode": "schedule", "days": [future], "close_after": True}), state)["payload"]
+        control.check_schedule(state, payload, {}, [])
+        for days, message in [(["2099-10-20"], "не торговый"), (["2099-12-31"], "не торговый"), (["2020-01-10"], "завершилась")]:
+            with self.assertRaisesRegex(control.ClientError, message):
+                control.check_schedule(state, dict(payload, days=days), {}, [])
+        # An already scheduled past day may stay in the list.
+        control.check_schedule(state, dict(payload, days=["2020-01-10"]), {"trading_days": ["2020-01-10"]}, [])
+        with self.assertRaisesRegex(control.ClientError, "уже занят стратегией first"):
+            control.check_schedule(state, payload, {}, [{"strategy_id": "first", "run_mode": "schedule", "trading_days": [future]}])
+        for bad in [{"run_mode": "later", "days": [], "close_after": True}, {"run_mode": "always", "days": ["19.10.2099"], "close_after": True},
+                    {"run_mode": "always", "days": [future, future], "close_after": True}, {"run_mode": "always", "days": [], "close_after": "yes"}]:
             with self.assertRaises(control.ClientError):
-                control.instrument_metadata({**raw, **changes})
+                control.validate(command("schedule", bad), state)
+
+    def test_runtime_limit_is_global_bounded_and_capped_by_tariff_streams(self):
+        global_command = dict(command("runtime_limit", {"value": 6}), strategy_id=None, account_id=None)
+        self.assertEqual(control.validate(global_command, STATE)["payload"], {"value": 6})
+        for value in [0, 11, "4", 2.5]:
+            with self.assertRaises(control.ClientError):
+                control.validate(dict(global_command, payload={"value": value}), STATE)
+        with self.assertRaises(control.ClientError):
+            control.validate(command("runtime_limit", {"value": 4}), STATE)
+        self.assertEqual(control.runtime_cap({"limits": {"streamLimits": [{"limit": 32}, {"limit": 11}]}}), 10)
+        self.assertEqual(control.runtime_cap({"limits": {"streamLimits": [{"limit": 6}]}}), 5)
+        self.assertEqual(control.runtime_cap({}), 10)
+
+    def test_portfolio_payload_normalizes_instruments_and_checks_blocks(self):
+        body = command("portfolio", {"title": "  Мой счёт ", "blocks": [{"instruments": [UID.upper()], "share": "100", "strategies": [{"kind": "moving-average-trend", "weight": "1"}]}]})
+        payload = control.validate(body, STATE)["payload"]
+        self.assertEqual(payload["title"], "Мой счёт")
+        self.assertEqual(payload["blocks"][0]["instruments"], [UID])
+        with self.assertRaisesRegex(control.ClientError, "100%"):
+            control.validate(command("portfolio", {"title": "x", "blocks": [{"instruments": [UID], "share": "50", "strategies": [{"kind": "range-breakout"}]}]}), STATE)
+        with self.assertRaisesRegex(control.ClientError, "UUID"):
+            control.validate(command("portfolio", {"title": "x", "blocks": [{"instruments": ["SBER"], "share": "100", "strategies": [{"kind": "range-breakout"}]}]}), STATE)
+
+    def test_portfolio_create_is_account_level_and_checks_name_and_blocks(self):
+        payload = {"account_id": "account", "kind": "value-composite", "title": "Value", "blocks": [{"instruments": [UID], "share": "100", "strategies": [{"kind": "dividend-month", "weight": "1"}]}]}
+        body = dict(command("portfolio_create", payload), strategy_id=None, account_id=None)
+        self.assertEqual(control.validate(copy.deepcopy(body), STATE)["payload"]["kind"], "value-composite")
+        for change, message in [({"account_id": "other"}, "не принадлежит"), ({"kind": "Bad Name"}, "латиница"), ({"kind": "first"}, "уже есть"), ({"run_mode": "later"}, "Режим")]:
+            with self.assertRaisesRegex(control.ClientError, message):
+                control.validate(dict(copy.deepcopy(body), payload=dict(payload, **change)), STATE)
+        with self.assertRaisesRegex(control.ClientError, "не меньше 10"):
+            control.validate(dict(copy.deepcopy(body), payload=dict(payload, blocks=[{"instruments": [UID], "share": "100", "strategies": [{"kind": "value-composite"}]}])), STATE)
 
     def test_universe_duplicates_and_empty_selection_rejected(self):
         for values in [[], [UID, UID], ["invalid"]]:

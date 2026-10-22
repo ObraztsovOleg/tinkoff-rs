@@ -43,15 +43,22 @@ class DashboardTests(unittest.TestCase):
 
     def test_schedule_and_universe_come_from_campaign_not_inferred_from_name(self):
         state = dashboard.read_json(self.work / "campaign.json")
-        state["sessions"] = [{"startTime": "2026-10-02T06:10:00Z"}, {"startTime": "2026-10-05T06:10:00Z"}, {"startTime": "2026-10-06T06:10:00Z"}]
+        # Windows are the supervisor's view of the operator schedule; past windows are skipped.
+        state["cases"]["first"]["schedule"] = {"run_mode": "schedule", "active": False, "close_after": True, "windows": [
+            {"begin": "2020-01-01T05:10:00+00:00", "open": "2020-01-01T06:10:00Z", "end": "2020-01-01T15:56:59+00:00", "days": ["2020-01-01"]},
+            {"begin": "2099-10-02T05:10:00+00:00", "open": "2099-10-02T06:10:00Z", "end": "2099-10-02T15:56:59+00:00", "days": ["2099-10-02"]}]}
+        state["cases"]["second"]["schedule"] = {"run_mode": "always", "windows": []}
         state["cases"]["first"]["config"] = "configs/first.toml"
         (self.work / "configs").mkdir()
         (self.work / "configs/first.toml").write_text('[[universe]]\nuid = "share"\n\n[[strategies]]\nkind = "example"\n')
         self.write("campaign.json", state)
         result = dashboard.snapshot(self.work)
         self.assertEqual(result["cases"][0]["assets"], [{"uid": "share", "ticker": "SBER", "benchmark": False}])
-        self.assertEqual(result["cases"][0]["launch_at"], "2026-10-02T05:10:00+00:00")
-        self.assertEqual(result["cases"][1]["launch_at"], "2026-10-06T05:10:00+00:00")
+        self.assertEqual(result["cases"][0]["launch_at"], "2099-10-02T05:10:00+00:00")
+        self.assertEqual(result["cases"][0]["opening_at"], "2099-10-02T06:10:00Z")
+        self.assertEqual(result["cases"][0]["schedule"]["windows"][1]["days"], ["2099-10-02"])
+        self.assertIsNone(result["cases"][1]["launch_at"])
+        self.assertEqual(result["cases"][1]["schedule"]["run_mode"], "always")
 
     def test_market_snapshot_is_filtered_and_does_not_expose_cache_metadata(self):
         self.write("reports/market-chart.json", {"secret": "TOP_SECRET", "assets": {"share": {"ticker": "SBER", "series": {"day": {
@@ -119,6 +126,53 @@ class DashboardTests(unittest.TestCase):
         feed.update()
         self.assertFalse(feed.history[0]["complete"])
 
+    def test_strategy_log_is_parsed_redacted_and_bounded(self):
+        (self.work / "logs").mkdir()
+        fake_token = "t." + "NOTxAxREALxTOKENxFORxTESTS0123456789"
+        lines = ["\x1b[2m2026-10-02T19:53:52.539623Z\x1b[0m  INFO tinkoff_bot: warmup complete; Sandbox runtime is live strategy_id=first components=1",
+                 f'2026-10-02T19:54:00.000000Z ERROR tinkoff_bot: command failed error=status: Unknown, message: "transport {fake_token}" url=postgres://user:TOP_SECRET@db/x',
+                 "thread 'main' panicked at src/bin/tinkoff-bot.rs:1:1"]
+        (self.work / "logs/first.log").write_text("\n".join(lines) + "\n")
+        (self.work / "logs/first.cleanup.log").write_text(lines[0] + "\n")
+        result = dashboard.strategy_log(self.work, "first")
+        self.assertEqual(result["sources"], ["main", "cleanup"])
+        live, failure, raw = result["entries"]
+        self.assertEqual((live["level"], live["message"]), ("INFO", "warmup complete; Sandbox runtime is live"))
+        self.assertEqual(live["fields"], {"strategy_id": "first", "components": "1"})
+        self.assertEqual(failure["fields"]["error"], 'status: Unknown, message: "transport t.***"')
+        self.assertEqual(raw["level"], "RAW")
+        encoded = json.dumps(result)
+        for forbidden in [fake_token, "TOP_SECRET", "\x1b"]:
+            self.assertNotIn(forbidden, encoded)
+        self.assertEqual(len(dashboard.strategy_log(self.work, "first", limit=1)["entries"]), 1)
+        self.assertFalse(dashboard.strategy_log(self.work, "first", "preflight")["exists"])
+        with patch.object(dashboard, "LOG_TAIL_BYTES", len(lines[-1]) + 5):
+            tail = dashboard.strategy_log(self.work, "first")
+        self.assertTrue(tail["truncated"])
+        self.assertEqual([e["level"] for e in tail["entries"]], ["RAW"])
+        for kind, source in [("../campaign", "main"), ("first", "../x"), ("", "main")]:
+            with self.assertRaises(ValueError):
+                dashboard.strategy_log(self.work, kind, source)
+
+    def test_snapshot_exposes_process_mode_and_campaign_window(self):
+        state = dashboard.read_json(self.work / "campaign.json")
+        state["sessions"] = [{"date": "2099-10-02T00:00:00Z", "startTime": "2099-10-02T06:10:00Z", "endTime": "2099-10-02T15:54:59Z"}]
+        state["calendar"] = [{"date": "2099-10-03", "isTradingDay": False, "startTime": None, "endTime": None}]
+        state["cases"]["first"].update(service_only=True, last_started="2026-10-01T10:00:00+00:00", pid=None, title="Мой портфель",
+                                       blocks=[{"share": "100", "instruments": ["share"], "strategies": [{"kind": "moving-average-trend", "weight": "1"}]}],
+                                       schedule={"run_mode": "schedule", "windows": [{"begin": "2099-10-02T05:10:00+00:00", "open": "2099-10-02T06:10:00Z", "end": "2099-10-02T15:56:59+00:00", "days": ["2099-10-02"]}]})
+        self.write("campaign.json", state)
+        result = dashboard.snapshot(self.work)
+        first, second = result["cases"]
+        self.assertTrue(first["service_only"])
+        self.assertEqual(first["last_started"], "2026-10-01T10:00:00+00:00")
+        self.assertEqual(first["window_end_at"], "2099-10-02T15:56:59+00:00")
+        self.assertEqual(first["title"], "Мой портфель")
+        self.assertEqual(first["blocks"][0]["instruments"], [{"uid": "share", "ticker": "SBER"}])
+        self.assertIsNone(second["window_end_at"])
+        self.assertIsNone(second["service_only"])
+        self.assertEqual([d["date"] for d in result["campaign"]["calendar"]], ["2099-10-02", "2099-10-03"])
+
     def test_http_exposes_only_assets_and_sanitized_get_endpoints(self):
         feed = dashboard.Feed(self.work)
         feed.update()
@@ -138,6 +192,17 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertEqual(response.getheader("Cache-Control"), "no-store")
             self.assertNotIn(b"TOP_SECRET", response.read())
+            (self.work / "logs").mkdir()
+            (self.work / "logs/first.log").write_text("2026-10-02T19:54:00.000000Z  INFO tinkoff_bot: shutdown requested\n")
+            for path, status in [("/api/logs?strategy=first", 200), ("/api/logs?strategy=..%2Fcampaign", 404),
+                                 ("/api/logs?strategy=first&source=..%2Fx", 404), ("/api/logs?strategy=unknown", 404)]:
+                connection.request("GET", path)
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, status, path)
+            connection.request("GET", "/api/logs?strategy=first&limit=5")
+            response = connection.getresponse()
+            self.assertEqual(json.loads(response.read())["entries"][0]["message"], "shutdown requested")
             connection.request("GET", "/api/snapshot", headers={"Host": "untrusted.example"})
             response = connection.getresponse()
             self.assertEqual(response.status, 403)

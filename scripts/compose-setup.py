@@ -21,7 +21,7 @@ spec.loader.exec_module(campaign)
 
 def initialize():
     os.umask(0o077)
-    for directory in ["secrets", "ca", "import/db", "import/state"]:
+    for directory in ["secrets", "ca", "import/db", "import/state", "ai"]:
         (LOCAL / directory).mkdir(parents=True, exist_ok=True)
     token_path = LOCAL / "secrets/tinkoff_token"
     if not token_path.exists():
@@ -29,7 +29,18 @@ def initialize():
     password = LOCAL / "secrets/postgres_password"
     if not password.exists():
         password.write_text(secrets.token_hex(32) + "\n")
-    for path in [token_path, password]:
+    production = sync_production_token()
+    # AI model profiles: a working copy of the example; tokens are added by the operator.
+    models = LOCAL / "ai/models.toml"
+    if not models.exists():
+        models.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / "examples/ai-models.example.toml", models)
+        print("AI model profiles created: docker/local/ai/models.toml — set provider, url, model and token there")
+    # Document sources for the AI model: feeds, retention and optional embeddings.
+    sources = LOCAL / "ai/sources.toml"
+    if not sources.exists():
+        shutil.copyfile(ROOT / "examples/sources.example.toml", sources)
+    for path in [token_path, password, production, models, sources]:
         path.chmod(0o600)
     if sys.platform == "darwin":
         # Search the user's configured keychains, including login and System.
@@ -76,6 +87,21 @@ def export():
             (destination / "STOP").touch()
         (campaign.WORK / "MOVED_TO_COMPOSE").write_text("Exported to docker/local/import; do not run this local copy alongside Compose.\n")
     print("Export complete. Accounts and request IDs preserved; local trading copy is disabled.")
+
+
+def sync_production_token():
+    """Copy TINKOFF_TOKEN_PRODUCTION (environment or literal fish assignment) into the
+    Compose secret; without the variable the secret is empty: real accounts are off."""
+    path = LOCAL / "secrets/tinkoff_token_production"
+    value = os.environ.get("TINKOFF_TOKEN_PRODUCTION", "").strip() or campaign.fish_literal("TINKOFF_TOKEN_PRODUCTION") or ""
+    if any(c.isspace() for c in value):
+        raise SystemExit("TINKOFF_TOKEN_PRODUCTION must be one line without spaces; nothing was changed")
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(value + "\n" if value else "")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+    print("Real-account token: " + ("connected from TINKOFF_TOKEN_PRODUCTION" if value else "not set (TINKOFF_TOKEN_PRODUCTION is empty)"))
+    return path
 
 
 if __name__ == "__main__":

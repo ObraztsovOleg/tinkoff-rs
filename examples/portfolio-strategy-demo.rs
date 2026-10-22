@@ -17,10 +17,10 @@ use tinkoff_rs::{
         AccountId, CandleInterval, InstrumentId, Money, PortfolioSnapshot, Price, StrategyId,
     },
     engine::{
-        DataRequirement, DataRole, EventPhase, InstrumentInfo, PlanningContext, PortfolioEngine,
-        PortfolioStrategy, RiskAnchor, RiskConfig, RiskManager, RiskObservation, ScheduleAnchor,
-        ScheduleEvent, ScheduleRequirement, StrategyEvent, StrategyEventKind, TargetPortfolio,
-        TargetWeight,
+        DataRequirement, DataRole, EventPhase, InstrumentInfo, InstrumentKind, PlanningContext,
+        PortfolioEngine, PortfolioStrategy, RiskAnchor, RiskConfig, RiskManager, RiskObservation,
+        ScheduleAnchor, ScheduleEvent, ScheduleRequirement, StrategyEvent, StrategyEventKind,
+        TargetPortfolio, TargetWeight,
     },
     storage::MemoryStorage,
 };
@@ -197,9 +197,14 @@ async fn main() -> Result<()> {
             short_enabled: true,
             api_trade_available: true,
             market_order_available: true,
+            kind: InstrumentKind::Share,
+            price_multiplier: Decimal::ONE,
+            accrued_interest: Decimal::ZERO,
+            commission_rate: Decimal::ZERO,
         }],
         prices: HashMap::from([(instrument_id, Price::new(Decimal::from(100)))]),
         risk,
+        min_trade_fraction: Decimal::ZERO,
     };
     let event = StrategyEvent {
         id: "offline-session-open".to_owned(),

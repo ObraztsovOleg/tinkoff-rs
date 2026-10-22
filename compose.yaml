@@ -1,8 +1,17 @@
 name: tinkoff-sandbox
 
+# Container logs are capped: the Mac disk is the scarcest resource of the stand.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
 services:
   postgres:
-    image: postgres:17-bookworm
+    # Semantic document search needs pgvector: POSTGRES_IMAGE=pgvector/pgvector:0.8.0-pg17
+    # (the same PostgreSQL 17 with the extension; the data volume stays).
+    image: ${POSTGRES_IMAGE:-postgres:17-bookworm}
     environment:
       POSTGRES_DB: tinkoff_campaign
       POSTGRES_USER: tinkoff_campaign
@@ -19,6 +28,28 @@ services:
       retries: 20
     restart: unless-stopped
     stop_grace_period: 1m
+    logging: *logging
+
+  # Nightly pg_dump into the campaign volume (/data/backups); the same image as the
+  # database, so the client always matches the server version.
+  backup:
+    image: ${POSTGRES_IMAGE:-postgres:17-bookworm}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/backup.sh"]
+    environment:
+      PGHOST: postgres
+      PGUSER: tinkoff_campaign
+      PGDATABASE: tinkoff_campaign
+      BACKUP_KEEP: ${BACKUP_KEEP:-3}
+    secrets:
+      - postgres_password
+    volumes:
+      - campaign-data:/data
+      - ./docker/backup.sh:/backup.sh:ro
+    restart: unless-stopped
+    logging: *logging
 
   app:
     build: .
@@ -30,20 +61,35 @@ services:
       POSTGRES_HOST: postgres
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       TINKOFF_TOKEN_FILE: /run/secrets/tinkoff_token
+      # Real accounts: TINKOFF_TOKEN_PRODUCTION copied by compose-setup.py init;
+      # an empty secret means "not connected".
+      TINKOFF_TOKEN_PRODUCTION_FILE: /run/secrets/tinkoff_token_production
+      # AI model profiles (provider, url, model, token) for the ai-model strategy.
+      AI_MODELS_FILE: /run/ai/models.toml
+      # Document sources for the AI model (feeds, retention, optional embeddings).
+      SOURCES_FILE: /run/ai/sources.toml
       # Reuse after cleanup was explicitly approved for this 16-scenario campaign.
       SANDBOX_ALLOW_ACCOUNT_REUSE: ${SANDBOX_ALLOW_ACCOUNT_REUSE:-1}
       # Use already open empty sandbox accounts (no account is closed or deleted).
       SANDBOX_ADOPT_IDLE_ACCOUNTS: ${SANDBOX_ADOPT_IDLE_ACCOUNTS:-0}
+      # Free space is watched on the Mac disk (a bind mount) and the VM volume.
+      DISK_WATCH_PATHS: /run/ai:/data
       DASHBOARD_BIND: 0.0.0.0
       DASHBOARD_PUBLIC_PORT: ${DASHBOARD_PORT:-8765}
     secrets:
       - tinkoff_token
+      - tinkoff_token_production
       - postgres_password
+    # Local models (Ollama, LM Studio) on this computer: http://host.docker.internal:<port>/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:${DASHBOARD_PORT:-8765}:8765"
     volumes:
       - campaign-data:/data
       - ./docker/local/ca:/run/extra-ca:ro
+      # A directory, not a file: edits to models.toml are visible without a restart.
+      - ./docker/local/ai:/run/ai:ro
       - ./docker/local/import/state:/seed:ro
     healthcheck:
       test: [CMD, python3, scripts/container-stack.py, --health]
@@ -55,13 +101,29 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
     stop_grace_period: 5m
+    logging: *logging
+
+  # Optional local vectors for semantic document search (about 2 GB of disk for the
+  # image and the model): docker compose --profile embeddings up -d, then the
+  # [embeddings] section in docker/local/ai/sources.toml.
+  embeddings:
+    profiles: ["embeddings"]
+    image: ollama/ollama:0.6.8
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5; ollama pull ${EMBEDDINGS_MODEL:-bge-m3}; wait"]
+    volumes:
+      - embedding-models:/root/.ollama
+    restart: unless-stopped
+    logging: *logging
 
 volumes:
   postgres-data:
   campaign-data:
+  embedding-models:
 
 secrets:
   tinkoff_token:
     file: ./docker/local/secrets/tinkoff_token
+  tinkoff_token_production:
+    file: ./docker/local/secrets/tinkoff_token_production
   postgres_password:
     file: ./docker/local/secrets/postgres_password

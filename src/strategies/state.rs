@@ -7,7 +7,10 @@ use chrono::{DateTime, Datelike, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Candle, CandleInterval, InstrumentId};
+use crate::{
+    domain::{Candle, CandleInterval, InstrumentId},
+    engine::{DividendEvent, InstrumentFundamentals, ModelAdvice},
+};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 /// Общий снимок истории и маркеров ребалансировки одной встроенной стратегии.
@@ -38,6 +41,21 @@ pub(crate) struct BuiltinState {
     pub(crate) last_intraday_session_close: Option<chrono::NaiveDate>,
     /// Выбранная пара и её открытое/закрытое состояние между сессиями.
     pub(crate) pair: Option<PairState>,
+    /// Последний снимок мультипликаторов брокера; пусто, пока данных не было.
+    #[serde(default)]
+    pub(crate) fundamentals: Vec<InstrumentFundamentals>,
+    /// Когда получен последний снимок мультипликаторов.
+    #[serde(default)]
+    pub(crate) fundamentals_observed_at: Option<DateTime<Utc>>,
+    /// Последний известный календарь дивидендов.
+    #[serde(default)]
+    pub(crate) dividends: Vec<DividendEvent>,
+    /// Когда получен последний календарь дивидендов.
+    #[serde(default)]
+    pub(crate) dividends_observed_at: Option<DateTime<Utc>>,
+    /// Последнее решение ИИ-модели для набора инструментов этой компоненты.
+    #[serde(default)]
+    pub(crate) ai_advice: Option<ModelAdvice>,
 }
 
 impl BuiltinState {
@@ -90,6 +108,16 @@ impl BuiltinState {
             .iter()
             .filter_map(|series| series.candles.last().map(|candle| candle.time))
             .max()
+    }
+
+    /// Последний снимок показателей инструмента, если брокер его прислал.
+    pub(crate) fn fundamentals_for(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> Option<&InstrumentFundamentals> {
+        self.fundamentals
+            .iter()
+            .find(|row| &row.instrument_id == instrument_id)
     }
 
     /// Проверяет, не создавался ли target в календарном месяце этой сессии.

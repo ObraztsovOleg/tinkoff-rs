@@ -1,16 +1,13 @@
 //! Audited maintenance liquidation, independent of strategy-generated signals.
 use super::{
-    BatchExecutionOutcome, BatchExecutor, BotConfig, Decimal, Duration, Error, GetOrdersRequest,
-    PlanningContext, Portfolio, PortfolioStrategy, Result, RiskMode, RiskObservation, RuntimeIds,
-    StdDuration, Storage, Utc, WeightedEnsembleStrategy, connect_sandbox, connect_storage, control,
+    BatchExecutionOutcome, BatchExecutor, BotConfig, Decimal, Duration, Error, PlanningContext,
+    Portfolio, PortfolioStrategy, Result, RiskMode, RiskObservation, RuntimeIds, StdDuration,
+    Storage, Utc, WeightedEnsembleStrategy, connect_storage, connect_venue, control,
     current_moex_session_date, ensure_account_exists, ensure_risk_owner, info, initialize_risk,
     inspect_instruments, portfolio_is_flat, refresh_execution_data, rub_equity,
     scan_external_cash_flows, validate_dedicated_portfolio,
 };
-use tinkoff_rs::{
-    engine::{TargetPlanner, TargetPortfolio, TargetWeight},
-    proto::CancelOrderRequest,
-};
+use tinkoff_rs::engine::{TargetPlanner, TargetPortfolio, TargetWeight};
 use uuid::Uuid;
 
 pub(super) async fn run(config: &BotConfig, ids: &RuntimeIds, reason: &str) -> Result<()> {
@@ -22,7 +19,8 @@ pub(super) async fn run(config: &BotConfig, ids: &RuntimeIds, reason: &str) -> R
     let storage = connect_storage(config).await?;
     storage.migrate().await?;
     let mut lease = storage.acquire_runtime_lease(&ids.account_id).await?;
-    let (api, broker) = connect_sandbox(config).await?;
+    super::venue::ensure_not_halted(&storage, config.contour).await?;
+    let (api, broker) = connect_venue(config).await?;
     ensure_account_exists(&broker, &ids.account_id).await?;
     let strategy = WeightedEnsembleStrategy::new(
         ids.strategy_id.clone(),
@@ -44,8 +42,15 @@ pub(super) async fn run(config: &BotConfig, ids: &RuntimeIds, reason: &str) -> R
         .await?
         .unwrap_or(strategy.state()?);
     let managed = control::managed_universe(&storage, &ids.account_id, &ids.universe).await?;
-    let mut instruments =
-        inspect_instruments(&api, &broker, &managed, &requirements, false).await?;
+    let mut instruments = inspect_instruments(
+        &api,
+        &broker,
+        &managed,
+        &requirements,
+        false,
+        &std::collections::HashSet::new(),
+    )
+    .await?;
     let executor = BatchExecutor::new(
         ids.account_id.clone(),
         ids.strategy_id.clone(),
@@ -66,28 +71,13 @@ pub(super) async fn run(config: &BotConfig, ids: &RuntimeIds, reason: &str) -> R
             "cleanup cannot reconcile batches owned by another strategy".to_owned(),
         ));
     }
-    let mut client = api.raw().sandbox();
     // Suppress every ordinary pending leg before recovery; a confirmation gate
     // must not keep cleanup waiting forever or allow a reduction to be resubmitted.
     sqlx::query("INSERT INTO batch_controls(batch_id,status,revision) SELECT b.id,'rejected',0 FROM rebalance_batches b WHERE b.account_id=$1 AND b.strategy_id=$2 AND b.status NOT IN ('completed','failed') AND b.event_id NOT LIKE 'cleanup:%' AND b.event_id NOT LIKE 'risk:%' ON CONFLICT(batch_id) DO UPDATE SET status='rejected' WHERE batch_controls.revision<>-1")
         .bind(ids.account_id.as_str()).bind(ids.strategy_id.as_str()).execute(storage.pool()).await?;
-    let orders = client
-        .get_sandbox_orders(GetOrdersRequest {
-            account_id: ids.account_id.to_string(),
-            ..Default::default()
-        })
-        .await?
-        .into_inner()
-        .orders;
-    for order in orders {
+    for order in api.active_orders(&ids.account_id).await? {
         lease.check().await?;
-        client
-            .cancel_sandbox_order(CancelOrderRequest {
-                account_id: ids.account_id.to_string(),
-                order_id: order.order_id,
-                order_id_type: None,
-            })
-            .await?;
+        api.cancel_order(&ids.account_id, order.order_id).await?;
     }
     for _ in 0..30 {
         lease.check().await?;
@@ -109,15 +99,7 @@ pub(super) async fn run(config: &BotConfig, ids: &RuntimeIds, reason: &str) -> R
     let portfolio = broker.portfolio(&ids.account_id).await?.data;
     validate_dedicated_portfolio(&portfolio, &managed)?;
     if portfolio_is_flat(&portfolio) {
-        let active = client
-            .get_sandbox_orders(GetOrdersRequest {
-                account_id: ids.account_id.to_string(),
-                ..Default::default()
-            })
-            .await?
-            .into_inner()
-            .orders;
-        if !active.is_empty() {
+        if !api.active_orders(&ids.account_id).await?.is_empty() {
             return Err(Error::RiskRejected(
                 "cleanup deferred: cancellation not yet confirmed".to_owned(),
             ));
@@ -180,6 +162,7 @@ pub(super) async fn run(config: &BotConfig, ids: &RuntimeIds, reason: &str) -> R
             instruments,
             prices,
             risk: decision.clone(),
+            min_trade_fraction: Decimal::ZERO,
         },
     )?;
     lease.check().await?;
@@ -206,14 +189,7 @@ pub(super) async fn run(config: &BotConfig, ids: &RuntimeIds, reason: &str) -> R
         tokio::time::sleep(StdDuration::from_secs(1)).await;
     }
     let remaining = broker.portfolio(&ids.account_id).await?.data;
-    let orders = client
-        .get_sandbox_orders(GetOrdersRequest {
-            account_id: ids.account_id.to_string(),
-            ..Default::default()
-        })
-        .await?
-        .into_inner()
-        .orders;
+    let orders = api.active_orders(&ids.account_id).await?;
     if !portfolio_is_flat(&remaining)
         || !orders.is_empty()
         || storage.has_unfinished_batches(&ids.account_id).await?
@@ -229,7 +205,7 @@ pub(super) async fn run(config: &BotConfig, ids: &RuntimeIds, reason: &str) -> R
 
 async fn finalize_performance(
     storage: &super::PostgresStorage,
-    api: &super::SandboxApi,
+    api: &super::VenueApi,
     portfolio: &super::PortfolioSnapshot,
 ) -> Result<()> {
     if let Some(risk) = storage.load_risk_state(&portfolio.account_id).await? {

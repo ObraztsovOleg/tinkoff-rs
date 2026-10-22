@@ -83,6 +83,111 @@ pub enum StrategyEventKind {
     Order(OrderUpdate),
     /// Периодическая переоценка risk state без торгового сигнала.
     RiskCheck,
+    /// Справочные данные брокера: мультипликаторы и объявленные дивиденды.
+    ///
+    /// Runtime подаёт их перед открытием сессии в фазе Warmup: событие обновляет
+    /// state стратегии, но само никогда не порождает заявку.
+    Reference(ReferenceData),
+    /// Решение внешней ИИ-модели для компоненты `ai-model`.
+    ///
+    /// Runtime получает его перед открытием сессии и подаёт в фазе Warmup: событие
+    /// только сохраняется в state, а target появляется на live-открытии той же
+    /// сессии и проходит обычные лимиты стратегии и risk manager.
+    Advice(ModelAdvice),
+}
+
+/// Решение ИИ-модели: целевые веса внутри набора инструментов компоненты.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModelAdvice {
+    /// Момент получения ответа модели.
+    pub observed_at: DateTime<Utc>,
+    /// Торговая сессия, для которой принято решение.
+    pub session_date: NaiveDate,
+    /// Инструменты компоненты: решение принимает только компонента с тем же набором.
+    pub universe: Vec<InstrumentId>,
+    /// Профиль и модель, давшие решение, для аудита.
+    pub model: String,
+    /// Целевые доли капитала компоненты; отсутствующий инструмент — ноль.
+    pub weights: Vec<AdviceWeight>,
+    /// Обоснование решения от модели.
+    #[serde(default)]
+    pub rationale: String,
+}
+
+/// Целевая доля одного инструмента в решении модели (отрицательная — short).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdviceWeight {
+    /// Торгуемый UID.
+    pub instrument_id: InstrumentId,
+    /// Доля капитала компоненты, от -1 до 1.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub weight: Decimal,
+}
+
+/// Внешние данные, которые стратегия не может вывести из свечей.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceData {
+    /// Момент получения ответа брокера.
+    pub observed_at: DateTime<Utc>,
+    /// Текущие мультипликаторы и показатели рентабельности (если запрошены).
+    #[serde(default)]
+    pub fundamentals: Vec<InstrumentFundamentals>,
+    /// Объявленные и прошедшие дивиденды в окне запроса (если запрошены).
+    #[serde(default)]
+    pub dividends: Vec<DividendEvent>,
+}
+
+/// Текущий снимок показателей эмитента. `None` — показатель не опубликован.
+///
+/// T-Invest возвращает отсутствующее значение как ноль; runtime переводит такой
+/// ноль в `None`, чтобы ранжирование не принимало пропуск за реальное значение.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InstrumentFundamentals {
+    /// Торгуемый UID, к которому относится показатель.
+    pub instrument_id: InstrumentId,
+    /// Цена к балансовой стоимости (P/B).
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub price_to_book: Option<Decimal>,
+    /// Цена к прибыли за 12 месяцев (P/E).
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub price_to_earnings: Option<Decimal>,
+    /// Стоимость компании к EBITDA (EV/EBITDA).
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub ev_to_ebitda: Option<Decimal>,
+    /// Рентабельность капитала, %.
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub return_on_equity: Option<Decimal>,
+    /// Рентабельность активов, %.
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub return_on_assets: Option<Decimal>,
+    /// Чистая маржа, %.
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub net_margin: Option<Decimal>,
+    /// Долг к собственному капиталу, %.
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub debt_to_equity: Option<Decimal>,
+}
+
+/// Дивиденд с известным последним днём покупки (T-1 перед датой фиксации).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DividendEvent {
+    /// Торгуемый UID акции.
+    pub instrument_id: InstrumentId,
+    /// Последний день, когда покупка ещё даёт право на дивиденд.
+    pub last_buy_date: NaiveDate,
+    /// Размер выплаты на акцию, если известен.
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub dividend_net: Option<Decimal>,
+}
+
+/// Вид справочных данных, которые нужно загрузить для стратегии.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceRequirement {
+    /// Мультипликаторы и рентабельность (`GetAssetFundamentals`).
+    Fundamentals,
+    /// Календарь дивидендов (`GetDividends`).
+    Dividends,
 }
 
 /// Идемпотентное входное событие стратегии.
@@ -132,6 +237,27 @@ pub struct ScheduleRequirement {
     pub offset_seconds: i64,
 }
 
+/// Тип инструмента: от него зависит, сколько рублей стоит единица цены.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstrumentKind {
+    /// Акция: цена — рубли за бумагу.
+    #[default]
+    Share,
+    /// Биржевой фонд: цена — рубли за пай.
+    Etf,
+    /// Облигация: цена — процент от номинала, сверху платится НКД.
+    Bond,
+    /// Фьючерс: цена — пункты, у пункта своя рублёвая стоимость.
+    Futures,
+    /// Валюта: цена — рубли за единицу.
+    Currency,
+}
+
+const fn one() -> Decimal {
+    Decimal::ONE
+}
+
 /// Проверенные торговые свойства инструмента, нужные planner-у.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstrumentInfo {
@@ -149,6 +275,27 @@ pub struct InstrumentInfo {
     pub api_trade_available: bool,
     /// Разрешены ли рыночные заявки.
     pub market_order_available: bool,
+    /// Тип инструмента.
+    #[serde(default)]
+    pub kind: InstrumentKind,
+    /// Рублей за единицу цены одной бумаги: 1 у акций, фондов и валюты,
+    /// номинал / 100 у облигаций, стоимость шага цены / шаг у фьючерсов.
+    #[serde(default = "one", with = "rust_decimal::serde::str")]
+    pub price_multiplier: Decimal,
+    /// НКД одной облигации в рублях; у остальных типов ноль.
+    #[serde(default, with = "rust_decimal::serde::str")]
+    pub accrued_interest: Decimal,
+    /// Комиссия брокера за сделку долей от её объёма (0.0005 = 0,05%).
+    #[serde(default, with = "rust_decimal::serde::str")]
+    pub commission_rate: Decimal,
+}
+
+impl InstrumentInfo {
+    /// Рублёвая стоимость одной бумаги (одного контракта) по цене `price`.
+    #[must_use]
+    pub fn piece_value(&self, price: Decimal) -> Decimal {
+        price * self.price_multiplier + self.accrued_interest
+    }
 }
 
 /// Знаковая доля strategy capital для одного инструмента.
@@ -206,6 +353,10 @@ pub trait PortfolioStrategy: Send + Sync {
     fn data_requirements(&self) -> Vec<DataRequirement>;
     /// Объявляет необходимые таймеры относительно сессии MOEX.
     fn schedule_requirements(&self) -> Vec<ScheduleRequirement>;
+    /// Объявляет внешние справочные данные; по умолчанию стратегии хватает свечей.
+    fn reference_requirements(&self) -> Vec<ReferenceRequirement> {
+        Vec::new()
+    }
     /// Сериализует внутреннее состояние после последнего события.
     fn state(&self) -> Result<Value>;
     /// Восстанавливает сохранённое состояние или выполняет rollback in-memory.
@@ -727,6 +878,9 @@ pub struct PlanningContext {
     pub prices: HashMap<InstrumentId, Price>,
     /// Последнее решение risk manager-а.
     pub risk: RiskDecision,
+    /// Изменение позиции меньше этой доли `sizing_capital` не исполняется:
+    /// мелкая перебалансировка только платит комиссию. Ноль — без порога.
+    pub min_trade_fraction: Decimal,
 }
 
 /// Результат planner-а: durable batch и упорядоченные ноги.
@@ -748,7 +902,7 @@ impl TargetPlanner {
     /// Для каждого инструмента используется формула:
     ///
     /// `target_lots = trunc_toward_zero(
-    ///     sizing_capital * signed_weight / (price * lot_size)
+    ///     sizing_capital * signed_weight / (piece_value(price) * lot_size)
     /// )`.
     ///
     /// Усечение к нулю не позволяет округлением увеличить абсолютную позицию.
@@ -801,10 +955,13 @@ impl TargetPlanner {
             }
             // Знаковая стоимость позиции = разрешённый капитал × target weight.
             let target_value = context.risk.sizing_capital * target_weight.weight;
-            // API принимает лоты, поэтому цена одной бумаги умножается на lot size.
-            let lot_value = price.0 * Decimal::from(info.lot_size);
+            // API принимает лоты: рублёвая стоимость бумаги (с учётом типа:
+            // пункты фьючерса, проценты номинала облигации) умножается на лот.
+            let lot_value = info.piece_value(price.0) * Decimal::from(info.lot_size);
+            // Резерв под комиссию: лот стоит вместе с комиссией за сделку.
+            let lot_cost = lot_value * (Decimal::ONE + info.commission_rate);
             // Decimal::trunc округляет и long, и short к нулю.
-            let desired_lots = (target_value / lot_value).trunc().to_i64().ok_or_else(|| {
+            let desired_lots = (target_value / lot_cost).trunc().to_i64().ok_or_else(|| {
                 Error::RiskRejected(format!(
                     "target lots overflow for `{}`",
                     target_weight.instrument_id
@@ -823,6 +980,12 @@ impl TargetPlanner {
                     target_weight.instrument_id
                 )));
             }
+            let desired_lots = after_trade_band(
+                current,
+                desired_lots,
+                lot_value,
+                context.min_trade_fraction * context.risk.sizing_capital,
+            );
             append_legs(
                 &effective_target,
                 target_weight.instrument_id,
@@ -943,6 +1106,20 @@ fn validate_target(target: &TargetPortfolio, context: &PlanningContext) -> Resul
         ));
     }
     Ok(())
+}
+
+/// Мелкое изменение позиции не исполняется: комиссия за него не окупается.
+/// Закрытие позиции и разворот исполняются всегда; новая позиция меньше
+/// порога не открывается.
+fn after_trade_band(current: i64, desired: i64, lot_value: Decimal, band: Decimal) -> i64 {
+    if band <= Decimal::ZERO || desired == current || desired == 0 {
+        return desired;
+    }
+    if current != 0 && current.signum() != desired.signum() {
+        return desired;
+    }
+    let change = Decimal::from(desired.abs_diff(current)) * lot_value;
+    if change < band { current } else { desired }
 }
 
 fn current_lots(
@@ -1141,6 +1318,11 @@ impl<S: Storage> PortfolioEngine<S> {
     /// Возвращает требования стратегии к расписанию MOEX.
     pub async fn schedule_requirements(&self) -> Vec<ScheduleRequirement> {
         self.strategy.lock().await.schedule_requirements()
+    }
+
+    /// Возвращает требования стратегии к справочным данным брокера.
+    pub async fn reference_requirements(&self) -> Vec<ReferenceRequirement> {
+        self.strategy.lock().await.reference_requirements()
     }
 
     /// Applies closed historical candles and commits one atomic warmup checkpoint.
@@ -2216,6 +2398,7 @@ mod warmup_batch_tests {
             vec![uid.clone()],
             vec![WeightedStrategySpec {
                 signal_weight: Decimal::ONE,
+                instruments: None,
                 strategy: BuiltinStrategySpec::MovingAverageTrend(
                     MovingAverageTrendConfig::default(),
                 ),
