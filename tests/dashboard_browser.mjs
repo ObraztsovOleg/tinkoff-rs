@@ -3,7 +3,9 @@ import {mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 const profile=await mkdtemp(join(tmpdir(),'sandbox-dashboard-chrome-'));
-const chrome=spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',['--headless=new','--disable-gpu','--no-first-run','--no-default-browser-check',`--user-data-dir=${profile}`,'--remote-debugging-port=0','about:blank'],{stdio:'ignore'});
+// CHROME overrides the browser; macOS uses the installed Google Chrome, Linux (CI) google-chrome.
+const chromePath=process.env.CHROME || (process.platform==='darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : 'google-chrome');
+const chrome=spawn(chromePath,['--headless=new','--disable-gpu','--no-sandbox','--no-first-run','--no-default-browser-check',`--user-data-dir=${profile}`,'--remote-debugging-port=0','about:blank'],{stdio:'ignore'});
 let socket;
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 try {
@@ -13,8 +15,8 @@ try {
  const pages=await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
  socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);
  await new Promise((r,j)=>{socket.addEventListener('open',r,{once:true});socket.addEventListener('error',j,{once:true});});
- let id=0;const pending=new Map(), errors=[];
- socket.addEventListener('message',e=>{const m=JSON.parse(e.data);if(m.id){const p=pending.get(m.id);pending.delete(m.id);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result);}if(m.method==='Runtime.exceptionThrown')errors.push(m.params.exceptionDetails.text);if(m.method==='Log.entryAdded' && m.params.entry.level==='error')errors.push(m.params.entry.text);});
+ let id=0;const pending=new Map(), errors=[], pinRequests=[];
+ socket.addEventListener('message',e=>{const m=JSON.parse(e.data);if(m.id){const p=pending.get(m.id);pending.delete(m.id);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result);}if(m.method==='Runtime.exceptionThrown')errors.push(m.params.exceptionDetails.text);if(m.method==='Log.entryAdded' && m.params.entry.level==='error'){const e=m.params.entry;if(/status of 401/.test(e.text) && String(e.url).endsWith('/api/commands'))pinRequests.push(e.text);else errors.push(e.text);}});
  const call=(method,params={})=>new Promise((resolve,reject)=>{const n=++id;pending.set(n,{resolve,reject});socket.send(JSON.stringify({id:n,method,params}));});
  const evaluate=async expression=>{const r=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.exceptionDetails)throw Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);return r.result.value;};
  const assert=(value,message)=>{if(!value)throw Error(message);};
@@ -150,11 +152,21 @@ try {
  await evaluate('(async()=>{document.getElementById("asset-select").value="22222222-2222-4222-8222-222222222222";setChartInterval("5s");await refresh();await loadMarket(true)})()');
  await waitFor('marketSeries?.ticker==="TEST" && marketSeries.interval==="5s"');
  assert(await evaluate('document.getElementById("asset-select").value==="22222222-2222-4222-8222-222222222222"'),'Added chart selection lost on refresh');
+ // Backtest on the strategy page: the period goes to the supervisor, the report shows metrics and the curve.
+ await evaluate('chooseStrategy("pairs-trading")');
+ await waitFor('document.getElementById("backtest-panel").offsetParent!==null');
+ await evaluate('document.getElementById("backtest-from").value="2025-10-24";document.getElementById("backtest-slippage").value="7";document.getElementById("backtest-form").requestSubmit()');
+ await waitFor('controlsData.commands.some(c=>c.kind==="backtest")');
+ assert(await evaluate('(()=>{const p=controlsData.commands.find(c=>c.kind==="backtest").payload;return p.from==="2025-10-24" && p.slippage_bps===7 && p.strategy_id==="fixture"})()'),'Backtest payload wrong');
+ await waitFor('document.getElementById("backtest-result").textContent.includes("+12,34%")');
+ assert(await evaluate('(()=>{const t=document.getElementById("backtest-result").textContent.replace(/\\s/g," ");return t.includes("+3,24%") && t.includes("0,87 / 1,21") && t.includes("8,76%") && t.includes("не исполнено 2") && t.includes("exposure limit") && document.querySelector("#backtest-result svg.spark polyline")})()'),'Backtest report wrong: '+await evaluate('document.getElementById("backtest-result").textContent.slice(0,400)'));
  assert(await evaluate('document.querySelectorAll("#ranking-content tbody tr").length===1'),'Ranking missing');
+ assert(await evaluate('(()=>{const t=document.getElementById("ranking-content").textContent.replace(/\\s/g," ");return t.includes("к SBMX: +0,6 п.п.") && t.includes("1,72 / 2,31") && t.includes("комиссии 512 ₽") && t.includes("волатильность 8,4%")})()'),'Ranking metrics missing: '+await evaluate('document.getElementById("ranking-content").textContent.slice(0,400)'));
  // Portfolios: one card per current portfolio with its account, blocks, AI model and instruments; old scenarios in the archive.
  await evaluate('location.hash="#portfolios"');
  await waitFor('document.querySelectorAll("#portfolio-cards .portfolio-card").length===3');
  assert(await evaluate('(()=>{const t=document.getElementById("portfolio-cards").textContent;return t.includes("ИИ по новостям") && t.includes("ИИ · claude") && t.includes("claude-opus-5-5") && t.includes("Реальный счёт") && t.includes("Песочница") && !t.includes("old-scenario") && document.getElementById("portfolios-archive").textContent==="Архив (1)"})()'),'Portfolios wrong: '+await evaluate('document.getElementById("portfolio-cards").textContent.slice(0,500)'));
+ assert(await evaluate('(()=>{const card=document.querySelector("#portfolio-cards .portfolio-card"),t=card.textContent.replace(/\\s/g," ");return t.includes("К SBMX") && t.includes("+0,6 п.п.") && t.includes("1,72 / 2,31") && t.includes("8,4%") && t.includes("512 ₽") && card.querySelectorAll("svg.spark polyline").length===1 && !!card.querySelector("svg.spark line")})()'),'Portfolio metrics missing: '+await evaluate('document.querySelector("#portfolio-cards .portfolio-card").textContent.slice(0,600)'));
  await evaluate('document.getElementById("portfolios-archive").click()');
  await waitFor('document.getElementById("portfolio-cards").textContent.includes("old-scenario")');
  await evaluate('document.getElementById("portfolios-archive").click()');
@@ -269,8 +281,16 @@ try {
  await input('promote-budget','30000');
  await waitFor('!document.querySelector("#live-promote-form [type=submit]").disabled');
  assert(await evaluate('document.getElementById("promote-kind").value==="live-pairs-trading"'),'Default real portfolio name missing');
+ assert(await evaluate('document.getElementById("live-pin").textContent.includes("PIN оператора")'),'PIN status missing');
  await evaluate('document.getElementById("live-promote-form").requestSubmit()');
+ // The operator PIN: a wrong one is refused with the attempts left, the right one sends the command.
+ await waitFor('document.getElementById("pin-dialog").open && document.getElementById("pin-reason").textContent.includes("PIN")');
+ assert(await evaluate('!controlsData.commands.some(c=>c.kind==="live_promote")'),'Promotion sent before the PIN');
+ await evaluate('document.getElementById("pin-input").value="1111";document.querySelector("#pin-dialog [value=ok]").click()');
+ await waitFor('document.getElementById("pin-dialog").open && document.getElementById("pin-reason").textContent.includes("осталось попыток 4")');
+ await evaluate('document.getElementById("pin-input").value="2468";document.querySelector("#pin-dialog [value=ok]").click()');
  await waitFor('controlsData.commands.some(c=>c.kind==="live_promote")');
+ assert(await evaluate('!document.getElementById("pin-dialog").open && document.getElementById("pin-input").value===""'),'PIN dialog left open or PIN kept');
  assert(await evaluate('(()=>{const p=controlsData.commands.find(c=>c.kind==="live_promote").payload;return p.account_id==="2000999999" && p.budget==="30000.00" && p.confirm==="9999" && p.source_strategy_id==="fixture" && p.daily_loss_percent==="2"})()'),'Promotion payload wrong');
  assert(await evaluate('document.querySelector(".account-card.live")!==null && document.getElementById("account-count").textContent.startsWith("2 счёта песочницы") && document.getElementById("account-count").textContent.includes("реальный счёт: 1")'),'Real account not separated from virtual rubles');
  await evaluate('chooseStrategy("live-pairs")');
@@ -310,5 +330,6 @@ try {
  assert(await evaluate('document.documentElement.scrollWidth<=window.innerWidth+2'),'Mobile page overflows');
  await writeFile('target/control-browser-mobile.png',Buffer.from((await call('Page.captureScreenshot',{format:'png'})).data,'base64'));
  assert(errors.length===0,'Browser errors: '+errors.join('; '));
- console.log('Browser smoke passed: AI spend in rubles and its limit, commissions and trade band, portfolios and archive, catalog of any type, AI monitor and rating, theses, lessons and outcomes, exposure editor, documents (collector, feed, full text, topics), storage and disk warning, AI spend and budget stop, AI models and decisions, sections, dark theme, sleep notice, real accounts (gate, survey, promotion, confirmation, emergency stop), session hint, operator schedule, runtime limit, budget journal, portfolio builder, log details, strategy journal, current activity, trade markers, secure commands, duplicate/repeat IDs, manual lots, budget, pay-in, plans, catalog, fast candles, ranking, mobile');
+ assert(pinRequests.length===2,'Expected two PIN requests (missing, wrong), got '+pinRequests.length);
+ console.log('Browser smoke passed: AI spend in rubles and its limit, commissions and trade band, portfolios and archive, portfolio metrics (vs benchmark, Sharpe/Sortino, volatility, commissions, sparkline), backtest, catalog of any type, AI monitor and rating, theses, lessons and outcomes, exposure editor, documents (collector, feed, full text, topics), storage and disk warning, AI spend and budget stop, AI models and decisions, sections, dark theme, sleep notice, real accounts (gate, survey, promotion, operator PIN, confirmation, emergency stop), session hint, operator schedule, runtime limit, budget journal, portfolio builder, log details, strategy journal, current activity, trade markers, secure commands, duplicate/repeat IDs, manual lots, budget, pay-in, plans, catalog, fast candles, ranking, mobile');
 } finally { if(socket)socket.close();chrome.kill();await pause(500);await rm(profile,{recursive:true,force:true}); }

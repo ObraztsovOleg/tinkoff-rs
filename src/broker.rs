@@ -808,6 +808,45 @@ async fn fetch_production_portfolio(
     map_portfolio_response(response)
 }
 
+/// Стоимость счёта для риска, доходности и расчёта лотов.
+///
+/// T-Invest включает в `total_amount_portfolio` номинал фьючерсов (цена ×
+/// стоимость пункта × контракты), хотя за контракт деньги не платятся: результат
+/// переходит в деньги вариационной маржой на клиринге и уже входит в остаток.
+/// Номинал вычитается — иначе покупка фьючерса выглядит прибылью, а закрытие —
+/// убытком на всю его стоимость. Результат с последнего клиринга попадёт в
+/// стоимость на следующем клиринге.
+fn account_value(data: &proto::PortfolioResponse) -> Result<Option<Money>> {
+    let Some(total) = data
+        .total_amount_portfolio
+        .clone()
+        .map(Money::from_proto)
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let futures = data
+        .total_amount_futures
+        .clone()
+        .map(Money::from_proto)
+        .transpose()?;
+    match futures {
+        Some(futures) if !futures.amount.0.is_zero() => {
+            if !futures.currency.eq_ignore_ascii_case(&total.currency) {
+                return Err(Error::RiskRejected(format!(
+                    "futures value is in {}, the portfolio in {}",
+                    futures.currency, total.currency
+                )));
+            }
+            Ok(Some(Money {
+                currency: total.currency,
+                amount: Price(total.amount.0 - futures.amount.0),
+            }))
+        }
+        _ => Ok(Some(total)),
+    }
+}
+
 fn map_portfolio_response(
     response: tonic::Response<proto::PortfolioResponse>,
 ) -> Result<ApiResponse<PortfolioSnapshot>> {
@@ -816,6 +855,7 @@ fn map_portfolio_response(
     let response = ApiResponse::from_tonic(response);
     let metadata = response.metadata;
     let data = response.data;
+    let total = account_value(&data)?;
     let positions = data
         .positions
         .into_iter()
@@ -841,10 +881,7 @@ fn map_portfolio_response(
     Ok(ApiResponse {
         data: PortfolioSnapshot {
             account_id: AccountId::new(data.account_id)?,
-            total: data
-                .total_amount_portfolio
-                .map(Money::from_proto)
-                .transpose()?,
+            total,
             positions,
             observed_at: Utc::now(),
         },
@@ -1045,6 +1082,31 @@ mod tests {
         assert_eq!(
             portfolio.total.unwrap().amount.0,
             rust_decimal::Decimal::from(1_000_000)
+        );
+    }
+
+    #[test]
+    fn futures_notional_is_not_account_value() {
+        let money = |units: i64, nano: i32| crate::proto::MoneyValue {
+            currency: "rub".to_owned(),
+            units,
+            nano,
+        };
+        // Sandbox 2026-10-24: 3 BRX6 at 116.63 make 281 794.76 ₽ of «futures value»;
+        // the account holds 991 332.31 ₽ with the settled variation margin.
+        let response = crate::proto::PortfolioResponse {
+            account_id: "account".to_owned(),
+            total_amount_portfolio: Some(money(1_273_127, 65_429_000)),
+            total_amount_currencies: Some(money(991_332, 307_339_000)),
+            total_amount_futures: Some(money(281_794, 758_090_000)),
+            ..Default::default()
+        };
+        let portfolio = super::map_portfolio_response(tonic::Response::new(response))
+            .unwrap()
+            .data;
+        assert_eq!(
+            portfolio.total.unwrap().amount.0,
+            rust_decimal::Decimal::new(991_332_307_339, 6)
         );
     }
 

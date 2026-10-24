@@ -155,13 +155,17 @@ async fn start_service(config: &BotConfig, ids: &RuntimeIds) -> Result<LiveRunti
     )
     .await?;
     let risk = initialize_risk(&api, &storage, &config.risk, ids, &portfolio, session).await?;
-    let executor = BatchExecutor::new(
+    let mut executor = BatchExecutor::new(
         ids.account_id.clone(),
         ids.strategy_id.clone(),
         broker.clone(),
         broker.clone(),
         storage.clone(),
     );
+    // Подтверждённые вручную планы реального счёта проходят ту же проверку стакана.
+    if let Some(guard) = super::spread_guard(config, &api) {
+        executor = executor.with_guard(guard);
+    }
     let costs = instruments::ExecutionCosts::load(&storage, config.contour.label()).await;
     Ok(LiveRuntime {
         account_id: ids.account_id.clone(),
@@ -799,27 +803,29 @@ impl LiveRuntime {
             return Ok(false);
         }
         let close_only = decision.mode == RiskMode::CloseOnly;
-        // (свойства, текущие лоты, целевые лоты)
-        let mut legs: Vec<(InstrumentInfo, i64, i64)> = Vec::new();
+        // Свойства и текущие лоты всех участников переноса.
+        let mut infos: HashMap<InstrumentId, InstrumentInfo> = HashMap::new();
+        let mut held: HashMap<InstrumentId, i64> = HashMap::new();
+        for id in rolls
+            .iter()
+            .flat_map(|r| [r.series.clone(), r.to.uid.clone()])
+            .chain(leftovers.iter().cloned())
+        {
+            let (info, _) = load_instrument(&self.api, &self.broker, id.clone()).await?;
+            held.insert(id.clone(), position_lots(&portfolio, &info)?);
+            infos.insert(id, info);
+        }
         for roll in &rolls {
-            let (series, _) = load_instrument(&self.api, &self.broker, roll.series.clone()).await?;
-            let (next, _) = load_instrument(&self.api, &self.broker, roll.to.uid.clone()).await?;
-            let held = position_lots(&portfolio, &series)?;
-            let moved = position_lots(&portfolio, &next)?;
-            let total = held
-                .checked_add(moved)
-                .ok_or_else(|| reject("rolled position overflows"))?;
-            info!(series = %roll.series, from = %roll.from.ticker, to = %roll.to.ticker, lots = total, "futures roll is due");
-            legs.push((series, held, 0));
-            legs.push((next, moved, if close_only { 0 } else { total }));
+            info!(series = %roll.series, from = %roll.from.ticker, to = %roll.to.ticker, lots = held[&roll.series], "futures roll is due");
         }
-        for uid in leftovers {
-            let (info, _) = load_instrument(&self.api, &self.broker, uid).await?;
-            let held = position_lots(&portfolio, &info)?;
-            warn!(instrument_id = %info.instrument_id, lots = held, "closing a position left in another contract of a futures series");
-            legs.push((info, held, 0));
+        for uid in &leftovers {
+            warn!(instrument_id = %uid, lots = held[uid], "closing a position left in another contract of a futures series");
         }
-        legs.retain(|(_, current, desired)| current != desired);
+        let legs: Vec<(InstrumentInfo, i64, i64)> =
+            roll_legs(&rolls, &leftovers, &held, close_only)
+                .into_iter()
+                .map(|(id, current, desired)| (infos[&id].clone(), current, desired))
+                .collect();
         if legs.is_empty() {
             return Ok(!rolls.is_empty());
         }
@@ -1502,6 +1508,38 @@ fn manual_intents(
     }
     Ok(result)
 }
+/// Ноги переноса непрерывных фьючерсов: позиция серии (привязанный контракт)
+/// закрывается, в следующий контракт открывается тот же объём, если он ещё не
+/// открыт; остатки в других контрактах закрываются. При
+/// риск-блокировке позиция только закрывается. Возвращает
+/// (идентификатор, текущие лоты, целевые лоты) без пустых ног.
+pub(super) fn roll_legs(
+    rolls: &[instruments::Roll],
+    leftovers: &[InstrumentId],
+    held: &HashMap<InstrumentId, i64>,
+    close_only: bool,
+) -> Vec<(InstrumentId, i64, i64)> {
+    let lots = |id: &InstrumentId| held.get(id).copied().unwrap_or_default();
+    let mut legs = Vec::new();
+    for roll in rolls {
+        let (series, moved) = (lots(&roll.series), lots(&roll.to.uid));
+        // Позиция, уже открытая в следующем контракте (прерванный перенос), не
+        // наращивается: старый контракт только закрывается.
+        let target = if moved == 0 { series } else { moved };
+        legs.push((roll.series.clone(), series, 0));
+        legs.push((
+            roll.to.uid.clone(),
+            moved,
+            if close_only { 0 } else { target },
+        ));
+    }
+    for uid in leftovers {
+        legs.push((uid.clone(), lots(uid), 0));
+    }
+    legs.retain(|(_, current, desired)| current != desired);
+    legs
+}
+
 fn same_plan(left: &[OrderIntent], right: &[OrderIntent]) -> bool {
     left.len() == right.len()
         && left.iter().zip(right).all(|(a, b)| {

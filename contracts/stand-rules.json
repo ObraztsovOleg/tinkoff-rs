@@ -1,0 +1,182 @@
+{
+  "_comment": "Rules shared by the bot (build.rs turns them into Rust constants), the supervisor and the dashboard. Change them here only.",
+  "futures": {
+    "_comment": "A continuous series futures:<code> trades its nearest contract and moves to the next one roll_days before the last trading day, at roll_time_utc (the start of the MOEX main session).",
+    "series_prefix": "futures:",
+    "roll_days": 5,
+    "roll_time_utc": "07:00",
+    "month_letters": "FGHJKMNQUVXZ"
+  },
+  "share_only_kinds": [
+    "value-composite",
+    "quality-profitability",
+    "value-momentum",
+    "multi-factor",
+    "dividend-month"
+  ],
+  "commissions": {
+    "_comment": "Tariff defaults, % of a trade's volume (T-Invest, 2026). A rate measured from the commissions actually charged replaces them once a type has min_trades trades and min_volume_rub of volume over measure_days.",
+    "tariffs": {
+      "sandbox": {
+        "default": 0.05
+      },
+      "investor": {
+        "share": 0.3,
+        "etf": 0.3,
+        "bond": 0.3,
+        "futures": 0.04,
+        "currency": 0.5,
+        "default": 0.3
+      },
+      "trader": {
+        "share": 0.05,
+        "etf": 0.05,
+        "bond": 0.05,
+        "futures": 0.04,
+        "currency": 0.5,
+        "default": 0.05
+      },
+      "premium": {
+        "share": 0.04,
+        "etf": 0.04,
+        "bond": 0.04,
+        "futures": 0.025,
+        "currency": 0.04,
+        "default": 0.04
+      }
+    },
+    "unknown_tariff": {
+      "default": 0.3
+    },
+    "measure_days": 90,
+    "min_trades": 5,
+    "min_volume_rub": 100000
+  },
+  "topics": [
+    {
+      "id": "geopolitics",
+      "name": "геополитика и переговоры",
+      "up": "разрядка, переговоры, перемирие (−1 — эскалация)"
+    },
+    {
+      "id": "sanctions",
+      "name": "санкции и ограничения",
+      "up": "ослабление санкций, снятие ограничений (−1 — ужесточение)"
+    },
+    {
+      "id": "oil",
+      "name": "нефть и нефтепродукты",
+      "up": "рост цен, спроса, экспорта (−1 — падение, дисконты, ограничения)"
+    },
+    {
+      "id": "gas",
+      "name": "газ и СПГ",
+      "up": "рост цен и экспорта газа"
+    },
+    {
+      "id": "metals",
+      "name": "металлы и сталь",
+      "up": "рост цен и спроса на сталь, никель, медь, алюминий, палладий"
+    },
+    {
+      "id": "gold",
+      "name": "золото и драгметаллы",
+      "up": "рост цен на золото"
+    },
+    {
+      "id": "coal",
+      "name": "уголь",
+      "up": "рост цен и экспорта угля"
+    },
+    {
+      "id": "fertilizers",
+      "name": "удобрения и агро",
+      "up": "рост цен и экспорта удобрений, зерна"
+    },
+    {
+      "id": "ruble",
+      "name": "курс рубля",
+      "up": "укрепление рубля (−1 — ослабление)"
+    },
+    {
+      "id": "key_rate",
+      "name": "ключевая ставка и политика ЦБ",
+      "up": "повышение ставки, жёсткий сигнал (−1 — снижение, мягкий сигнал)"
+    },
+    {
+      "id": "inflation",
+      "name": "инфляция",
+      "up": "ускорение инфляции"
+    },
+    {
+      "id": "budget",
+      "name": "бюджет и госфинансы",
+      "up": "улучшение бюджета, рост доходов и господдержки (−1 — дефицит, сокращение расходов)"
+    },
+    {
+      "id": "taxes",
+      "name": "налоги и пошлины",
+      "up": "рост налоговой нагрузки: НДПИ, НДД, налог на прибыль, пошлины (−1 — снижение)"
+    },
+    {
+      "id": "dividends",
+      "name": "дивидендная политика",
+      "up": "больше дивидендов: требования к госкомпаниям, рекомендации"
+    },
+    {
+      "id": "banking",
+      "name": "банки и кредитование",
+      "up": "рост кредитования, смягчение регулирования банков"
+    },
+    {
+      "id": "consumer",
+      "name": "потребительский спрос и розница",
+      "up": "рост спроса и доходов населения"
+    },
+    {
+      "id": "real_estate",
+      "name": "недвижимость и ипотека",
+      "up": "рост спроса, льготная ипотека"
+    },
+    {
+      "id": "tech",
+      "name": "технологии и импортозамещение",
+      "up": "рост спроса на ИТ, господдержка отрасли"
+    },
+    {
+      "id": "telecom",
+      "name": "связь и телеком",
+      "up": "рост тарифов и выручки связи"
+    },
+    {
+      "id": "power",
+      "name": "электроэнергетика и тарифы",
+      "up": "рост тарифов и потребления"
+    },
+    {
+      "id": "transport",
+      "name": "транспорт, логистика, авиация",
+      "up": "рост перевозок, снятие ограничений логистики"
+    },
+    {
+      "id": "china",
+      "name": "Китай",
+      "up": "рост экономики и спроса Китая, расширение торговли с Россией"
+    },
+    {
+      "id": "world_markets",
+      "name": "мировые рынки и ФРС",
+      "up": "рост мировых рынков, смягчение ФРС"
+    },
+    {
+      "id": "market_regulation",
+      "name": "регулирование рынка",
+      "up": "решения, расширяющие рынок: допуск инвесторов, послабления"
+    },
+    {
+      "id": "corporate",
+      "name": "корпоративные события эмитента",
+      "up": "хорошие для акционеров: прибыль выше ожиданий, выкуп, сделки (−1 — плохие)"
+    }
+  ]
+}

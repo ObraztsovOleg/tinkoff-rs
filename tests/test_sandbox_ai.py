@@ -47,6 +47,19 @@ class AiBlockTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             controls.validate_blocks(trend)
 
+    def test_several_models_compete_in_one_block_under_their_own_profiles(self):
+        model = lambda profile=None: {"kind": "ai-model", "weight": "1", "params": {"model_profile": profile} if profile else {}}
+        blocks = lambda *strategies: [{"instruments": UIDS, "share": "100", "strategies": list(strategies)}]
+        controls.validate_blocks(blocks(model("deepseek"), model("qwen122"), model("qwen-flash")))
+        for bad in [(model("deepseek"), model("deepseek")), (model(), model("qwen122"))]:
+            with self.subTest(bad), self.assertRaises(ValueError) as error:
+                controls.validate_blocks(blocks(*bad))
+            self.assertIn("свой профиль модели", str(error.exception))
+        trend = {"kind": "moving-average-trend", "weight": "1", "params": {}}
+        with self.assertRaises(ValueError) as error:
+            controls.validate_blocks(blocks(trend, dict(trend)))
+        self.assertIn("указана дважды", str(error.exception))
+
     def test_block_settings_are_written_into_the_strategy_toml(self):
         state = {"benchmark": {"uid": "bench"}}
         text = controls.strategy_block(SimpleNamespace(ROOT=ROOT), state, "ai-model", "0.5", UIDS,
@@ -123,6 +136,36 @@ class AiJobTests(unittest.TestCase):
             controls.ai_job(self.campaign, self.state, {"id": str(uuid.uuid4()), "kind": "ai_preview", "payload": {"strategy_id": "camp-trend"}})
 
 
+    def test_backtest_runs_in_background_with_the_period_and_keeps_the_report(self):
+        self.state["benchmark"] = {"uid": "sbmx-uid", "ticker": "SBMX"}
+        report = {"from": "2025-10-24", "to": "2026-10-23", "return_percent": 12.345, "max_drawdown_percent": 8.7, "sharpe": 0.9,
+                  "trades": 118, "commission_rub": "2250.00", "final_equity": "1123450.00",
+                  "benchmark": {"instrument_id": "sbmx-uid", "return_percent": 9.1, "excess_percent": 3.2}}
+        args, result = self.run_job("backtest", {"strategy_id": "camp-trend", "from": "2025-10-24", "to": "2026-10-23", "slippage_bps": 5},
+                                    "INFO loading\n" + json.dumps(report) + "\n")
+        self.assertEqual(args[1:3], ["--config", str(self.work / "configs/trend.toml")])
+        self.assertEqual(args[3:], ["backtest", "--from", "2025-10-24", "--to", "2026-10-23", "--slippage-bps", "5", "--benchmark", "sbmx-uid"])
+        # History is read through the Sandbox contour: no case environment, so never a real-account token.
+        self.assertEqual(self.campaign.environment.call_args.args[1], None)
+        self.assertEqual(result["report"]["trades"], 118)
+        self.assertIn("+12.35%", result["message"])
+        self.assertIn("ориентир +9.10%", result["message"])
+        with self.assertRaises(ValueError) as error:
+            self.run_job("backtest", {"strategy_id": "camp-trend", "from": "2025-10-24", "to": "2026-10-23", "slippage_bps": 5},
+                         "ERROR tinkoff_bot: command failed error=configuration error: backtest covers price strategies\n")
+        self.assertIn("price strategies", str(error.exception))
+
+    def test_backtest_period_is_validated(self):
+        state = {"cases": {"trend": {"kind": "trend", "strategy_id": "camp-trend", "account_id": "acc"}}}
+        command = lambda **payload: {"id": str(uuid.uuid4()), "kind": "backtest", "strategy_id": None, "account_id": None,
+                                     "payload": dict({"strategy_id": "camp-trend", "from": "2025-10-24", "to": "2026-10-23", "slippage_bps": 5}, **payload)}
+        self.assertEqual(dashboard.validate(command(), state)["payload"]["from"], "2025-10-24")
+        for bad in [{"from": "2026-10-24", "to": "2026-10-23"}, {"to": "2099-01-01"}, {"from": "24.10.2025"},
+                    {"from": "2010-01-01"}, {"slippage_bps": 500}, {"slippage_bps": "5"}, {"strategy_id": "unknown"}]:
+            with self.subTest(bad=bad), self.assertRaises(dashboard.ClientError):
+                dashboard.validate(command(**bad), state)
+
+
 class AiDashboardTests(unittest.TestCase):
     STATE = {"cases": {"ai": {"kind": "ai", "strategy_id": "camp-ai", "account_id": "acc"}}}
 
@@ -157,10 +200,18 @@ class AiDashboardTests(unittest.TestCase):
 
 
 class TopicTests(unittest.TestCase):
-    def test_dashboard_topics_match_the_model_taxonomy(self):
+    def test_topics_and_rules_come_from_one_shared_file(self):
         import re
-        rust = re.findall(r'Topic\s*\{\s*id:\s*"([a-z_]+)",\s*name:\s*"([^"]+)"', (ROOT / "src/bin/support/documents/topics.rs").read_text(encoding="utf-8"))
-        self.assertEqual(dict(rust), dashboard.TOPICS)
+        rules = json.loads((ROOT / "contracts/stand-rules.json").read_text(encoding="utf-8"))
+        self.assertEqual(dashboard.TOPICS, {t["id"]: t["name"] for t in rules["topics"]})
+        if not (ROOT / "src").exists():
+            self.skipTest("Rust sources are not part of the container image")
+        self.assertRegex((ROOT / "src/bin/support/documents/topics.rs").read_text(encoding="utf-8"), r"use crate::rules::\{[^}]*\bTOPICS\b")
+        # No part of the stand keeps its own copy of the share-only list or the roll rule.
+        copies = re.compile(r'quality-profitability"\s*[,|]\s*"value-momentum|ROLL_DAYS\s*[:=]\s*[0-9]|ROLL_DAYS: i64 = [0-9]')
+        found = [str(path.relative_to(ROOT)) for folder in ("src", "scripts") for path in (ROOT / folder).rglob("*")
+                 if path.suffix in {".rs", ".py", ".js"} and copies.search(path.read_text(encoding="utf-8"))]
+        self.assertEqual(found, [])
 
     def test_exposure_edits_are_validated(self):
         command = lambda payload, kind="exposure_set": {"id": str(uuid.uuid4()), "kind": kind, "strategy_id": None, "account_id": None, "payload": payload}

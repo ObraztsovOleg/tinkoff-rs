@@ -41,6 +41,17 @@ class DashboardTests(unittest.TestCase):
         self.broker["accounts"]["second"] = self.broker["accounts"]["first"]
         self.write("reports/broker-latest.json", self.broker)
 
+    def test_account_value_excludes_the_futures_notional(self):
+        portfolio = {"totalAmountPortfolio": {"units": "1273127", "nano": 65429000},
+                     "totalAmountFutures": {"currency": "rub", "units": "281794", "nano": 758090000}}
+        self.assertAlmostEqual(dashboard.account_value(portfolio), 991332.307339)
+        self.assertEqual(dashboard.account_value({"totalAmountPortfolio": {"units": "5"}}), 5)
+        self.assertIsNone(dashboard.account_value({}))
+        self.broker["accounts"]["first"]["portfolio"]["totalAmountFutures"] = {"units": "250000", "nano": 0}
+        self.write("reports/broker-latest.json", self.broker)
+        account = next(a for a in dashboard.snapshot(self.work)["accounts"] if a["id"] == "shared")
+        self.assertAlmostEqual(account["equity"], 750000.25)
+
     def test_schedule_and_universe_come_from_campaign_not_inferred_from_name(self):
         state = dashboard.read_json(self.work / "campaign.json")
         # Windows are the supervisor's view of the operator schedule; past windows are skipped.
@@ -94,6 +105,17 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(result["orders"][0]["maintenance"])
         self.assertTrue(result["fills"][0]["maintenance"])
         self.assertEqual(result["fills"][0]["strategy"], "first")
+
+    def test_a_waiting_plan_carries_the_reason(self):
+        database = dashboard.read_json(self.work / "reports/database.json")
+        database["batches"] = [{"strategy_id": "first", "event_id": "schedule:open", "status": "awaiting_fills",
+                                "reason": "sber: рыночная заявка ушла бы на 1.20% хуже середины спреда (порог 0.50%)",
+                                "target": {"batch_id": "b", "generated_at": "2026-10-26T07:00:00Z",
+                                           "valid_until": "2026-10-26T07:30:00Z", "weights": []}}]
+        self.write("reports/database.json", database)
+        target = dashboard.snapshot(self.work)["targets"][0]
+        self.assertEqual(target["status"], "awaiting_fills")
+        self.assertIn("хуже середины спреда", target["reason"])
 
     def test_missing_broker_snapshot_is_unknown_not_zero(self):
         (self.work / "reports/broker-latest.json").unlink()

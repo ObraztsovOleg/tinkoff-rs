@@ -328,6 +328,22 @@ class CommissionTests(unittest.TestCase):
         self.assertEqual(rows["default"]["rate"], 0.05)
         self.assertEqual(controls.commission_rows("unknown-tariff", {})[0]["rate"], 0.3, "an unknown tariff is costed conservatively")
 
+    def test_each_trade_and_its_commission_are_kept_for_the_portfolio_costs(self):
+        item = lambda n: {"id": f"op{n}", "date": "2026-10-22T08:00:00Z", "type": "OPERATION_TYPE_SELL", "instrumentType": "share",
+                          "payment": self.money(1000), "commission": self.money(-0.5)}
+        api = SimpleNamespace(call=Mock(return_value={"items": [item(n) for n in range(5)] + [{"type": "OPERATION_TYPE_BUY",
+                                                       "instrumentType": "share", "payment": self.money(-10)}], "hasNext": False}))
+        trades = []
+        controls.measure_commissions(api, ["acc"], True, "2026-10-01T00:00:00+00:00", trades=trades)
+        self.assertEqual(len(trades), 5, "an operation without id or date is counted in rates only")
+        self.assertEqual(trades[0], {"id": "op0", "account": "acc", "at": "2026-10-22T08:00:00Z", "kind": "share", "volume": 1000.0, "commission": 0.5})
+        campaign = SimpleNamespace(run_sql=Mock(return_value=""))
+        controls.store_trade_commissions(campaign, {}, trades, chunk=2)
+        self.assertEqual(campaign.run_sql.call_count, 3, "rows go in chunks")
+        sql = campaign.run_sql.call_args_list[0][0][1]
+        self.assertIn("('op0','acc','2026-10-22T08:00:00Z'::timestamptz,'share','1000.00','0.50')", sql)
+        self.assertIn("ON CONFLICT (operation_id) DO UPDATE", sql)
+
     def test_calibration_stores_the_rates_of_each_contour(self):
         campaign = SimpleNamespace(now=lambda: __import__("datetime").datetime(2026, 10, 21, tzinfo=__import__("datetime").timezone.utc),
                                    API=Mock(side_effect=RuntimeError("Real-account token is not connected")), run_sql=Mock(return_value=""))

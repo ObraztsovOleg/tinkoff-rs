@@ -9,9 +9,9 @@ x-logging: &logging
 
 services:
   postgres:
-    # Semantic document search needs pgvector: POSTGRES_IMAGE=pgvector/pgvector:0.8.0-pg17
-    # (the same PostgreSQL 17 with the extension; the data volume stays).
-    image: ${POSTGRES_IMAGE:-postgres:17-bookworm}
+    # PostgreSQL 17 on Debian 12 with pgvector for semantic document search: the same
+    # server and libc as postgres:17-bookworm, so the data volume and collations stay.
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:0.8.7-pg17-bookworm}
     environment:
       POSTGRES_DB: tinkoff_campaign
       POSTGRES_USER: tinkoff_campaign
@@ -33,7 +33,7 @@ services:
   # Nightly pg_dump into the campaign volume (/data/backups); the same image as the
   # database, so the client always matches the server version.
   backup:
-    image: ${POSTGRES_IMAGE:-postgres:17-bookworm}
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:0.8.7-pg17-bookworm}
     depends_on:
       postgres:
         condition: service_healthy
@@ -88,6 +88,10 @@ services:
     volumes:
       - campaign-data:/data
       - ./docker/local/ca:/run/extra-ca:ro
+      # Off-site copies of the database: s3.env with the bucket keys and a passphrase.
+      - ./docker/local/backup:/run/backup:ro
+      # Telegram notifications: telegram.env with the bot token and the chat.
+      - ./docker/local/notify:/run/notify:ro
       # A directory, not a file: edits to models.toml are visible without a restart.
       - ./docker/local/ai:/run/ai:ro
       - ./docker/local/import/state:/seed:ro

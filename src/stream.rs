@@ -1020,6 +1020,6 @@ mod tests {
             panic!("unexpected subscription kind");
         };
         assert_eq!(request.instruments[0].instrument_id, "BBG004730N88");
-        assert!(request.instruments[0].figi.is_empty());
+        assert_eq!(request.instruments[0].figi, "");
     }
 }

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light dark"><title>Strategy Lab · Наблюдение за стратегиями</title>
-  <link rel="icon" href="data:,"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/dark.css"><script src="/theme.js"></script><script src="/app.js" defer></script><script src="/detail.js" defer></script><script src="/controls.js" defer></script><script src="/portfolios.js" defer></script><script src="/logs.js" defer></script><script src="/live.js" defer></script><script src="/ai.js" defer></script><script src="/aiboard.js" defer></script><script src="/costs.js" defer></script><script src="/documents.js" defer></script><script src="/exposures.js" defer></script><script src="/storage.js" defer></script><script src="/nav.js" defer></script>
+  <link rel="icon" href="data:,"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/dark.css"><script src="/theme.js"></script><script src="/app.js" defer></script><script src="/detail.js" defer></script><script src="/controls.js" defer></script><script src="/portfolios.js" defer></script><script src="/logs.js" defer></script><script src="/live.js" defer></script><script src="/ai.js" defer></script><script src="/aiboard.js" defer></script><script src="/costs.js" defer></script><script src="/backtest.js" defer></script><script src="/documents.js" defer></script><script src="/exposures.js" defer></script><script src="/storage.js" defer></script><script src="/nav.js" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -39,7 +39,7 @@
     </section>
     <section id="activity" class="panel"><div class="section-heading"><div><h2>Сделки и позиции</h2><p id="activity-scope" class="muted">Все счета кампании</p></div><label class="sr-only" for="activity-filter">Стратегия</label><select id="activity-filter"><option value="">Все стратегии</option></select></div><div class="tabs" role="tablist" aria-label="Данные о торговле"><button role="tab" aria-selected="true" aria-controls="activity-content" id="tab-orders" data-tab="orders">Заявки</button><button role="tab" aria-selected="false" aria-controls="activity-content" id="tab-fills" data-tab="fills">Исполнения</button><button role="tab" aria-selected="false" aria-controls="activity-content" id="tab-positions" data-tab="positions">Позиции</button><button role="tab" aria-selected="false" aria-controls="activity-content" id="tab-operations" data-tab="operations">Операции брокера</button></div><div id="activity-content" role="tabpanel" aria-labelledby="tab-orders" tabindex="0"></div></section>
     <section id="accounts"><div class="section-heading"><div><h2>Счета</h2><p class="muted">Один счёт — одна карточка, даже при последовательном запуске нескольких стратегий. Реальные счета отмечены красным</p></div></div><div id="account-cards" class="account-grid"></div></section>
-    <footer><span id="db-updated">Состояние стратегий: ожидаем данные</span><span>Страница: каждые 10 с · отчёт: ~1 мин · брокер: ~5 мин</span></footer>
+    <footer><span id="db-updated">Состояние стратегий: ожидаем данные</span><span>Страница: каждые 10 с · отчёт: ~1 мин · брокер: ~5 мин, после сделок ~1 мин</span></footer>
   </main>
 </body>
 </html>

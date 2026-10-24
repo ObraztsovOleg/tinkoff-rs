@@ -50,8 +50,9 @@ fn literal(vector: &[f32]) -> String {
 impl Vectors {
     /// Подключение из настроек; `None` — векторы не настроены.
     pub(crate) fn from_sources(sources: &Sources) -> Option<Self> {
-        let settings = sources.embeddings.clone()?;
-        let client = reqwest::Client::builder()
+        let mut settings = sources.embeddings.clone()?;
+        settings.url = sources.embeddings_url()?;
+        let client = crate::tls::http_client()
             .timeout(StdDuration::from_secs(120))
             .build()
             .ok()?;
@@ -110,11 +111,11 @@ impl Vectors {
         .await?;
         let model = self.model_sql()?;
         let dimensions = self.settings.dimensions;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE INDEX IF NOT EXISTS {} ON document_embeddings USING hnsw \
              ((embedding::halfvec({dimensions})) halfvec_cosine_ops) WHERE model = {model}",
             self.index_name()
-        ))
+        )))
         .execute(storage.pool())
         .await?;
         Ok(true)
@@ -317,14 +318,14 @@ impl Vectors {
             return Ok(());
         }
         let dimensions = self.settings.dimensions;
-        let similar: Option<(String, f64)> = sqlx::query_as(&format!(
+        let similar: Option<(String, f64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT d.cluster_id, (1 - ((e.embedding::halfvec({dimensions})) <=> (me.embedding::halfvec({dimensions}))))::float8 \
              FROM document_embeddings me JOIN documents mine ON mine.id = me.document_id, \
                   document_embeddings e JOIN documents d ON d.id = e.document_id \
              WHERE me.document_id = $1 AND me.ord = 0 AND me.model = $2 AND e.model = $2 AND e.ord = 0 \
                AND d.cluster_id <> $3 AND d.source <> mine.source AND d.published_at BETWEEN $4 AND $5 \
              ORDER BY (e.embedding::halfvec({dimensions})) <=> (me.embedding::halfvec({dimensions})) LIMIT 1"
-        ))
+        )))
         .bind(document)
         .bind(&self.settings.model)
         .bind(cluster)

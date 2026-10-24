@@ -12,6 +12,8 @@ use tinkoff_rs::{
 };
 
 use super::indicators::{number, round};
+// Фьючерс Brent переходит на следующий контракт за ROLL_DAYS дней до исполнения.
+use crate::rules::ROLL_DAYS;
 use crate::{VenueApi, VenueBroker, history};
 
 /// Вид ряда: от него зависит порог внеочередного решения.
@@ -64,8 +66,6 @@ const FIXED: &[(&str, &str, &str, Class)] = &[
 ];
 /// Ключевая ставка Банка России (индикатор, только последнее значение).
 const KEY_RATE: &str = "e8442bbf-829d-4c24-8582-7fcf85fa511c";
-/// Фьючерс переходит на следующий за столько дней до исполнения.
-const ROLL_DAYS: i64 = 5;
 /// Ближайший фьючерс Brent ищется раз в сутки.
 static BRENT: Mutex<Option<(DateTime<Utc>, Option<Series>)>> = Mutex::new(None);
 

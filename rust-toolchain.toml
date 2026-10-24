@@ -1,3 +1,5 @@
+# One Rust for the Mac, CI and the Docker image: a new stable with new lints must
+# not break the build unannounced. Update together with the Dockerfile builder.
 [toolchain]
-channel = "stable"
-components = ["rust-analyzer", "rustfmt", "clippy"]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

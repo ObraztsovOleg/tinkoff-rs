@@ -95,7 +95,7 @@ async fn rss(fetcher: &mut Fetcher, storage: &PostgresStorage, sources: &Sources
             Err(error) => errors.push(error.to_string()),
         }
     }
-    items.sort_by(|a, b| b.published.cmp(&a.published));
+    items.sort_by_key(|item| std::cmp::Reverse(item.published));
     let ids: Vec<String> = items.iter().map(super::rss::news_id).collect();
     let known: Vec<String> = sqlx::query_scalar("SELECT id FROM documents WHERE id = ANY($1)")
         .bind(&ids)

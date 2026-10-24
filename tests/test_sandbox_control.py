@@ -3,7 +3,9 @@ import copy
 import http.client
 import importlib.util
 import json
+import math
 from pathlib import Path
+import statistics
 import tempfile
 import threading
 import unittest
@@ -212,6 +214,49 @@ class ControlTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in result["clean"]], ["new-run"])
         self.assertEqual({r["account_id"] for r in result["history"]}, {"one", "two"})
 
+    def test_risk_metrics_use_daily_returns_net_of_deposits_and_the_benchmark_over_the_same_days(self):
+        # 1000 → +1% → −2% → deposit of 500 with no gain → +3% → +1%; the deposit is not a return.
+        days = [["2026-10-19", "1010", "0"], ["2026-10-20", "989.8", "0"], ["2026-10-21", "1489.8", "500"],
+                ["2026-10-22", "1534.494", "500"], ["2026-10-23", "1549.83894", "500"]]
+        benchmark = {"ticker": "SBMX", "closes": {"2026-10-16": 10.0, "2026-10-19": 10.1, "2026-10-23": 10.5, "2026-10-26": 11.0}}
+        m = control.risk_metrics(1000.0, 0.0, days, benchmark, "2026-10-18T17:40:00Z")
+        returns = [0.01, -0.02, 0.0, 0.03, 0.01]
+        self.assertEqual(m["days"], 5)
+        self.assertEqual([p[1] for p in m["curve"]][-1], round(((1.01 * 0.98 * 1.03 * 1.01) - 1) * 100, 3))
+        self.assertAlmostEqual(m["worst_day_percent"], -2.0)
+        mean = sum(returns) / 5
+        deviation = statistics.stdev(returns)
+        self.assertAlmostEqual(m["volatility_percent"], deviation * math.sqrt(365) * 100)
+        self.assertAlmostEqual(m["sharpe"], mean / deviation * math.sqrt(365))
+        self.assertAlmostEqual(m["sortino"], mean / math.sqrt(0.02 ** 2 / 5) * math.sqrt(365))
+        # From the close before the run began to the close of its last day; later closes are ignored.
+        self.assertEqual(m["benchmark"], "SBMX")
+        self.assertAlmostEqual(m["benchmark_percent"], 5.0)
+        few = control.risk_metrics(1000.0, 0.0, days[:3], None, "2026-10-18")
+        self.assertEqual((few["days"], few["sharpe"], few["benchmark_percent"]), (3, None, None), "too few days for ratios")
+        self.assertEqual(control.risk_metrics(None, 0.0, None)["days"], 0)
+
+    def test_ranking_carries_metrics_commissions_and_excess_over_the_benchmark(self):
+        run = {"id": UID, "strategy_id": "first", "account_id": "account", "classification": "clean", "started_at": "2026-10-18T10:00:00Z",
+               "anchor_equity": "1000", "principal": "1000", "anchor_external_cash_flows": "0", "last_equity": "1030",
+               "last_external_cash_flows": "0", "fills": 3, "days": [["2026-10-19", "1030", "0"]],
+               "costs": {"trades": 3, "volume_rub": "90000", "commission_rub": "45.5"}}
+        benchmark = {"ticker": "SBMX", "closes": {"2026-10-17": 10.0, "2026-10-19": 10.1}}
+        row = control.ranking([run], None, benchmark)["clean"][0]
+        self.assertEqual((row["commission_rub"], row["trades"]), (45.5, 3))
+        self.assertAlmostEqual(row["metrics"]["excess_percent"], 2.0)
+        self.assertEqual(control.ranking([{**run, "costs": None, "days": None}])["clean"][0]["commission_rub"], 0)
+
+    def test_benchmark_closes_come_from_the_chart_cache_by_moscow_day(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "reports").mkdir()
+            (Path(folder) / "reports" / "market-chart.json").write_text(json.dumps({"assets": {"b": {"series": {"day": {"candles": [
+                {"time": "2026-10-22T21:00:00Z", "close": 10.5}, {"time": "2026-10-21T21:00:00Z", "close": 10.0}]}}}}}))
+            closes = control.benchmark_closes(folder, {"uid": "b", "ticker": "SBMX"})
+            self.assertEqual(closes, {"ticker": "SBMX", "closes": {"2026-10-23": 10.5, "2026-10-22": 10.0}})
+            self.assertIsNone(control.benchmark_closes(folder, {"uid": "missing", "ticker": "X"}))
+            self.assertIsNone(control.benchmark_closes(folder, None))
+
     def test_http_requires_session_csrf_origin_and_host_before_queueing(self):
         application = server_module.ThreadingHTTPServer(("127.0.0.1", 0), server_module.Handler)
         application.control = Mock()
@@ -244,6 +289,84 @@ class ControlTests(unittest.TestCase):
             application.server_close()
             thread.join()
 
+
+    def test_operator_pin_is_hashed_and_locks_after_five_wrong_entries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            pin = server_module.OperatorPin(Path(folder) / "operator-pin.json")
+            pin.ITERATIONS = 1000
+            self.assertFalse(pin.configured())
+            self.assertEqual(pin.check("anything"), (True, ""), "no PIN set: nothing to check")
+            with self.assertRaises(ValueError):
+                pin.set("12")
+            pin.set("4321")
+            stored = (Path(folder) / "operator-pin.json").read_text()
+            self.assertNotIn("4321", stored)
+            self.assertEqual(oct((Path(folder) / "operator-pin.json").stat().st_mode & 0o777), "0o600")
+            self.assertEqual(pin.check("4321"), (True, ""))
+            for left in range(4, 0, -1):
+                self.assertEqual(pin.check("0000"), (False, f"Неверный PIN: осталось попыток {left}"))
+            accepted, message = pin.check("0000")
+            self.assertFalse(accepted)
+            self.assertIn("заблокирован", message)
+            self.assertFalse(pin.check("4321")[0], "even the right PIN waits out the lockout")
+            pin.locked_until = 0
+            self.assertTrue(pin.check("4321")[0])
+
+    def test_pin_is_required_for_real_money_commands_only(self):
+        state = {"cases": {"live": {"strategy_id": "live", "account_id": "real", "contour": "production"},
+                           "sandbox": {"strategy_id": "sandbox", "account_id": "acc"}}}
+        on = lambda kind, strategy=None: control.pin_required({"kind": kind, "strategy_id": strategy}, state)
+        self.assertTrue(on("live_promote"))
+        self.assertTrue(on("live_resume"))
+        self.assertTrue(on("live_gate"))
+        self.assertTrue(on("resume", "live"))
+        self.assertTrue(on("approve_batch", "live"))
+        self.assertFalse(on("pause", "live"), "stopping never waits for the PIN")
+        self.assertFalse(on("live_halt"))
+        self.assertFalse(on("resume", "sandbox"))
+        self.assertFalse(on("ai_budget"))
+
+    def test_http_asks_for_the_pin_before_a_real_money_command_and_unlocks_the_session(self):
+        application = server_module.ThreadingHTTPServer(("127.0.0.1", 0), server_module.Handler)
+        application.control = Mock()
+        application.control.state.return_value = {"cases": {"live": {"strategy_id": "live", "account_id": "real", "contour": "production"}}}
+        application.control.enqueue.return_value = {"command": {"status": "queued"}}
+        folder = tempfile.TemporaryDirectory()
+        application.pin = server_module.OperatorPin(Path(folder.name) / "operator-pin.json")
+        application.pin.ITERATIONS = 1000
+        application.pin.set("2468")
+        thread = threading.Thread(target=application.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection("127.0.0.1", application.server_port, timeout=3)
+        live = lambda kind: dict(command(kind), strategy_id="live", account_id="real")
+
+        def post(body, **extra):
+            connection.request("POST", "/api/commands", body=json.dumps(body), headers={**headers, **extra})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        try:
+            connection.request("GET", "/api/session")
+            response = connection.getresponse()
+            cookie = response.getheader("Set-Cookie")
+            csrf = json.loads(response.read())["csrf_token"]
+            headers = {"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{application.server_port}",
+                       "Cookie": cookie.split(";", 1)[0], "X-CSRF-Token": csrf}
+            self.assertEqual(post(live("pause"))[0], 202, "pause needs no PIN")
+            status, value = post(live("resume"))
+            self.assertEqual((status, value["pin_required"]), (401, True))
+            status, value = post(live("resume"), **{"X-Operator-Pin": "1111"})
+            self.assertEqual(status, 401)
+            self.assertIn("осталось попыток 4", value["error"])
+            self.assertEqual(application.control.enqueue.call_count, 1)
+            self.assertEqual(post(live("resume"), **{"X-Operator-Pin": "2468"})[0], 202)
+            self.assertEqual(post(live("cleanup"))[0], 202, "the session stays unlocked for a while")
+            self.assertEqual(application.control.enqueue.call_count, 3)
+        finally:
+            connection.close()
+            application.shutdown()
+            application.server_close()
+            thread.join()
+            folder.cleanup()
 
 if __name__ == "__main__":
     unittest.main()

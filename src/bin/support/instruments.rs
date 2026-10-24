@@ -37,14 +37,10 @@ use tinkoff_rs::{
 
 use super::venue::{VenueApi, VenueBroker};
 
-/// Префикс идентификатора непрерывной серии фьючерсов.
-pub(super) const SERIES_PREFIX: &str = "futures:";
-/// За сколько дней до последнего дня торгов серия переходит на следующий контракт.
-pub(super) const ROLL_DAYS: i64 = 5;
-/// Переход — к началу основной сессии MOEX (10:00 МСК).
-const ROLL_TIME_UTC: (u32, u32) = (7, 0);
-/// Буквы месяцев в тикерах фьючерсов MOEX: BRX6 — ноябрь 2026.
-const MONTHS: &str = "FGHJKMNQUVXZ";
+// Префикс серии (`futures:`), за сколько дней до последнего дня торгов серия
+// переходит на следующий контракт и в какое время (начало основной сессии MOEX),
+// буквы месяцев в тикерах (BRX6 — ноябрь 2026): contracts/stand-rules.json.
+pub(super) use crate::rules::{MONTHS, ROLL_DAYS, ROLL_TIME_UTC, SERIES_PREFIX};
 
 /// Код серии в идентификаторе `futures:BR`.
 pub(super) fn series_code(id: &InstrumentId) -> Option<&str> {
@@ -144,6 +140,17 @@ pub(super) struct SeriesBook {
 }
 
 impl SeriesBook {
+    /// Книга с готовой серией, привязанной к контракту `bound` (тесты).
+    #[cfg(test)]
+    pub(super) fn with_series(series: Series, bound: usize) -> Self {
+        let book = Self::default();
+        if let (Ok(mut map), Ok(mut binding)) = (book.series.write(), book.bound.write()) {
+            binding.insert(series.code.clone(), bound);
+            map.insert(series.code.clone(), series);
+        }
+        book
+    }
+
     /// Загружает серии из списка и привязывает каждую к текущему контракту.
     pub(super) async fn load(
         &self,
@@ -636,6 +643,207 @@ mod tests {
             ticker: ticker.to_owned(),
             last_trade: at(last),
         }
+    }
+
+    /// Brent: BRV6 (last day 1 Oct), BRX6 (2 Nov), BRZ6 (1 Dec); bound to BRX6.
+    fn brent() -> SeriesBook {
+        SeriesBook::with_series(
+            Series {
+                code: "BR".to_owned(),
+                contracts: vec![
+                    contract("BRV6", "2026-10-01T16:00:00Z"),
+                    contract("BRX6", "2026-11-02T16:00:00Z"),
+                    contract("BRZ6", "2026-12-01T16:00:00Z"),
+                ],
+            },
+            1,
+        )
+    }
+
+    /// Daily closes per contract; candles of a contract are served for any window.
+    struct Daily(Map<String, Vec<(&'static str, i64)>>);
+
+    #[async_trait::async_trait]
+    impl MarketData for Daily {
+        async fn candles(
+            &self,
+            request: CandleHistoryRequest,
+        ) -> Result<tinkoff_rs::ApiResponse<Vec<Candle>>> {
+            let data = self
+                .0
+                .get(request.instrument_id.as_str())
+                .into_iter()
+                .flatten()
+                .map(|(time, close)| {
+                    let price = Price(Decimal::from(*close));
+                    Candle {
+                        instrument_id: request.instrument_id.clone(),
+                        interval: request.interval,
+                        open: price,
+                        high: price,
+                        low: price,
+                        close: price,
+                        volume: 1,
+                        time: at(time),
+                        complete: true,
+                    }
+                })
+                .filter(|c| c.time >= request.from && c.time < request.to)
+                .collect();
+            Ok(tinkoff_rs::ApiResponse {
+                data,
+                metadata: tinkoff_rs::ApiMetadata::default(),
+            })
+        }
+
+        async fn trading_availability(
+            &self,
+            _: &InstrumentId,
+        ) -> Result<tinkoff_rs::ApiResponse<tinkoff_rs::domain::TradingAvailability>> {
+            unreachable!("history does not ask for availability")
+        }
+    }
+
+    #[test]
+    fn a_series_stands_for_its_bound_contract_until_the_roll() {
+        let book = brent();
+        let series = InstrumentId::new("futures:BR").unwrap();
+        let (old, bound, next) = (
+            InstrumentId::new("uid-BRV6").unwrap(),
+            InstrumentId::new("uid-BRX6").unwrap(),
+            InstrumentId::new("uid-BRZ6").unwrap(),
+        );
+        // Requests go to the bound contract; its positions and quotes come back as the series.
+        assert_eq!(book.contract(&series), bound);
+        assert_eq!(book.of_broker(bound.clone()), series);
+        assert_eq!(
+            book.of_broker(next.clone()),
+            next,
+            "another contract stays itself"
+        );
+        assert_eq!(book.other_contract_series(&old), Some(series.clone()));
+        assert_eq!(book.other_contract_series(&bound), None);
+        let sber = InstrumentId::new("sber").unwrap();
+        assert_eq!(book.contract(&sber), sber, "plain instruments pass through");
+        // No roll before 28 Oct 10:00 MSK; from then on BRX6 → BRZ6.
+        assert!(book.due_rolls(at("2026-10-28T06:59:00Z")).is_empty());
+        let rolls = book.due_rolls(at("2026-10-28T07:00:00Z"));
+        assert_eq!(rolls.len(), 1);
+        assert_eq!(
+            (
+                rolls[0].series.clone(),
+                rolls[0].from.ticker.as_str(),
+                rolls[0].to.ticker.as_str()
+            ),
+            (series, "BRX6", "BRZ6")
+        );
+    }
+
+    #[tokio::test]
+    async fn history_of_a_series_is_glued_without_a_gap_at_the_roll() {
+        let book = brent();
+        // BRV6 closes at 60 before its roll (26 Sep 07:00), BRX6 at 66 then: 10% contango.
+        let market = Daily(Map::from([
+            (
+                "uid-BRV6".to_owned(),
+                vec![("2026-09-24T00:00:00Z", 59), ("2026-09-25T00:00:00Z", 60)],
+            ),
+            (
+                "uid-BRX6".to_owned(),
+                vec![
+                    ("2026-09-25T00:00:00Z", 66),
+                    ("2026-09-28T00:00:00Z", 67),
+                    ("2026-10-20T00:00:00Z", 70),
+                ],
+            ),
+        ]));
+        let candles = book
+            .candles(
+                &market,
+                CandleHistoryRequest {
+                    instrument_id: InstrumentId::new("futures:BR").unwrap(),
+                    interval: CandleInterval::OneDay,
+                    from: at("2026-09-20T00:00:00Z"),
+                    to: at("2026-10-21T00:00:00Z"),
+                    limit: None,
+                },
+            )
+            .await
+            .unwrap();
+        let closes: Vec<(String, String)> = candles
+            .iter()
+            .map(|c| {
+                (
+                    c.time.format("%m-%d").to_string(),
+                    c.close.0.normalize().to_string(),
+                )
+            })
+            .collect();
+        // The old contract is scaled by 66/60: 59 → 64.9, 60 → 66; the bound one is as traded.
+        assert_eq!(
+            closes,
+            [
+                ("09-24", "64.9"),
+                ("09-25", "66"),
+                ("09-28", "67"),
+                ("10-20", "70")
+            ]
+            .map(|(d, c)| (d.to_owned(), c.to_owned()))
+        );
+        assert!(
+            candles
+                .iter()
+                .all(|c| c.instrument_id.as_str() == "futures:BR")
+        );
+    }
+
+    #[test]
+    fn a_roll_moves_the_position_once_and_closes_what_is_left() {
+        let book = brent();
+        let roll = book.due_rolls(at("2026-10-28T07:00:00Z"));
+        let id = |s: &str| InstrumentId::new(s).unwrap();
+        let held = |pairs: &[(&str, i64)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (id(k), *v))
+                .collect::<Map<_, _>>()
+        };
+        // 3 contracts long: close the bound one, open 3 in the next.
+        assert_eq!(
+            crate::control::roll_legs(&roll, &[], &held(&[("futures:BR", 3)]), false),
+            vec![(id("futures:BR"), 3, 0), (id("uid-BRZ6"), 0, 3)]
+        );
+        // A short is moved as a short.
+        assert_eq!(
+            crate::control::roll_legs(&roll, &[], &held(&[("futures:BR", -2)]), false),
+            vec![(id("futures:BR"), -2, 0), (id("uid-BRZ6"), 0, -2)]
+        );
+        // Both held after an abnormal interruption: only the old contract is closed.
+        assert_eq!(
+            crate::control::roll_legs(
+                &roll,
+                &[],
+                &held(&[("futures:BR", 3), ("uid-BRZ6", 3)]),
+                false
+            ),
+            vec![(id("futures:BR"), 3, 0)],
+            "the next contract is not doubled"
+        );
+        // Interrupted after closing: nothing to do but rebind.
+        assert_eq!(
+            crate::control::roll_legs(&roll, &[], &held(&[("uid-BRZ6", 3)]), false).len(),
+            0
+        );
+        // A risk block only closes; a leftover in an old contract is closed.
+        assert_eq!(
+            crate::control::roll_legs(
+                &roll,
+                &[id("uid-BRV6")],
+                &held(&[("futures:BR", 3), ("uid-BRV6", 1)]),
+                true
+            ),
+            vec![(id("futures:BR"), 3, 0), (id("uid-BRV6"), 1, 0)]
+        );
     }
 
     #[test]

@@ -143,7 +143,7 @@ fn decode(bytes: &[u8], content_type: Option<&str>) -> String {
 
 impl Fetcher {
     pub(crate) fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = crate::tls::http_client()
             .timeout(StdDuration::from_secs(20))
             .user_agent(USER_AGENT)
             .redirect(reqwest::redirect::Policy::limited(5))
@@ -541,6 +541,29 @@ pub(crate) fn html_text(fragment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// После обновления HTTP-стека: клиент строится с единственным
+    /// криптопровайдером rustls и проверяет сертификаты по системным корням.
+    #[tokio::test]
+    #[ignore = "network: reaches a public HTTPS site"]
+    async fn https_client_verifies_a_public_site() {
+        let fetcher = Fetcher::new().unwrap();
+        let response = fetcher
+            .client
+            .get("https://www.moex.com/")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success() || response.status().is_redirection());
+        assert!(
+            fetcher
+                .client
+                .get("https://self-signed.badssl.com/")
+                .send()
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn html_fragments_become_paragraphs_and_table_rows() {

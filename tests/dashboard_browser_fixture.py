@@ -165,7 +165,11 @@ control["ai_decisions"] = [
                  {"title": "javascript ссылка", "link": "javascript:alert(1)", "source": "bad", "published": ago(hours=3)}],
      "tool_calls": {"calls": [{"tool": "get_news"}, {"tool": "get_indicators"}], "feed_errors": [], "confidence_percent": 70},
      "duration_ms": 42000, "created_at": ago(hours=1)}]
-run = {"id": "fixture-run", "strategy_id": "fixture", "strategy": "pairs-trading", "classification": "clean", "started_at": stamp, "principal": 1000000, "pnl_rub": 10000, "return_percent": 1, "max_drawdown_percent": .25, "fills": 2, "rank": 1, "ranked": True}
+run = {"id": "fixture-run", "strategy_id": "fixture", "strategy": "pairs-trading", "classification": "clean", "started_at": stamp, "principal": 1000000, "pnl_rub": 10000, "return_percent": 1, "max_drawdown_percent": .25, "fills": 2, "rank": 1, "ranked": True,
+       "commission_rub": 512.4, "trades": 2, "volume_rub": 1024800,
+       "metrics": {"days": 6, "curve": [["2026-10-19", 0.4], ["2026-10-20", -0.2], ["2026-10-21", 0.6], ["2026-10-22", 0.9], ["2026-10-23", 0.7], ["2026-10-24", 1.0]],
+                   "volatility_percent": 8.4, "sharpe": 1.72, "sortino": 2.31, "worst_day_percent": -0.6,
+                   "benchmark": "SBMX", "benchmark_percent": 0.4, "excess_percent": 0.6}}
 control["ranking"]["clean"] = [run]
 control["ranking"]["history"] = [run]
 past = (now - dt.timedelta(days=1)).date().isoformat()
@@ -210,6 +214,7 @@ documents = [
 control["collector"] = [{"source": "tinvest", "last_success": ago(minutes=1), "last_error": None, "added_last": 12, "added_total": 1370},
                         {"source": "rss", "last_success": ago(minutes=3), "last_error": "finam.ru: unavailable", "added_last": 4, "added_total": 260}]
 control["topics"] = dashboard.control_module.TOPICS
+control["rules"] = {"share_only_kinds": sorted(dashboard.control_module.stand_rules.SHARE_ONLY_KINDS), "roll_days": 5}
 control["exposures"] = [
     {"ticker": "LKOH", "name": "ЛУКОЙЛ", "sector": "нефть и газ", "note": "Экспортёр нефти: выигрывает от роста Brent и слабого рубля.",
      "drafted_at": ago(days=1), "confirmed_at": None, "draft_error": None,
@@ -226,6 +231,9 @@ control["documents"] = {"total": 1630, "day": 1412, "newest": ago(minutes=1), "k
 class FakeControl:
     def data(self):
         return control
+
+    def state(self):
+        return {"cases": {c["kind"]: c for c in [case, live_case, ai_case]}}
 
     def documents(self, params):
         text = params.get("q", "").lower()
@@ -256,6 +264,15 @@ class FakeControl:
             row.update(run_mode=payload["run_mode"], trading_days=payload["days"], close_after=payload["close_after"])
             case["schedule"] = {"run_mode": payload["run_mode"], "active": False, "close_after": payload["close_after"],
                                 "windows": [window([d]) for d in payload["days"]] if payload["run_mode"] == "schedule" else []}
+        elif kind == "backtest":
+            report = {"from": payload["from"], "to": payload["to"], "sessions": 250, "capital": "1000000", "final_equity": "1123400.00",
+                      "return_percent": 12.34, "annual_return_percent": 12.3, "volatility_percent": 14.2, "sharpe": 0.87, "sortino": 1.21,
+                      "max_drawdown_percent": 8.76, "worst_day_percent": -3.1, "decisions": 250, "skipped_decisions": 2,
+                      "skip_reasons": {"instrument `X` exceeds the per-instrument exposure limit": 2}, "trades": 118,
+                      "turnover_rub": "4500000.00", "commission_rub": "2250.00", "slippage_rub": "2250.00", "risk_blocked_sessions": 1,
+                      "benchmark": {"instrument_id": "sbmx", "return_percent": 9.1, "excess_percent": 3.24},
+                      "curve_sample": [["2025-10-24", 1000000], ["2026-03-01", 960000], ["2026-10-23", 1123400]]}
+            result = {"message": "На истории: +12.34%", "report": report}
         elif kind == "ai_budget":
             result = {"before": {"rub": control["ai_budget_rub"]}, "after": payload}
             control["ai_budget_rub"] = payload["rub"]
@@ -327,5 +344,10 @@ with tempfile.TemporaryDirectory(prefix="dashboard-browser-") as temporary:
     server = ThreadingHTTPServer(("127.0.0.1", 18766), dashboard.Handler)
     server.feed = SimpleNamespace(work=work, data=lambda: json.dumps(snapshot).encode())
     server.control = FakeControl()
+    # Real-money commands ask for the operator PIN (fixture PIN 2468, fast hash).
+    server.pin = dashboard.OperatorPin(work / "operator-pin.json")
+    server.pin.ITERATIONS = 1000
+    server.pin.set("2468")
+    control["operator_pin"] = True
     print("Browser fixture listening on 18766; no broker or database", flush=True)
     server.serve_forever()

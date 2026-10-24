@@ -190,7 +190,7 @@ const HIT_COLUMNS: &str = "d.id, d.cluster_id, d.source, d.kind, d.title, d.url,
 async fn text_candidates(storage: &PostgresStorage, filter: &Filter) -> Result<Vec<Hit>> {
     let (uids, tickers, about) = subject_query(&filter.subjects);
     let kinds: Vec<&str> = filter.kinds.iter().map(|k| k.as_str()).collect();
-    let rows: Vec<Row> = sqlx::query_as(&format!(
+    let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "WITH q AS (SELECT \
            nullif(replace(plainto_tsquery('russian', $1)::text, '&', '|'), '')::tsquery AS text_q, \
            CASE WHEN $2 = '' THEN NULL ELSE to_tsquery('russian', $2) END AS about_q) \
@@ -207,7 +207,7 @@ async fn text_candidates(storage: &PostgresStorage, filter: &Filter) -> Result<V
            AND (cardinality($7::text[]) = 0 OR d.source = ANY($7)) {markup} \
          ORDER BY rank DESC, c.published_at DESC LIMIT 300",
         markup = markup_condition(9, 10)
-    ))
+    )))
     .bind(&filter.text)
     .bind(&about)
     .bind(&uids)
@@ -251,7 +251,7 @@ async fn vector_candidates(
             .execute(&mut *transaction)
             .await?;
     }
-    let rows: Vec<Row> = sqlx::query_as(&format!(
+    let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {HIT_COLUMNS}, left(c.text, 400) AS snippet, \
            (1 - ((e.embedding::halfvec({dimensions})) <=> $1::text::halfvec({dimensions})))::real AS rank, \
            (d.instruments && $2 OR d.tickers && $8 OR ($3 <> '' AND c.search @@ to_tsquery('russian', $3))) AS about \
@@ -265,7 +265,7 @@ async fn vector_candidates(
          ORDER BY (e.embedding::halfvec({dimensions})) <=> $1::text::halfvec({dimensions}) LIMIT 100",
         markup = markup_condition(9, 10),
         model = vectors.model_sql()?
-    ))
+    )))
     .bind(query)
     .bind(&uids)
     .bind(&about)
@@ -441,14 +441,14 @@ pub(crate) async fn digest(
 ) -> Result<(Vec<Hit>, i64)> {
     let now = Utc::now();
     let (uids, tickers, about) = subject_query(subjects);
-    let rows: Vec<Row> = sqlx::query_as(&format!(
+    let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "WITH q AS (SELECT CASE WHEN $2 = '' THEN NULL ELSE to_tsquery('russian', $2) END AS about_q) \
          SELECT {HIT_COLUMNS}, left(c.text, 300) AS snippet, 1.0::real AS rank, \
            (d.instruments && $3 OR d.tickers && $4 OR (q.about_q IS NOT NULL AND c.search @@ q.about_q)) AS about \
          FROM documents d JOIN document_chunks c ON c.document_id = d.id AND c.ord = 0, q \
          WHERE d.published_at >= $1 AND d.status <> 'skipped' \
          ORDER BY d.published_at DESC LIMIT 3000"
-    ))
+    )))
     .bind(since)
     .bind(&about)
     .bind(&uids)

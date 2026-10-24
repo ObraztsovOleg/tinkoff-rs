@@ -41,9 +41,35 @@ def windows(start, end, name):
         start = stop
 
 
-def refresh(api, instrument, name, cache, persist):
+CONTRACTS = {}
+
+
+def contract_of(api, uid):
+    """The instrument whose candles chart `uid`: itself, or for a continuous futures
+    series (`futures:BR`) its current contract, the one the stand trades. None when
+    the series has no contract to trade."""
+    rules = campaign.control_plane
+    match = rules.SERIES_ID.fullmatch(uid)
+    if not match:
+        return uid
+    current = campaign.now()
+    if not CONTRACTS.get("at") or current - CONTRACTS["at"] > dt.timedelta(hours=1):
+        CONTRACTS["list"] = api.call("InstrumentsService/Futures", {"instrumentStatus": "INSTRUMENT_STATUS_BASE"}).get("instruments", [])
+        CONTRACTS["at"] = current
+    contracts = sorted((f for f in CONTRACTS["list"] if rules.series_code(f.get("ticker")) == match.group(1)
+                        and f.get("lastTradeDate") and rules.roll_at(f["lastTradeDate"]) > current),
+                       key=lambda f: f["lastTradeDate"])
+    return contracts[0]["uid"] if contracts else None
+
+
+def refresh(api, instrument, name, cache, persist, source=None):
     asset = cache.setdefault("assets", {}).setdefault(instrument["uid"], {"ticker": instrument["ticker"], "series": {}})
     asset["ticker"] = instrument["ticker"]
+    source = source or instrument["uid"]
+    if asset.get("contract", source) != source:
+        # A series moved to the next contract: prices of the old one do not continue the chart.
+        asset["series"] = {}
+    asset["contract"] = source
     previous = asset["series"].get(name, {})
     interval, retention, seconds, _, limit = INTERVALS[name]
     end = campaign.now()
@@ -55,7 +81,7 @@ def refresh(api, instrument, name, cache, persist):
     merged = {c["time"]: c for c in previous.get("candles", []) if campaign.timestamp(c["time"]) >= cutoff}
     try:
         for beginning, ending in windows(start, end, name):
-            response = api.call("MarketDataService/GetCandles", {"instrumentId": instrument["uid"],
+            response = api.call("MarketDataService/GetCandles", {"instrumentId": source,
                 "interval": interval, "from": beginning.isoformat(), "to": ending.isoformat(), "limit": limit})
             for candle in response.get("candles", []):
                 if not cutoff <= campaign.timestamp(candle["time"]) <= end:
@@ -98,7 +124,13 @@ def update(api, state, cache, persist, requested=None, *, background_limit=None)
             if background_count >= background_limit:
                 continue
             background_count += 1
-        refresh(api, instruments[uid], name, cache, persist)
+        try:
+            source = contract_of(api, uid)
+        except (RuntimeError, ValueError, KeyError):
+            print(f"Futures contracts temporarily unavailable: {instruments[uid]['ticker']}", flush=True)
+            continue
+        if source:
+            refresh(api, instruments[uid], name, cache, persist, source)
 
 
 def read(path, default):

@@ -121,7 +121,7 @@ function renderDetailTrades() {
   $("planned-trades").innerHTML=plans.length ? table(["Направление","Лоты","Цена","Состояние"],plans.map(o=>`<tr><td>${side(o.side)}${o.maintenance ? '<span class="subtext warning">Служебное закрытие</span>' : ""}</td><td>${fmt(o.lots)}<span class="subtext">Цель: ${fmt(o.target_lots)} лот.</span></td><td>${o.limit_price==null ? "По рынку" : fmt(o.limit_price,2)}</td><td>${badge(detailStatuses[o.status] || o.status,o.status === "uncertain" ? "warn" : "waiting")}</td></tr>`)) : empty("Запланированных заявок нет","Стратегия ещё не сохранила актуальную заявку по этому активу.");
   const latest=(data.targets || []).filter(t=>t.strategy===c.kind && !t.maintenance).sort((a,b)=>String(b.generated_at).localeCompare(a.generated_at))[0];
   const weight=latest?.weights.find(w=>w.instrument_id===$("asset-select").value);
-  $("target-summary").textContent=weight ? `Последняя цель: ${fmt(weight.weight*100,2)}% портфеля · ${datetime(latest.generated_at)} МСК${Date.parse(latest.valid_until) <= Date.now() ? " · срок исполнения истёк" : ""}. Целевая доля не является обещанием сделки.` : "Будущий сигнал неизвестен. Здесь отображаются только сохранённые планы, без прогнозирования новых сделок.";
+  $("target-summary").textContent=weight ? `Последняя цель: ${fmt(weight.weight*100,2)}% портфеля · ${datetime(latest.generated_at)} МСК${Date.parse(latest.valid_until) <= Date.now() ? " · срок исполнения истёк" : ""}${latest.status==="awaiting_fills" && latest.reason ? ` · ждёт: ${latest.reason}` : ""}. Целевая доля не является обещанием сделки.` : "Будущий сигнал неизвестен. Здесь отображаются только сохранённые планы, без прогнозирования новых сделок.";
 }
 
 async function loadMarket(force=false) {

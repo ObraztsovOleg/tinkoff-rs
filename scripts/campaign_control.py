@@ -22,9 +22,35 @@ AI_PARAMS = {"model_profile", "instructions", "news_hours", "max_tool_rounds", "
              "decision_interval_minutes", "news_burst_items", "price_jump_percent", "material_importance",
              "market_move_percent", "commodity_move_percent", "currency_move_percent"}
 PROFILE_NAME = re.compile(r"[A-Za-z0-9_-]{1,40}")
+# Rules shared with the bot and the dashboard; build.rs turns the same file into
+# Rust constants, so they cannot drift apart.
+RULES = json.loads((Path(__file__).resolve().parents[1] / "contracts" / "stand-rules.json").read_text())
 # Strategies computed from company reports and dividends trade shares only.
-SHARE_ONLY_KINDS = {"value-composite", "quality-profitability", "value-momentum", "multi-factor", "dividend-month"}
-SUPERVISOR_COMMANDS = ("mode", "universe", "portfolio", "portfolio_create", "live_accounts", "live_promote", "ai_check", "ai_preview")
+SHARE_ONLY_KINDS = frozenset(RULES["share_only_kinds"])
+# A continuous futures series: the stand trades its current contract and rolls
+# to the next one ROLL_DAYS before its last trading day, at the start of the
+# main session (`futures:BR`, `futures:Si`).
+SERIES_ID = re.compile(re.escape(RULES["futures"]["series_prefix"]) + r"([A-Za-z0-9]{1,4})")
+# Dated MOEX futures: two-character code, month letter, year digit (BRX6, SiZ6).
+DATED_FUTURES = re.compile(r"([A-Za-z0-9]{2})[" + RULES["futures"]["month_letters"] + r"]\d")
+ROLL_DAYS = RULES["futures"]["roll_days"]
+ROLL_TIME_UTC = dt.time.fromisoformat(RULES["futures"]["roll_time_utc"])
+# Market topics of the AI model: id → name.
+TOPICS = {topic["id"]: topic["name"] for topic in RULES["topics"]}
+
+
+def roll_at(last_trade_date):
+    """When a series leaves the contract with this last trading day."""
+    last = dt.datetime.fromisoformat(last_trade_date.replace("Z", "+00:00"))
+    return dt.datetime.combine(last.date() - dt.timedelta(days=ROLL_DAYS), ROLL_TIME_UTC, dt.timezone.utc)
+
+
+def series_code(ticker):
+    """`BRX6` → `BR`; None for perpetual futures and other instruments."""
+    match = DATED_FUTURES.fullmatch(ticker or "")
+    return match.group(1) if match else None
+SUPERVISOR_COMMANDS = ("mode", "universe", "portfolio", "portfolio_create", "live_accounts", "live_promote", "ai_check", "ai_preview",
+                       "backtest")
 PORTFOLIO_NAME = re.compile(r"[a-z0-9][a-z0-9-]{2,40}")
 # Columns a new revision inherits from the strategy it replaces.
 INHERITED = "execution_mode,execution_budget,run_mode,trading_days,close_after,schedule_initialized"
@@ -43,7 +69,7 @@ def read(campaign, state):
       'pending',coalesce((SELECT json_agg(q) FROM (SELECT id,COALESCE(execution_strategy_id,strategy_id) AS strategy_id,created_at FROM control_commands WHERE status IN ('queued','running') ORDER BY created_at) q),'[]'),
       'closed',coalesce((SELECT json_agg(c.strategy_id) FROM strategy_controls c WHERE NOT c.enabled AND NOT c.needs_service AND NOT c.cleanup_requested AND (SELECT q.kind FROM control_commands q WHERE COALESCE(q.execution_strategy_id,q.strategy_id)=c.strategy_id AND q.status='succeeded' AND q.kind IN ('cleanup','manual_order','resume','universe') ORDER BY q.created_at DESC LIMIT 1)='cleanup'),'[]'),
       'live',(SELECT row_to_json(l) FROM (SELECT halted,halted_at,min_sessions,min_fills,require_no_risk_block FROM live_settings WHERE id) l),
-      'commands',coalesce((SELECT json_agg(q) FROM (SELECT * FROM control_commands WHERE kind IN ('mode','universe','portfolio','portfolio_create','live_accounts','live_promote','ai_check','ai_preview') AND status IN ('queued','running') ORDER BY created_at) q),'[]'))"""))
+      'commands',coalesce((SELECT json_agg(q) FROM (SELECT * FROM control_commands WHERE kind IN ('mode','universe','portfolio','portfolio_create','live_accounts','live_promote','ai_check','ai_preview','backtest') AND status IN ('queued','running') ORDER BY created_at) q),'[]'))"""))
 
 
 def initialize(campaign, state):
@@ -270,8 +296,15 @@ def validate_blocks(blocks, benchmark_uid=None):
         if not isinstance(strategies, list) or not 1 <= len(strategies) <= 6:
             raise ValueError(f"Блок {index}: добавьте от 1 до 6 стратегий")
         kinds = [s.get("kind") if isinstance(s, dict) else None for s in strategies]
-        if len(set(kinds)) != len(kinds):
+        # Повтор допустим только у ИИ-моделей (соревнование на одном наборе):
+        # решение адресуется компоненте по профилю, поэтому профили явные и разные.
+        plain = [kind for kind in kinds if kind != "ai-model"]
+        if len(set(plain)) != len(plain):
             raise ValueError(f"Блок {index}: стратегия указана дважды")
+        profiles = [((s.get("params") or {}).get("model_profile") if isinstance(s, dict) else None)
+                    for s in strategies if isinstance(s, dict) and s.get("kind") == "ai-model"]
+        if len(profiles) > 1 and (not all(profiles) or len(set(profiles)) != len(profiles)):
+            raise ValueError(f"Блок {index}: у каждой ИИ-модели блока должен быть свой профиль модели")
         for strategy in strategies:
             if set(strategy) - {"kind", "weight", "params"} or strategy.get("kind") not in STRATEGY_KINDS:
                 raise ValueError(f"Блок {index}: неизвестная стратегия")
@@ -508,18 +541,12 @@ def gate_failures(stats, settings, ai=False):
     return failures
 
 
-# Tariff defaults, % of a trade's volume (T-Invest, 2026). A rate measured from the
-# commissions actually charged replaces them once there is enough evidence.
-TARIFF_RATES = {
-    "sandbox": {"default": 0.05},
-    "investor": {"share": 0.3, "etf": 0.3, "bond": 0.3, "futures": 0.04, "currency": 0.5, "default": 0.3},
-    "trader": {"share": 0.05, "etf": 0.05, "bond": 0.05, "futures": 0.04, "currency": 0.5, "default": 0.05},
-    "premium": {"share": 0.04, "etf": 0.04, "bond": 0.04, "futures": 0.025, "currency": 0.04, "default": 0.04},
-}
-UNKNOWN_TARIFF = {"default": 0.3}
-MEASURE_DAYS = 90
-MEASURE_MIN_TRADES = 5
-MEASURE_MIN_VOLUME = 100_000
+# Tariff defaults, % of a trade's volume, and how much evidence a measured rate needs.
+TARIFF_RATES = RULES["commissions"]["tariffs"]
+UNKNOWN_TARIFF = RULES["commissions"]["unknown_tariff"]
+MEASURE_DAYS = RULES["commissions"]["measure_days"]
+MEASURE_MIN_TRADES = RULES["commissions"]["min_trades"]
+MEASURE_MIN_VOLUME = RULES["commissions"]["min_volume_rub"]
 
 
 def money_value(value):
@@ -527,9 +554,10 @@ def money_value(value):
     return int((value or {}).get("units") or 0) + int((value or {}).get("nano") or 0) / 1e9
 
 
-def measure_commissions(api, accounts, sandbox, since, point_values=None):
+def measure_commissions(api, accounts, sandbox, since, point_values=None, trades=None):
     """Commission and volume of the stand's trades by instrument type. A futures
-    trade has no cash payment: its volume is price × quantity × point value."""
+    trade has no cash payment: its volume is price × quantity × point value.
+    Each trade is also appended to `trades` when a list is given."""
     method = "SandboxService/GetSandboxOperationsByCursor" if sandbox else "OperationsService/GetOperationsByCursor"
     point_values = {} if point_values is None else point_values
     totals = {}
@@ -555,10 +583,14 @@ def measure_commissions(api, accounts, sandbox, since, point_values=None):
                     volume = abs(money_value(item.get("price"))) * int(item.get("quantityDone") or 0) * point_values[uid]
                 if volume <= 0:
                     continue
+                commission = abs(money_value(item.get("commission")))
                 row = totals.setdefault(kind, {"trades": 0, "volume": 0.0, "commission": 0.0})
                 row["trades"] += 1
                 row["volume"] += volume
-                row["commission"] += abs(money_value(item.get("commission")))
+                row["commission"] += commission
+                if trades is not None and item.get("id") and item.get("date"):
+                    trades.append({"id": item["id"], "account": account, "at": item["date"], "kind": kind,
+                                   "volume": volume, "commission": commission})
             cursor = page.get("nextCursor") or ""
             if not page.get("hasNext") or not cursor:
                 break
@@ -591,13 +623,27 @@ def calibrate_commissions(campaign, state, sandbox_api):
         accounts = sorted({c["account_id"] for c in state.get("cases", {}).values()
                            if (c.get("contour") == "production") == (contour == "production")})
         tariff = "sandbox" if contour == "sandbox" else (api.call("UsersService/GetInfo", {}).get("tariff") or "unknown")
-        rows = commission_rows(tariff, measure_commissions(api, accounts, contour == "sandbox", since))
+        trades = []
+        rows = commission_rows(tariff, measure_commissions(api, accounts, contour == "sandbox", since, trades=trades))
         values = ",".join("(" + ",".join([literal(contour), literal(r["kind"]), literal(f"{r['rate']:.5f}"), literal(r["source"]),
                                             literal(tariff), str(int(r["trades"])), literal(f"{r['volume']:.2f}"),
                                             literal(f"{r['commission']:.2f}")]) + ",now())" for r in rows)
         campaign.run_sql(state, "BEGIN; DELETE FROM commission_rates WHERE contour=" + literal(contour) + "; "
                          "INSERT INTO commission_rates(contour,kind,rate_percent,source,tariff,trades,volume_rub,commission_rub,updated_at) VALUES "
                          + values + "; COMMIT;")
+        store_trade_commissions(campaign, state, trades)
+
+
+def store_trade_commissions(campaign, state, trades, chunk=300):
+    """What each trade cost: the dashboard sums it over a portfolio's run. A psql
+    argument has a size limit, so the rows go in chunks."""
+    for start in range(0, len(trades), chunk):
+        values = ",".join("(" + ",".join([literal(t["id"]), literal(t["account"]), literal(t["at"]) + "::timestamptz",
+                                          literal(t["kind"]), literal(f"{t['volume']:.2f}"), literal(f"{t['commission']:.2f}")]) + ")"
+                          for t in trades[start:start + chunk])
+        campaign.run_sql(state, "INSERT INTO trade_commissions(operation_id,account_id,executed_at,kind,volume_rub,commission_rub) VALUES "
+                         + values + " ON CONFLICT (operation_id) DO UPDATE SET volume_rub=EXCLUDED.volume_rub,"
+                         "commission_rub=EXCLUDED.commission_rub")
 
 
 # USD/RUB of the Moscow Exchange (USD000UTSTOM): AI model prices in dollars become rubles.
@@ -773,28 +819,38 @@ AI_JOB_SECONDS = 900
 
 
 def ai_job(campaign, state, command):
-    """Model check or dry-run analysis in a background process: a slow model never
-    blocks the supervisor. The bot records previews in ai_decisions itself."""
+    """Model check, dry-run analysis or a backtest in a background process: slow
+    work never blocks the supervisor. The bot records previews in ai_decisions itself."""
     jobs = state.setdefault("ai_jobs", {})
     job = jobs.get(command["id"])
     payload = command["payload"]
+    env_case = None
     if command["kind"] == "ai_preview":
         case = next((c for c in state["cases"].values() if c["strategy_id"] == payload.get("strategy_id")), None)
         if not case or 'kind = "ai-model"' not in (campaign.WORK / case["config"]).read_text():
             raise ValueError("В портфеле нет стратегии ИИ-модели")
-        args = ["ai-preview"]
+        args, env_case = ["ai-preview"], case
+    elif command["kind"] == "backtest":
+        case = next((c for c in state["cases"].values() if c["strategy_id"] == payload.get("strategy_id")), None)
+        if not case:
+            raise ValueError("Портфель не найден")
+        # History is read through the Sandbox contour even for a real-account portfolio.
+        args = ["backtest", "--from", payload["from"], "--to", payload["to"], "--slippage-bps", str(payload["slippage_bps"])]
+        if (state.get("benchmark") or {}).get("uid"):
+            args += ["--benchmark", state["benchmark"]["uid"]]
     else:
         case = next(iter(state["cases"].values()))
-        args = ["ai-check"] + (["--profile", payload["profile"]] if payload.get("profile") else [])
+        args, env_case = ["ai-check"] + (["--profile", payload["profile"]] if payload.get("profile") else []), case
     if not job:
         output = campaign.WORK / "logs" / ("ai-" + command["id"] + ".out")
         output.parent.mkdir(exist_ok=True)
         with output.open("w") as out:
             child = campaign.subprocess.Popen([str(campaign.BINARY), "--config", str(campaign.WORK / case["config"]), *args],
-                                              env=campaign.environment(state, case), stdout=out, stderr=campaign.subprocess.STDOUT, start_new_session=True)
+                                              env=campaign.environment(state, env_case), stdout=out, stderr=campaign.subprocess.STDOUT, start_new_session=True)
         jobs[command["id"]] = {"pid": child.pid, "output": str(output), "started": campaign.now().isoformat()}
         campaign.persist(state)
-        finish(campaign, state, command, "running", {"message": "Модель анализирует…" if command["kind"] == "ai_preview" else "Проверяем подключение…"})
+        finish(campaign, state, command, "running", {"message": {"ai_preview": "Модель анализирует…", "backtest": "Считаем на истории…"}.get(
+            command["kind"], "Проверяем подключение…")})
         return
     output = Path(job["output"])
     if campaign.process_alive(job["pid"], str(campaign.BINARY)):
@@ -802,7 +858,7 @@ def ai_job(campaign, state, command):
             campaign.os.kill(job["pid"], campaign.signal.SIGTERM)
             jobs.pop(command["id"])
             campaign.persist(state)
-            raise ValueError("Модель не ответила за 15 минут")
+            raise ValueError("Проверка на истории не закончилась за 15 минут" if command["kind"] == "backtest" else "Модель не ответила за 15 минут")
         return
     jobs.pop(command["id"])
     campaign.persist(state)
@@ -811,6 +867,11 @@ def ai_job(campaign, state, command):
     lines = [line for line in text.splitlines() if line.strip()]
     result = next((json.loads(line) for line in reversed(lines) if line.startswith("{")), None)
     error = next((line.split("error=", 1)[1] for line in reversed(lines) if "error=" in line), None)
+    if command["kind"] == "backtest":
+        if not result or "final_equity" not in result:
+            raise ValueError("Проверка на истории не удалась: " + (error or "нет результата")[:500])
+        finish(campaign, state, command, "succeeded", {"message": backtest_summary(result), "report": result})
+        return
     if command["kind"] == "ai_check":
         if not result:
             raise ValueError("Модель недоступна: " + (error or "нет ответа")[:500])
@@ -822,6 +883,19 @@ def ai_job(campaign, state, command):
         raise ValueError("Пробный анализ не удался: " + ((previews[0]["error"] if previews else error) or "нет ответа")[:500])
     weights = ", ".join(f"{w['ticker']} {w['weight_percent']}%" for p in good for w in p["weights"]) or "без позиций"
     finish(campaign, state, command, "succeeded", {"message": "Пробный анализ: " + weights + " — подробности в «Решениях модели»"})
+
+
+def backtest_summary(report):
+    """One line for the command journal."""
+    def number(value, digits=2):
+        return "—" if value is None else f"{value:+.{digits}f}"
+    benchmark = report.get("benchmark")
+    line = (f"На истории {report['from']} — {report['to']}: {number(report['return_percent'])}% "
+            f"(просадка {report['max_drawdown_percent']:.2f}%, Шарп {number(report.get('sharpe'))}, "
+            f"сделок {report['trades']}, комиссии {float(report['commission_rub']):,.0f} ₽)").replace(",", " ")
+    if benchmark:
+        line += f"; ориентир {number(benchmark['return_percent'])}%"
+    return line
 
 
 def process(campaign, state):
@@ -841,7 +915,7 @@ def process(campaign, state):
                 live_accounts(campaign, state, command)
             elif command["kind"] == "live_promote":
                 live_promote(campaign, state, command)
-            elif command["kind"] in {"ai_check", "ai_preview"}:
+            elif command["kind"] in {"ai_check", "ai_preview", "backtest"}:
                 ai_job(campaign, state, command)
             else:
                 universe(campaign, state, command)

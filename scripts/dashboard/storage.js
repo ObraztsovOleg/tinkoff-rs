@@ -27,6 +27,13 @@ function renderStorage() {
   $("storage-content").innerHTML=`<div class="storage-grid">
     <div><h3>Диск ${badge(level[0],level[1])}</h3>${readings ? `<ul class="plain-list">${readings}</ul>` : '<p class="muted-text">Наблюдатель ещё не проверял место.</p>'}<p class="detail-note">База данных: ${bytes(disk.database_bytes ?? upkeep.database_bytes)}${disk.checked_at ? ` · проверено ${esc(ageText(disk.checked_at))}` : ""}</p></div>
     <div><h3>Обслуживание</h3>${upkeep.at ? `<p>Последнее: ${esc(datetime(upkeep.at))} МСК${upkeep.seconds!=null ? ` · ${fmt(upkeep.seconds,1)} с` : ""}</p><p class="detail-note">${deleted ? `Удалено устаревшее: ${esc(deleted)}.` : "Удалять было нечего."}${(upkeep.rotated_logs || []).length ? ` Журналы сжаты: ${esc(upkeep.rotated_logs.join(", "))}.` : ""}</p>` : '<p class="muted-text">Ещё не выполнялось: каждую ночь в 03:30 МСК.</p>'}${upkeep.error ? `<p class="warning">Ошибка: ${esc(upkeep.error)}; повтор через час.</p>` : ""}</div>
-    <div><h3>Резервные копии</h3>${status ? `<p class="${status.ok ? "" : "warning"}">${status.ok ? "Последняя копия сделана" : "Копия не сделана"}: ${esc(datetime(status.at))} МСК${status.ok ? "" : ` — ${esc(status.message)}`}</p>` : '<p class="muted-text">Копий пока нет: служба backup делает их каждую ночь.</p>'}${files ? `<ul class="plain-list">${files}</ul>` : ""}<p class="detail-note">Хранятся последние копии в томе стенда (/data/backups).</p></div>
+    <div><h3>Резервные копии</h3>${status ? `<p class="${status.ok ? "" : "warning"}">${status.ok ? "Последняя копия сделана" : "Копия не сделана"}: ${esc(datetime(status.at))} МСК${status.ok ? "" : ` — ${esc(status.message)}`}</p>` : '<p class="muted-text">Копий пока нет: служба backup делает их каждую ночь.</p>'}${files ? `<ul class="plain-list">${files}</ul>` : ""}<p class="detail-note">Хранятся последние копии в томе стенда (/data/backups).</p>${offsiteHtml(copies.offsite)}</div>
   </div>`;
+}
+
+// Encrypted copies in an S3 bucket (off the computer); off until the settings file exists.
+function offsiteHtml(o) {
+  if(!o || !o.at)return '<p class="detail-note">Копии вне компьютера выключены: заполните docker/local/backup/s3.env (см. «Резервные копии» в docs/DOCKER.ru.md).</p>';
+  if(!o.ok)return `<p class="warning">Копия вне компьютера не отправлена: ${esc(o.error || "ошибка")} (${esc(datetime(o.at))} МСК)</p>`;
+  return `<p>Вне компьютера: последняя копия ${esc(o.latest || "—")} в бакете ${esc(o.bucket || "")}, проверено ${esc(datetime(o.at))} МСК${o.removed ? ` · удалено устаревших: ${fmt(o.removed)}` : ""}</p>`;
 }

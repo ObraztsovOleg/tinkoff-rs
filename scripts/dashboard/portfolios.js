@@ -41,6 +41,25 @@ function lastResult(c) {
   return runs[0];
 }
 
+// Signed percent: "+1,25%" / "−0,40%".
+const signedPercent=(value,digits=2,unit="%")=>value==null || !Number.isFinite(Number(value)) ? "—" : `${Number(value)>0 ? "+" : ""}${fmt(Number(value),digits)}${unit}`;
+
+// Cumulative return of the run day by day, with the zero line when it is crossed.
+function sparkline(curve) {
+  if(!curve || curve.length<2)return "";
+  const values=[0,...curve.map(p=>Number(p[1]))], low=Math.min(...values), high=Math.max(...values), span=high-low || 1;
+  const x=i=>(i/(values.length-1)*200).toFixed(1), y=v=>(34-(v-low)/span*30).toFixed(1);
+  const zero=low<0 && high>0 ? `<line x1="0" x2="200" y1="${y(0)}" y2="${y(0)}"></line>` : "";
+  return `<svg class="spark${values.at(-1)<0 ? " down" : ""}" viewBox="0 0 200 36" preserveAspectRatio="none" role="img" aria-label="Доходность по дням: ${esc(signedPercent(values.at(-1)))}">${zero}<polyline points="${values.map((v,i)=>`${x(i)},${y(v)}`).join(" ")}"></polyline></svg>`;
+}
+
+function metricsFacts(result) {
+  const m=result?.metrics;
+  if(!m)return "";
+  const ratio=v=>v==null ? "—" : fmt(v,2), few=m.days<5 ? `<span class="subtext">нужно 5 дней, есть ${m.days}</span>` : "";
+  return `<dl class="portfolio-facts portfolio-metrics"><div><dt>${m.benchmark ? `К ${esc(m.benchmark)}` : "К индексу"}</dt><dd title="${m.benchmark ? `${esc(m.benchmark)} за тот же период: ${esc(signedPercent(m.benchmark_percent))}` : "Нет данных бенчмарка"}">${m.excess_percent!=null ? signedPercent(m.excess_percent,2," п.п.") : "—"}</dd></div><div><dt>Шарп / Сортино</dt><dd title="Годовые, без безрисковой ставки">${ratio(m.sharpe)} / ${ratio(m.sortino)}${few}</dd></div><div><dt>Волатильность</dt><dd title="Годовая, по дневным изменениям">${m.volatility_percent!=null ? fmt(m.volatility_percent,1)+"%" : "—"}</dd></div><div><dt>Комиссии</dt><dd title="Сделок по данным брокера: ${fmt(result.trades)}">${fmt(result.commission_rub,0)} ₽</dd></div></dl>${sparkline(m.curve)}`;
+}
+
 function lastActivity(c) {
   const orders=data.orders.filter(o=>o.strategy_id===c.strategy_id).sort((a,b)=>Date.parse(b.updated_at || b.created_at)-Date.parse(a.updated_at || a.created_at));
   return orders[0] ? `Последняя заявка: ${datetime(orders[0].updated_at || orders[0].created_at)}` : "Заявок ещё не было";
@@ -55,7 +74,8 @@ function portfolioCard(c) {
   const positions=account?.positions || [];
   return `<article class="portfolio-card${c.contour==="production" ? " live" : ""}">
     <div class="portfolio-head"><div><a class="portfolio-name" href="#strategy/${encodeURIComponent(c.kind)}">${esc(displayName(c))}</a><span class="subtext">${esc(c.kind)} · счёт ${esc(c.account_id.slice(0,8))}</span></div><div class="portfolio-badges">${c.contour==="production" ? badge("Реальный счёт","live") : badge("Песочница","sandbox")}${badge(state,type)}</div></div>
-    <dl class="portfolio-facts"><div><dt>Стоимость счёта</dt><dd>${account?.equity!=null ? fmt(account.equity) + " ₽" : "—"}</dd></div><div><dt>Результат</dt><dd>${result?.return_percent!=null ? `${result.return_percent>0 ? "+" : ""}${fmt(result.return_percent,2)}%` : "—"}</dd></div><div><dt>Позиции</dt><dd title="${esc(positions.map(p=>p.instrument).join(", "))}">${positions.length}</dd></div><div><dt>Расписание</dt><dd>${esc(scheduleSummary(c))}</dd></div></dl>
+    <dl class="portfolio-facts"><div><dt>Стоимость счёта</dt><dd>${account?.equity!=null ? fmt(account.equity) + " ₽" : "—"}</dd></div><div><dt>Результат</dt><dd>${result?.return_percent!=null ? signedPercent(result.return_percent) : "—"}${result?.max_drawdown_percent ? `<span class="subtext">просадка ${fmt(result.max_drawdown_percent,2)}%</span>` : ""}</dd></div><div><dt>Позиции</dt><dd title="${esc(positions.map(p=>p.instrument).join(", "))}">${positions.length}</dd></div><div><dt>Расписание</dt><dd>${esc(scheduleSummary(c))}</dd></div></dl>
+    ${metricsFacts(result)}
     <div class="pf-blocks">${blocks}</div>
     <div class="portfolio-foot"><span>${esc(lastActivity(c))}</span><a href="#strategy/${encodeURIComponent(c.kind)}">Открыть →</a></div>
   </article>`;

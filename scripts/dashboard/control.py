@@ -5,6 +5,7 @@ import datetime as dt
 from decimal import Decimal, InvalidOperation
 import importlib.util
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -16,6 +17,8 @@ SPEC = importlib.util.spec_from_file_location("dashboard_campaign", Path(__file_
 campaign = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(campaign)
 
+MSK = dt.timezone(dt.timedelta(hours=3))
+
 
 class ClientError(ValueError):
     def __init__(self, message, status=400):
@@ -24,8 +27,9 @@ class ClientError(ValueError):
 
 
 DOCUMENT_KINDS = {"news", "article", "disclosure", "press_release", "report", "exchange", "regulator"}
-# Market topics of the AI model; the same list as src/bin/support/documents/topics.rs.
-TOPICS = {"geopolitics": "геополитика и переговоры", "sanctions": "санкции и ограничения", "oil": "нефть и нефтепродукты", "gas": "газ и СПГ", "metals": "металлы и сталь", "gold": "золото и драгметаллы", "coal": "уголь", "fertilizers": "удобрения и агро", "ruble": "курс рубля", "key_rate": "ключевая ставка и политика ЦБ", "inflation": "инфляция", "budget": "бюджет и госфинансы", "taxes": "налоги и пошлины", "dividends": "дивидендная политика", "banking": "банки и кредитование", "consumer": "потребительский спрос и розница", "real_estate": "недвижимость и ипотека", "tech": "технологии и импортозамещение", "telecom": "связь и телеком", "power": "электроэнергетика и тарифы", "transport": "транспорт, логистика, авиация", "china": "Китай", "world_markets": "мировые рынки и ФРС", "market_regulation": "регулирование рынка", "corporate": "корпоративные события эмитента"}
+# Rules shared with the bot and the supervisor: contracts/stand-rules.json.
+stand_rules = campaign.control_plane
+TOPICS = stand_rules.TOPICS
 
 
 def literal(value):
@@ -42,27 +46,13 @@ def identifier(value):
         raise ClientError("Ожидается UUID идентификатор") from None
 
 
-# A continuous futures series: the stand trades its current contract and rolls
-# to the next one before expiry (`futures:BR`, `futures:Si`).
-SERIES_ID = re.compile(r"futures:([A-Za-z0-9]{1,4})")
-# Dated MOEX futures: two-character code, month letter, year digit (BRX6, SiZ6).
-DATED_FUTURES = re.compile(r"([A-Za-z0-9]{2})[FGHJKMNQUVXZ]\d")
-# Days before the last trading day when the series moves to the next contract, at the
-# start of the main session (10:00 MSK); the bot uses the same rule.
-ROLL_DAYS = 5
-ROLL_TIME_UTC = dt.time(7, 0)
-
-
-def roll_at(last_trade_date):
-    last = dt.datetime.fromisoformat(last_trade_date.replace("Z", "+00:00"))
-    return dt.datetime.combine(last.date() - dt.timedelta(days=ROLL_DAYS), ROLL_TIME_UTC, dt.timezone.utc)
+SERIES_ID, DATED_FUTURES, ROLL_DAYS = stand_rules.SERIES_ID, stand_rules.DATED_FUTURES, stand_rules.ROLL_DAYS
+roll_at, series_code = stand_rules.roll_at, stand_rules.series_code
 # Instruments the stand trades: settled in rubles on MOEX, with a known value of a price unit.
 TRADABLE_KINDS = {"share", "etf", "bond", "futures", "currency"}
 INSTRUMENT_TYPES = {"share": "INSTRUMENT_TYPE_SHARE", "etf": "INSTRUMENT_TYPE_ETF", "bond": "INSTRUMENT_TYPE_BOND",
                     "futures": "INSTRUMENT_TYPE_FUTURES", "currency": "INSTRUMENT_TYPE_CURRENCY",
                     "option": "INSTRUMENT_TYPE_OPTION", "sp": "INSTRUMENT_TYPE_SP"}
-# Strategies computed from company reports and dividends: shares only.
-SHARE_ONLY_KINDS = {"value-composite", "quality-profitability", "value-momentum", "multi-factor", "dividend-month"}
 
 
 def instrument_id(value):
@@ -78,10 +68,6 @@ def quotation(value):
         return None
     return int(value.get("units") or 0) + int(value.get("nano") or 0) / 1e9
 
-
-def series_code(ticker):
-    match = DATED_FUTURES.fullmatch(ticker or "")
-    return match.group(1) if match else None
 
 
 def amount(value, *, price=False):
@@ -117,7 +103,7 @@ def validate(body, state):
               "live_gate": {"min_sessions", "min_fills", "min_ai_decisions", "require_no_risk_block"},
               "live_promote": {"source_strategy_id", "account_id", "kind", "title", "budget", "daily_loss_percent",
                                "max_drawdown_percent", "confirm"},
-              "ai_check": {"profile"}, "ai_preview": {"strategy_id"},
+              "ai_check": {"profile"}, "ai_preview": {"strategy_id"}, "backtest": {"strategy_id", "from", "to", "slippage_bps"},
               "exposure_set": {"ticker", "topic", "sensitivity", "note"}, "exposure_confirm": {"ticker"}, "exposure_redraft": {"ticker"}}
     if not isinstance(kind, str) or kind not in fields or not isinstance(payload, dict) or set(payload) - fields[kind]:
         raise ClientError("Неизвестная команда или параметры")
@@ -221,8 +207,10 @@ def validate(body, state):
         validate_promotion(payload, state)
     if kind == "ai_check" and "profile" in payload and not (isinstance(payload["profile"], str) and campaign.control_plane.PROFILE_NAME.fullmatch(payload["profile"])):
         raise ClientError("Профиль модели — латиница, цифры, - и _")
-    if kind == "ai_preview" and payload.get("strategy_id") not in {c["strategy_id"] for c in state.get("cases", {}).values()}:
+    if kind in {"ai_preview", "backtest"} and payload.get("strategy_id") not in {c["strategy_id"] for c in state.get("cases", {}).values()}:
         raise ClientError("Выберите портфель стенда")
+    if kind == "backtest":
+        validate_backtest(payload)
     if kind in {"exposure_set", "exposure_confirm", "exposure_redraft"}:
         if not isinstance(payload.get("ticker"), str) or not re.fullmatch(r"[A-Z0-9]{1,12}", payload["ticker"]):
             raise ClientError("Тикер — латиница и цифры")
@@ -253,11 +241,29 @@ def validate(body, state):
 
 
 GLOBAL_COMMANDS = {"mode", "catalog_add", "runtime_limit", "trade_band", "ai_budget", "portfolio_create",
-                   "live_accounts", "live_promote", "live_halt", "live_resume", "live_gate", "ai_check", "ai_preview",
+                   "live_accounts", "live_promote", "live_halt", "live_resume", "live_gate", "ai_check", "ai_preview", "backtest",
                    "exposure_set", "exposure_confirm", "exposure_redraft"}
 # Applied by the dashboard in one transaction: they need neither the broker nor the account lease.
 IMMEDIATE_COMMANDS = {"schedule", "runtime_limit", "trade_band", "ai_budget", "live_halt", "live_resume", "live_gate",
                       "exposure_set", "exposure_confirm", "exposure_redraft"}
+# With an operator PIN set, these need it: moving a portfolio to a real account,
+# turning real accounts back on, loosening the gate, and every command for a
+# real-account portfolio. Stopping never waits for the PIN.
+PIN_COMMANDS = {"live_promote", "live_resume", "live_gate"}
+PIN_FREE_COMMANDS = {"pause", "live_halt"}
+
+
+def pin_required(body, state):
+    """Whether a command acts on real money and so needs the operator PIN."""
+    kind = body.get("kind") if isinstance(body, dict) else None
+    if kind in PIN_COMMANDS:
+        return True
+    if kind in PIN_FREE_COMMANDS or kind in GLOBAL_COMMANDS:
+        return False
+    case = next((c for c in state.get("cases", {}).values() if c.get("strategy_id") == body.get("strategy_id")), None)
+    return bool(case and case.get("contour") == "production")
+
+
 # A real account: no virtual money, no manual or automatic orders, no composition edits.
 LIVE_FORBIDDEN = {"pay_in": "Пополнение реального счёта — только в приложении брокера",
                   "manual_order": "Ручные заявки на реальном счёте — в приложении брокера",
@@ -291,6 +297,20 @@ def percent(value, label):
     if not number.is_finite() or not 0 < number <= 100 or number.as_tuple().exponent < -2:
         raise ClientError(label + ": больше 0 и не больше 100, до 2 знаков после запятой")
     return number
+
+
+def validate_backtest(payload):
+    """Period of a backtest: whole days, the first not after the last, the last
+    before today, at most ten years; slippage 0–100 basis points."""
+    try:
+        first, last = (dt.date.fromisoformat(str(payload.get(key))) for key in ("from", "to"))
+    except ValueError:
+        raise ClientError("Период — даты в формате ГГГГ-ММ-ДД") from None
+    if not first <= last < dt.date.today() or (last - first).days > 3660:
+        raise ClientError("Период: начало не позже конца, конец раньше сегодняшнего дня, не длиннее 10 лет")
+    if type(payload.get("slippage_bps")) not in (int, float) or not 0 <= payload["slippage_bps"] <= 100:
+        raise ClientError("Проскальзывание — от 0 до 100 базисных пунктов")
+    payload["from"], payload["to"] = first.isoformat(), last.isoformat()
 
 
 def validate_promotion(payload, state):
@@ -385,7 +405,61 @@ def instrument_metadata(raw, details=None):
     return meta
 
 
-def ranking(runs, names=None):
+def benchmark_closes(work, benchmark):
+    """Daily closes of the stand's benchmark (a fund on the Moscow Exchange index)
+    from the chart cache the market feed keeps: {Moscow date: close}."""
+    if not benchmark:
+        return None
+    try:
+        cache = json.loads((Path(work) / "reports" / "market-chart.json").read_text())
+        candles = cache["assets"][benchmark["uid"]]["series"]["day"]["candles"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    closes = {}
+    for candle in candles:
+        moment = dt.datetime.fromisoformat(str(candle["time"]).replace("Z", "+00:00"))
+        closes[moment.astimezone(MSK).date().isoformat()] = float(candle["close"])
+    return {"ticker": benchmark.get("ticker"), "closes": closes} if closes else None
+
+
+def risk_metrics(anchor, anchor_flows, days, benchmark=None, started=None):
+    """Daily returns of a run net of deposits and withdrawals (the last sample of
+    each Moscow day): annualized volatility, Sharpe and Sortino ratios without a
+    risk-free rate, the worst day, the cumulative curve and the benchmark's return
+    over the same days. Ratios need at least five days."""
+    returns, curve, index = [], [], 1.0
+    previous, previous_flows = anchor, anchor_flows
+    for day, equity, flows in days or []:
+        equity, flows = float(equity), float(flows)
+        if previous and previous > 0:
+            value = (equity - previous - (flows - previous_flows)) / previous
+            returns.append(value)
+            index *= 1 + value
+            curve.append([day, round((index - 1) * 100, 3)])
+        previous, previous_flows = equity, flows
+    result = {"days": len(returns), "curve": curve[-120:], "volatility_percent": None, "sharpe": None,
+              "sortino": None, "worst_day_percent": None, "benchmark_percent": None, "benchmark": None}
+    if len(returns) >= 5:
+        mean = sum(returns) / len(returns)
+        deviation = math.sqrt(sum((r - mean) ** 2 for r in returns) / (len(returns) - 1))
+        downside = math.sqrt(sum(min(r, 0) ** 2 for r in returns) / len(returns))
+        year = math.sqrt(365)
+        result.update(volatility_percent=deviation * year * 100,
+                      sharpe=mean / deviation * year if deviation > 0 else None,
+                      sortino=mean / downside * year if downside > 0 else None,
+                      worst_day_percent=min(returns) * 100)
+    if benchmark and curve and started:
+        closes = benchmark["closes"]
+        first = str(started)[:10]
+        before = [d for d in closes if d < first]
+        upto = [d for d in closes if d <= curve[-1][0]]
+        if before and upto and upto[-1] > before[-1]:
+            result.update(benchmark=benchmark["ticker"],
+                          benchmark_percent=(closes[upto[-1]] / closes[before[-1]] - 1) * 100)
+    return result
+
+
+def ranking(runs, names=None, benchmark=None):
     """Account equity already contains commission; exclude all external flows."""
     names = names or {}
     history = []
@@ -405,6 +479,14 @@ def ranking(runs, names=None):
                    principal=float(principal) if principal is not None else None,
                    max_drawdown_percent=float(decimal("max_drawdown_percent") or 0),
                    fills=int(run.get("fills") or 0), ranked=bool(ready and int(run.get("fills") or 0) > 0))
+        costs = run.get("costs") or {}
+        row.update(commission_rub=float(costs.get("commission_rub") or 0), trades=int(costs.get("trades") or 0),
+                   volume_rub=float(costs.get("volume_rub") or 0),
+                   metrics=risk_metrics(float(anchor) if anchor is not None else None,
+                                        float(anchor_flows) if anchor_flows is not None else 0.0,
+                                        run.get("days"), benchmark, run.get("started_at")))
+        if row["metrics"]["benchmark_percent"] is not None and row["return_percent"] is not None:
+            row["metrics"]["excess_percent"] = row["return_percent"] - row["metrics"]["benchmark_percent"]
         history.append(row)
     history.sort(key=lambda r: r.get("started_at") or "", reverse=True)
     latest, seen = [], set()
@@ -650,7 +732,13 @@ class Control:
           'runs',(SELECT coalesce(json_agg(t),'[]'::json) FROM (SELECT r.*,
              (SELECT count(*) FROM fills f JOIN trade_intents i ON i.request_id=f.request_id
               WHERE i.strategy_id=r.strategy_id AND i.account_id=r.account_id AND f.executed_at>=r.started_at
-                AND (r.ended_at IS NULL OR f.executed_at<r.ended_at)) AS fills FROM strategy_runs r) t));""")
+                AND (r.ended_at IS NULL OR f.executed_at<r.ended_at)) AS fills,
+             (SELECT json_agg(json_build_array(d.day,d.equity,d.external_cash_flows) ORDER BY d.day) FROM (
+                SELECT DISTINCT ON (1) (p.observed_at AT TIME ZONE 'Europe/Moscow')::date AS day,p.equity,p.external_cash_flows
+                FROM performance_samples p WHERE p.run_id=r.id ORDER BY 1,p.observed_at DESC) d) AS days,
+             (SELECT json_build_object('trades',count(*),'volume_rub',sum(c.volume_rub),'commission_rub',sum(c.commission_rub))
+                FROM trade_commissions c WHERE c.account_id=r.account_id AND c.executed_at>=r.started_at
+                AND (r.ended_at IS NULL OR c.executed_at<r.ended_at)) AS costs FROM strategy_runs r) t));""")
         state = self.state()
         names = {c["strategy_id"]: c["kind"] for c in state.get("cases", {}).values()}
         for case in state.get("cases", {}).values():
@@ -658,12 +746,14 @@ class Control:
                 names[revision["strategy_id"]] = case["kind"]
         for case in state.get("archived_cases", []):
             names[case["strategy_id"]] = case["kind"]
-        data["ranking"] = ranking(data.pop("runs"), names)
+        data["ranking"] = ranking(data.pop("runs"), names, benchmark_closes(self.work, state.get("benchmark")))
         data["mode"] = data["mode"] or "campaign"
         data["runtime_cap"] = runtime_cap(state)
         data["live"] = self.live_data(state)
         data["ai_models"] = self.ai_models()
         data["topics"] = TOPICS
+        data["rules"] = {"share_only_kinds": sorted(stand_rules.SHARE_ONLY_KINDS), "roll_days": ROLL_DAYS}
+        data["operator_pin"] = (self.work / "operator-pin.json").exists()
         data["observed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         return data
 

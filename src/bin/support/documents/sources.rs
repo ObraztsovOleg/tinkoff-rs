@@ -227,7 +227,13 @@ const fn default_same_event_similarity() -> f64 {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Embeddings {
+    /// Адрес OpenAI-совместимого API; без него — адрес профиля `profile`.
+    #[serde(default)]
     pub url: String,
+    /// Профиль из файла моделей, чьи адрес и токен использовать: ключ остаётся
+    /// в одном файле с правами 0600.
+    #[serde(default)]
+    pub profile: Option<String>,
     pub model: String,
     #[serde(default = "default_dimensions")]
     pub dimensions: u32,
@@ -500,6 +506,7 @@ impl Sources {
             if !(64..=4096).contains(&embeddings.dimensions)
                 || !(1..=256).contains(&embeddings.batch)
                 || embeddings.model.trim().is_empty()
+                || (embeddings.url.trim().is_empty() && embeddings.profile.is_none())
                 || !embeddings.price_per_million.is_finite()
                 || embeddings.price_per_million < 0.0
             {
@@ -511,6 +518,7 @@ impl Sources {
 
     /// Токен сервиса векторов из файла или переменной окружения.
     pub(crate) fn embeddings_token(&self) -> Option<String> {
+        use secrecy::ExposeSecret;
         let embeddings = self.embeddings.as_ref()?;
         embeddings
             .token
@@ -523,6 +531,35 @@ impl Sources {
                     .and_then(|name| std::env::var(name).ok())
                     .filter(|t| !t.trim().is_empty())
             })
+            .or_else(|| {
+                let (_, profile) = self.embeddings_profile()?;
+                profile
+                    .token()
+                    .ok()
+                    .flatten()
+                    .map(|token| token.expose_secret().clone())
+            })
+    }
+
+    /// Профиль модели, на который ссылаются настройки векторов.
+    pub(crate) fn embeddings_profile(&self) -> Option<(String, crate::ai::profiles::Profile)> {
+        let name = self.embeddings.as_ref()?.profile.as_deref()?;
+        let profiles = crate::ai::profiles::Profiles::load().ok()?;
+        profiles
+            .get(Some(name))
+            .ok()
+            .map(|(name, profile)| (name, profile.clone()))
+    }
+
+    /// Адрес сервиса векторов: свой или профиля.
+    pub(crate) fn embeddings_url(&self) -> Option<String> {
+        let embeddings = self.embeddings.as_ref()?;
+        if embeddings.url.trim().is_empty() {
+            self.embeddings_profile()
+                .map(|(_, profile)| profile.base_url())
+        } else {
+            Some(embeddings.url.clone())
+        }
     }
 }
 
@@ -548,6 +585,14 @@ mod tests {
         assert!(!serde_json::to_string(&custom).unwrap().contains("secret"));
         let bad: Sources = toml::from_str("[tinvest]\ninterval_seconds = 5").unwrap();
         assert!(bad.validate().is_err());
+        // Адрес и токен векторов можно взять из профиля модели.
+        let borrowed: Sources = toml::from_str(
+            "[embeddings]\nprofile = \"remote\"\nmodel = \"bge-m3\"\ndimensions = 1024",
+        )
+        .unwrap();
+        borrowed.validate().unwrap();
+        let nowhere: Sources = toml::from_str("[embeddings]\nmodel = \"bge-m3\"").unwrap();
+        assert!(nowhere.validate().is_err(), "neither url nor profile");
         assert!(toml::from_str::<Sources>("[unknown]\nx = 1").is_err());
     }
 }

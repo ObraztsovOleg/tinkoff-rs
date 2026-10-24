@@ -605,7 +605,7 @@ impl Workspace<'_> {
                 .map(|i| i.uid.clone())
                 .collect();
             self.reference = Some(
-                crate::load_reference(
+                crate::reference::load_reference(
                     self.context.api,
                     &universe,
                     &[

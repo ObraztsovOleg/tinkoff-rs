@@ -1,5 +1,9 @@
-//! Профили подключения к моделям (`AI_MODELS_FILE`).
-use std::{collections::HashMap, path::PathBuf};
+//! Профили подключения к моделям (`AI_MODELS_FILE`) и дополнительные профили
+//! из каталога `models.d` рядом с ним.
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -145,7 +149,21 @@ pub(crate) struct Profile {
     /// Кэш промпта Anthropic: повторные шаги одного решения в разы дешевле.
     #[serde(default = "default_true")]
     pub prompt_cache: bool,
+    /// Дополнительные поля тела запроса, которых требует модель или сервер,
+    /// например `reasoning_effort = "none"` для Ollama без режима размышлений.
+    #[serde(default)]
+    pub body: serde_json::Map<String, Value>,
 }
+
+/// Поля запроса, которые формирует сам клиент: профиль не может их подменить.
+const RESERVED_BODY_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "tools",
+    "tool_choice",
+    "stream",
+];
 
 impl std::fmt::Debug for Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -233,8 +251,59 @@ impl Profile {
         {
             return fail("prices must be numbers from 0 to 1000");
         }
+        if let Some(field) = self
+            .body
+            .keys()
+            .find(|field| RESERVED_BODY_FIELDS.contains(&field.as_str()))
+        {
+            return fail(&format!("body cannot override `{field}`"));
+        }
         Ok(())
     }
+}
+
+/// Файл каталога `models.d`: только профили, без умолчания и бюджета.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DropIn {
+    #[serde(default)]
+    models: HashMap<String, Profile>,
+}
+
+/// Профили из `models.d/*.toml` рядом с файлом профилей, по алфавиту файлов.
+/// Так профиль без секретов (локальная модель) добавляется, не трогая основной
+/// файл с токенами. Нет каталога — нет и дополнительных профилей.
+fn drop_ins(main: &Path) -> Result<Vec<(PathBuf, HashMap<String, Profile>)>> {
+    let Some(directory) = main.parent().map(|parent| parent.join("models.d")) else {
+        return Ok(Vec::new());
+    };
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return Ok(Vec::new());
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path).map_err(|error| {
+                Error::Configuration(format!(
+                    "cannot read AI model profiles {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let file: DropIn = toml::from_str(&text).map_err(|error| {
+                Error::Configuration(format!(
+                    "invalid AI model profiles {}: {}",
+                    path.display(),
+                    error.message()
+                ))
+            })?;
+            Ok((path, file.models))
+        })
+        .collect()
 }
 
 /// Файл профилей моделей.
@@ -257,14 +326,17 @@ impl Profiles {
 
     /// Читает файл при каждом решении: правка профиля применяется без перезапуска.
     pub(crate) fn load() -> Result<Self> {
-        let path = Self::path();
-        let text = std::fs::read_to_string(&path).map_err(|error| {
+        Self::load_from(&Self::path())
+    }
+
+    fn load_from(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path).map_err(|error| {
             Error::Configuration(format!(
                 "cannot read AI model profiles {}: {error}",
                 path.display()
             ))
         })?;
-        let profiles: Self = toml::from_str(&text).map_err(|error| {
+        let mut profiles: Self = toml::from_str(&text).map_err(|error| {
             // Сообщение toml не содержит значений полей, только позицию и тип ошибки.
             Error::Configuration(format!(
                 "invalid AI model profiles {}: {}",
@@ -272,6 +344,17 @@ impl Profiles {
                 error.message()
             ))
         })?;
+        for (file, models) in drop_ins(path)? {
+            for (name, profile) in models {
+                if profiles.models.contains_key(&name) {
+                    return Err(Error::Configuration(format!(
+                        "AI profile `{name}` from {} is already defined",
+                        file.display()
+                    )));
+                }
+                profiles.models.insert(name, profile);
+            }
+        }
         for (name, profile) in &profiles.models {
             profile.validate(name)?;
         }
@@ -412,5 +495,49 @@ mod tests {
         );
         let custom: Profiles = toml::from_str("[budget]\nmax_usd_per_day = 12.5").unwrap();
         assert_eq!(custom.budget.max_usd_per_day, Some(12.5));
+    }
+
+    #[test]
+    fn profiles_from_models_d_join_the_main_file_without_touching_it() {
+        let directory = std::env::temp_dir().join(format!("profiles-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(directory.join("models.d")).unwrap();
+        let main = directory.join("models.toml");
+        std::fs::write(&main, "default = \"claude\"\n[models.claude]\nprovider = \"anthropic\"\nmodel = \"claude-sonnet-5-5\"\n").unwrap();
+        std::fs::write(
+            directory.join("models.d/local.toml"),
+            "[models.local]\nprovider = \"openai\"\nurl = \"http://host.docker.internal:11434/v1\"\nmodel = \"qwen3:8b\"\nbody = { reasoning_effort = \"none\" }\n",
+        )
+        .unwrap();
+        std::fs::write(directory.join("models.d/notes.txt"), "ignored").unwrap();
+        let (_, models) = drop_ins(&main).unwrap().pop().unwrap();
+        assert_eq!(models["local"].body["reasoning_effort"], "none");
+        // Профиль не может подменить поля, которые формирует клиент.
+        let bad: Profile =
+            toml::from_str("provider = \"openai\"\nmodel = \"m\"\nbody = { tools = [] }").unwrap();
+        assert!(bad.validate("bad").is_err());
+        let profiles = Profiles::load_from(&main).unwrap();
+        assert_eq!(profiles.get(Some("local")).unwrap().1.model, "qwen3:8b");
+        assert_eq!(
+            profiles.get(None).unwrap().0,
+            "claude",
+            "the default stays in the main file"
+        );
+        // Повтор имени из основного файла — ошибка, а не тихая подмена.
+        std::fs::write(
+            directory.join("models.d/clash.toml"),
+            "[models.claude]\nprovider = \"openai\"\nmodel = \"other\"\n",
+        )
+        .unwrap();
+        let error = Profiles::load_from(&main).unwrap_err().to_string();
+        assert!(
+            error.contains("`claude`") && error.contains("already defined"),
+            "{error}"
+        );
+        assert!(
+            drop_ins(&directory.join("absent/models.toml"))
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

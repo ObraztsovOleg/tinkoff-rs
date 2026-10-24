@@ -1,0 +1,26 @@
+# Локальная модель через Ollama на этом Mac: бесплатно, данные не уходят наружу.
+# Скопируйте в docker/local/ai/models.d/qwen.toml (рядом с models.toml).
+# Установка: brew install ollama && brew services start ollama && ollama pull qwen3:8b
+# Контейнеры стенда видят Ollama по адресу host.docker.internal.
+
+# Без «размышлений» (≈3 с на короткий шаг). Для разметки пачек документов Qwen3 8B
+# не годится: см. docs/AI-MODEL.ru.md, «Локальная модель через Ollama».
+[models.qwen]
+provider = "openai"
+url = "http://host.docker.internal:11434/v1"
+model = "qwen3:8b"
+timeout_seconds = 300
+max_output_tokens = 8192
+prompt_cache = false
+body = { reasoning_effort = "none" }
+prices = { input = 0, output = 0 }
+
+# С «размышлениями» (≈30 с на шаг): эксперименты с решениями в песочнице.
+[models.qwen-think]
+provider = "openai"
+url = "http://host.docker.internal:11434/v1"
+model = "qwen3:8b"
+timeout_seconds = 600
+max_output_tokens = 8192
+prompt_cache = false
+prices = { input = 0, output = 0 }

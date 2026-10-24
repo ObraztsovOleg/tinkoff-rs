@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.93.1-bookworm AS build
+FROM rust:1.99.1-trixie AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY contracts ./contracts
@@ -11,13 +11,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --locked --release --bin tinkoff-bot && \
     cp target/release/tinkoff-bot /usr/local/bin/tinkoff-bot
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl python3 postgresql-client procps tini poppler-utils && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /usr/local/bin/tinkoff-bot /usr/local/bin/tinkoff-bot
 COPY scripts ./scripts
+COPY contracts/stand-rules.json ./contracts/stand-rules.json
 COPY examples/configs ./examples/configs
 COPY tests/test_sandbox_*.py ./tests/
 COPY docker/entrypoint.py ./docker/entrypoint.py

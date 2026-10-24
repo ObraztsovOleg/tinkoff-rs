@@ -1,6 +1,7 @@
 import datetime as dt
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -37,6 +38,40 @@ class MarketFeedTests(unittest.TestCase):
             self.assertEqual(api.call.call_args.args[1]["interval"], "CANDLE_INTERVAL_5_SEC")
             feed.update(api, {"instruments": [{"uid": "uid", "ticker": "SBER"}]}, cache, Mock(), requests, background_limit=0)
             self.assertEqual(api.call.call_count, 1)
+
+    def test_a_futures_series_is_charted_by_its_current_contract_and_restarts_after_a_roll(self):
+        now = dt.datetime(2026, 10, 24, 12, tzinfo=dt.timezone.utc)
+        futures = {"instruments": [{"uid": "brx6", "ticker": "BRX6", "lastTradeDate": "2026-11-02T00:00:00Z"},
+                                   {"uid": "brz6", "ticker": "BRZ6", "lastTradeDate": "2026-12-01T00:00:00Z"},
+                                   {"uid": "six6", "ticker": "SiZ6", "lastTradeDate": "2026-12-17T00:00:00Z"}]}
+        asked = []
+
+        def call(method, body):
+            if method == "InstrumentsService/Futures":
+                return futures
+            asked.append(body["instrumentId"])
+            return {"candles": [{"time": "2026-10-23T00:00:00Z", "open": {"units": "60"}, "high": {"units": "61"},
+                                 "low": {"units": "59"}, "close": {"units": "60"}, "volume": "1", "isComplete": True}]}
+        series = {"uid": "futures:BR", "ticker": "BR"}
+        request = {"chart": {"uid": "futures:BR", "interval": "day", "expires_at": now.timestamp() + 20}}
+        feed.CONTRACTS.clear()
+        cache = {}
+        with patch.object(feed.campaign, "now", return_value=now):
+            feed.update(SimpleNamespace(call=call), {"instruments": [series]}, cache, Mock(), request, background_limit=0)
+        self.assertEqual(asked, ["brx6"], "the nearest contract before its roll on 2026-10-28")
+        self.assertEqual(cache["assets"]["futures:BR"]["contract"], "brx6")
+        self.assertEqual(len(cache["assets"]["futures:BR"]["series"]["day"]["candles"]), 1)
+        # After the roll the next contract is charted from scratch: old prices are not mixed in.
+        later = dt.datetime(2026, 10, 28, 8, tzinfo=dt.timezone.utc)
+        feed.CONTRACTS.clear()
+        cache["assets"]["futures:BR"]["series"]["30m"] = {"candles": [{"time": "x"}]}
+        with patch.object(feed.campaign, "now", return_value=later):
+            feed.update(SimpleNamespace(call=call), {"instruments": [series]}, cache,
+                        Mock(), {"chart": dict(request["chart"], expires_at=later.timestamp() + 20)}, background_limit=0)
+        self.assertEqual(asked[-1], "brz6")
+        self.assertEqual(cache["assets"]["futures:BR"]["contract"], "brz6")
+        self.assertNotIn("30m", cache["assets"]["futures:BR"]["series"])
+        self.assertEqual(feed.contract_of(SimpleNamespace(call=call), "plain-uid"), "plain-uid")
 
     def test_backoff_preserves_prices_and_prevents_repeated_failed_requests(self):
         now = dt.datetime(2026, 10, 1, 12, tzinfo=dt.timezone.utc)

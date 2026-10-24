@@ -176,7 +176,7 @@ pub(crate) fn host(url: &str) -> String {
 
 /// Загружает все ленты параллельно; недоступная лента не мешает остальным.
 pub(crate) async fn fetch_news(feeds: &[String], hours: u32) -> (Vec<NewsItem>, Vec<String>) {
-    let client = match reqwest::Client::builder()
+    let client = match crate::tls::http_client()
         .timeout(StdDuration::from_secs(20))
         .user_agent("Mozilla/5.0 (compatible; tinkoff-rs-news/0.3)")
         .build()
@@ -222,7 +222,7 @@ pub(crate) async fn fetch_news(feeds: &[String], hours: u32) -> (Vec<NewsItem>, 
             )),
         }
     }
-    items.sort_by(|a, b| b.published.cmp(&a.published));
+    items.sort_by_key(|item| std::cmp::Reverse(item.published));
     items.dedup_by(|a, b| a.title == b.title);
     items.truncate(400);
     (items, errors)

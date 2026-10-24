@@ -33,7 +33,10 @@ use tinkoff_rs::{
     stream::{MarketDataStream, MarketDataSubscription, StreamConfig},
 };
 
-use super::instruments::{SeriesBook, series_code};
+use super::{
+    candle_cache::CandleCache,
+    instruments::{SeriesBook, series_code},
+};
 
 /// Торговый контур из TOML. По умолчанию — Sandbox.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -210,6 +213,8 @@ enum BrokerKind {
 pub(super) struct VenueBroker {
     kind: BrokerKind,
     series: Arc<SeriesBook>,
+    /// Общий кэш истории в базе стенда; без него история идёт от брокера.
+    cache: std::sync::OnceLock<CandleCache>,
 }
 
 impl VenueBroker {
@@ -232,11 +237,37 @@ impl VenueBroker {
         }
     }
 
-    async fn raw_candles(&self, request: CandleHistoryRequest) -> Result<ApiResponse<Vec<Candle>>> {
+    /// Подключает общий кэш истории (один раз за процесс).
+    pub(super) fn use_candle_cache(&self, storage: Arc<PostgresStorage>) {
+        let _ = self.cache.set(CandleCache::new(storage));
+    }
+
+    async fn broker_candles(
+        &self,
+        request: CandleHistoryRequest,
+    ) -> Result<ApiResponse<Vec<Candle>>> {
         match &self.kind {
             BrokerKind::Sandbox(broker) => broker.candles(request).await,
             BrokerKind::Production { read, .. } => read.candles(request).await,
         }
+    }
+
+    /// Свечи одного инструмента: через кэш истории, если он подключён.
+    async fn raw_candles(&self, request: CandleHistoryRequest) -> Result<ApiResponse<Vec<Candle>>> {
+        let Some(cache) = self.cache.get() else {
+            return self.broker_candles(request).await;
+        };
+        let data = cache
+            .candles(request, |piece| async move {
+                self.broker_candles(piece)
+                    .await
+                    .map(|response| response.data)
+            })
+            .await?;
+        Ok(ApiResponse {
+            data,
+            metadata: tinkoff_rs::ApiMetadata::default(),
+        })
     }
 }
 
@@ -286,6 +317,7 @@ pub(super) async fn connect(
                 Arc::new(VenueBroker {
                     kind: BrokerKind::Sandbox(broker),
                     series,
+                    cache: std::sync::OnceLock::new(),
                 }),
             ))
         }
@@ -307,6 +339,7 @@ pub(super) async fn connect(
                 Arc::new(VenueBroker {
                     kind: BrokerKind::Production { read, trade },
                     series,
+                    cache: std::sync::OnceLock::new(),
                 }),
             ))
         }

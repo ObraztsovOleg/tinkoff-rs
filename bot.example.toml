@@ -12,6 +12,12 @@ budget_rub = "30000.00"
 daily_loss_percent = "5.0"
 max_drawdown_percent = "25.0"
 
+# Проверка стакана перед рыночной заявкой (docs/LIVE-TRADING.ru.md): на реальном
+# счёте по умолчанию 0,5% и 30 минут ожидания, в песочнице выключена.
+# [execution]
+# max_spread_percent = "0.5"
+# spread_wait_minutes = 30
+
 [[universe]]
 uid = "replace-with-moex-instrument-uid-1"
 

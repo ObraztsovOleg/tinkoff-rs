@@ -149,3 +149,7 @@
 :where([data-theme="dark"]) .pf-block{border:1px solid #19292d;background:#121e21}
 :where([data-theme="dark"]) .instrument-chip{border:1px solid #293b30}
 :where([data-theme="dark"]) .portfolio-foot{border-top:1px solid #19292d}
+:where([data-theme="dark"]) .portfolio-metrics{border-top:1px solid #19292d}
+:where([data-theme="dark"]) .spark line{stroke:#2b474c}
+:where([data-theme="dark"]) .pin-dialog{background:#111b1d}
+:where([data-theme="dark"]) .pin-dialog::backdrop{background:rgba(11,21,23,.45)}

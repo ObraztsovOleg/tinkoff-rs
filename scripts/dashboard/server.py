@@ -8,6 +8,8 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fcntl
+import getpass
+import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -66,6 +68,14 @@ def money(value):
         return None
     units, nano = number(value.get("units", 0)), number(value.get("nano", 0))
     return units + nano / 1e9 if units is not None and nano is not None else None
+
+
+def account_value(portfolio):
+    """Account value without the futures notional T-Invest adds to the portfolio
+    total: a futures result is already in cash as settled variation margin."""
+    total = money(portfolio.get("totalAmountPortfolio"))
+    futures = money(portfolio.get("totalAmountFutures")) or 0
+    return None if total is None else total - futures
 
 
 def pick(value, keys):
@@ -191,6 +201,8 @@ def storage(work, campaign):
                          readings=[pick(r, ["path", "free_bytes", "total_bytes"]) for r in disk.get("readings", [])]),
             "maintenance": pick(campaign.get("maintenance") or {}, ["day", "at", "deleted", "rotated_logs", "database_bytes", "seconds", "error", "retry_at"]),
             "backups": {"status": read_json(directory / "status.json"),
+                        # Off-site copies: when and where to, never the credentials.
+                        "offsite": pick(read_json(directory / "offsite.json") or {}, ["ok", "at", "latest", "removed", "bucket", "prefix", "error"]),
                         "files": [{"name": f.name, "bytes": f.stat().st_size,
                                    "at": dt.datetime.fromtimestamp(f.stat().st_mtime, UTC).isoformat()} for f in files]}}
 
@@ -252,7 +264,7 @@ def snapshot(work):
         accounts[account_id] = {"id": account_id, "cases": [c["kind"] for c in candidates],
                                 "contour": "production" if any(c.get("contour") == "production" for c in candidates) else "sandbox",
                                 "owner": names.get(current_risk.get("strategy_id")),
-                                "equity": money(portfolio.get("totalAmountPortfolio")), "cash": cash,
+                                "equity": account_value(portfolio), "cash": cash,
                                 "available": bool(data), "positions": positions,
                                 "active_orders": active, "operations": operations}
     cases = []
@@ -311,7 +323,8 @@ def snapshot(work):
     for batch in database.get("batches", []):
         target = batch.get("target") or {}
         targets.append({"strategy": names.get(batch.get("strategy_id")), "batch_id": target.get("batch_id"),
-                        "status": batch.get("status"), "generated_at": target.get("generated_at"),
+                        "status": batch.get("status"), "reason": batch.get("reason"),
+                        "generated_at": target.get("generated_at"),
                         "valid_until": target.get("valid_until"),
                         "maintenance": str(batch.get("event_id", "")).startswith("cleanup:"),
                         "weights": [{"instrument_id": w.get("instrument_id"), "weight": number(w.get("weight"))}
@@ -477,6 +490,7 @@ class Handler(BaseHTTPRequestHandler):
                   "/portfolios.js": ("portfolios.js", "text/javascript; charset=utf-8"),
                   "/aiboard.js": ("aiboard.js", "text/javascript; charset=utf-8"),
                   "/costs.js": ("costs.js", "text/javascript; charset=utf-8"),
+                  "/backtest.js": ("backtest.js", "text/javascript; charset=utf-8"),
                   "/theme.js": ("theme.js", "text/javascript; charset=utf-8"),
                   "/dark.css": ("dark.css", "text/css; charset=utf-8"),
                   "/style.css": ("style.css", "text/css; charset=utf-8")}
@@ -535,6 +549,25 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError):
             self.respond({"error": "Сервис временно недоступен. Проверьте соединение и миграции БД."}, 503)
 
+    def pin_accepted(self, body, session):
+        """Real-money commands need the operator PIN once it is set; an accepted PIN
+        unlocks the session for a while. Answers 401 itself when it is missing or wrong."""
+        pin = getattr(self.server, "pin", None)
+        if pin is None or not pin.configured() or session.get("pin_until", 0) > time.monotonic():
+            return True
+        if not control_module.pin_required(body, self.require_control().state()):
+            return True
+        entered = self.headers.get("X-Operator-Pin", "")
+        if not entered:
+            self.respond({"error": "Действие с реальным счётом: введите PIN оператора", "pin_required": True}, 401)
+            return False
+        accepted, message = pin.check(entered)
+        if not accepted:
+            self.respond({"error": message, "pin_required": True}, 401)
+            return False
+        session["pin_until"] = time.monotonic() + PIN_UNLOCK_SECONDS
+        return True
+
     def do_POST(self):
         if not self.valid_host():
             self.send_error(403)
@@ -552,6 +585,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json" or not 0 < length <= 16384:
                 raise control_module.ClientError("Ожидается JSON, не более 16 КБ")
             body = json.loads(self.rfile.read(length))
+            if not self.pin_accepted(body, session[1]):
+                return
             self.respond(self.require_control().enqueue(body), 202)
         except control_module.ClientError as error:
             self.respond({"error": str(error)}, error.status)
@@ -559,6 +594,69 @@ class Handler(BaseHTTPRequestHandler):
             self.respond({"error": "Некорректный JSON"}, 400)
         except (OSError, KeyError, RuntimeError, subprocess.SubprocessError):
             self.respond({"error": "Команда не подтверждена. Проверьте её статус перед повтором."}, 503)
+
+
+class OperatorPin:
+    """PIN of the operator for real-money commands: a PBKDF2 hash in
+    <work>/operator-pin.json, set with `server.py set-pin`. Five wrong entries in
+    a row lock it for 15 minutes. Without the file no PIN is asked."""
+    ITERATIONS = 600_000
+    ATTEMPTS = 5
+    LOCKOUT = 900
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.failures = 0
+        self.locked_until = 0.0
+        self.lock = threading.Lock()
+
+    def stored(self):
+        try:
+            value = json.loads(self.path.read_text())
+            return value if {"salt", "iterations", "hash"} <= set(value) else None
+        except (OSError, ValueError):
+            return None
+
+    def configured(self):
+        return self.stored() is not None
+
+    @staticmethod
+    def digest(pin, salt, iterations):
+        return hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt), iterations).hex()
+
+    def set(self, pin):
+        if not 4 <= len(pin) <= 64 or pin != pin.strip():
+            raise ValueError("PIN: от 4 до 64 символов, без пробелов по краям")
+        salt = secrets.token_hex(16)
+        value = {"salt": salt, "iterations": self.ITERATIONS, "hash": self.digest(pin, salt, self.ITERATIONS),
+                 "set_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(value))
+        os.chmod(temporary, 0o600)
+        temporary.replace(self.path)
+
+    def check(self, pin):
+        """(accepted, message for the operator)."""
+        stored = self.stored()
+        if stored is None:
+            return True, ""
+        with self.lock:
+            wait = self.locked_until - time.monotonic()
+            if wait > 0:
+                return False, f"PIN заблокирован после {self.ATTEMPTS} ошибок: повторите через {math.ceil(wait / 60)} мин"
+            if secrets.compare_digest(self.digest(str(pin), stored["salt"], int(stored["iterations"])), stored["hash"]):
+                self.failures = 0
+                return True, ""
+            self.failures += 1
+            if self.failures >= self.ATTEMPTS:
+                self.failures = 0
+                self.locked_until = time.monotonic() + self.LOCKOUT
+                return False, f"Неверный PIN. Ввод заблокирован на {self.LOCKOUT // 60} минут"
+            return False, f"Неверный PIN: осталось попыток {self.ATTEMPTS - self.failures}"
+
+
+# An accepted PIN unlocks real-money commands of this browser session for 10 minutes.
+PIN_UNLOCK_SECONDS = 600
 
 
 def serve(port):
@@ -571,6 +669,7 @@ def serve(port):
     server = ThreadingHTTPServer((os.environ.get("DASHBOARD_BIND", "127.0.0.1"), port), Handler)
     server.feed = feed
     server.control = control
+    server.pin = OperatorPin(WORK / "operator-pin.json")
     server.sessions = {}
     server.sessions_lock = threading.Lock()
     server.chart_lock = threading.Lock()
@@ -622,10 +721,25 @@ def health(state):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["start", "serve", "status", "stop"])
+    parser.add_argument("action", choices=["start", "serve", "status", "stop", "set-pin", "remove-pin"])
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     os.umask(0o077)
+    if args.action in ("set-pin", "remove-pin"):
+        pin = OperatorPin(WORK / "operator-pin.json")
+        if args.action == "remove-pin":
+            pin.path.unlink(missing_ok=True)
+            print("PIN removed: real-account commands are confirmed by the account number only")
+            return
+        first = getpass.getpass("New operator PIN: ")
+        if first != getpass.getpass("Repeat the PIN: "):
+            raise SystemExit("The PINs differ; nothing was changed")
+        try:
+            pin.set(first)
+        except ValueError as error:
+            raise SystemExit(str(error)) from None
+        print("PIN set: the dashboard asks for it before real-account commands")
+        return
     if args.action == "serve":
         serve(args.port)
         return

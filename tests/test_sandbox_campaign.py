@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch, Mock
 
@@ -150,7 +151,7 @@ class TradingWindowTests(unittest.TestCase):
 class SupervisorScheduleTests(unittest.TestCase):
     """supervise_tick follows the operator schedule; every broker-side action is mocked."""
 
-    def tick(self, controls, state, alive=False):
+    def tick(self, controls, state, alive=False, clocks=None):
         def cleaned(_state, case):
             case["state"] = "cleaned"
         with patch.object(campaign.control_plane, "process", return_value=controls), \
@@ -159,8 +160,25 @@ class SupervisorScheduleTests(unittest.TestCase):
                 patch.object(campaign, "stop_process") as stop, \
                 patch.object(campaign, "cleanup_case", side_effect=cleaned) as cleanup, \
                 patch.object(campaign, "runtime_ready", return_value=False), patch.object(campaign, "persist"):
-            campaign.supervise_tick(state, None, {"audit": float("inf"), "report": float("inf"), "calendar": float("inf")})
+            campaign.supervise_tick(state, None, clocks or {"audit": float("inf"), "report": float("inf"), "calendar": float("inf")})
         return launch, stop, cleanup
+
+    def test_new_orders_and_fills_refresh_the_accounts_within_a_minute(self):
+        current = campaign.now()
+        state, controls = self.setup(current + dt.timedelta(days=3), current + dt.timedelta(days=3, hours=8))
+        clocks = {"audit": time.monotonic() - 100, "report": float("inf"), "calendar": float("inf"), "trades": float("-inf")}
+        marks = iter(["2026-10-24 10:00:00+00", "2026-10-24 10:00:00+00", "2026-10-24 10:05:00+00"])
+        with patch.object(campaign, "latest_trade_activity", side_effect=lambda _state: next(marks)), \
+                patch.object(campaign, "audit_accounts") as audit:
+            self.tick(controls, state, clocks=clocks)
+            audit.assert_not_called()  # the first mark is only remembered
+            clocks["trades"] = float("-inf")
+            self.tick(controls, state, clocks=clocks)
+            audit.assert_not_called()  # nothing new
+            clocks["trades"] = float("-inf")
+            self.tick(controls, state, clocks=clocks)
+            audit.assert_called_once()  # a new fill, and the last read was over a minute ago
+        self.assertFalse(clocks["audit_wanted"])
 
     def setup(self, start, end, **control):
         day = start.date().isoformat()

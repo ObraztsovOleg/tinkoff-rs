@@ -69,7 +69,7 @@ impl<'a> Chat<'a> {
         system: String,
         meter: Meter,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = crate::tls::http_client()
             .timeout(StdDuration::from_secs(profile.timeout_seconds))
             .user_agent("tinkoff-rs-ai/0.3")
             .build()
@@ -167,6 +167,11 @@ impl<'a> Chat<'a> {
                 (format!("{base}/chat/completions"), body)
             }
         };
+        let mut body = body;
+        // Дополнительные поля профиля (например, выключить размышления модели).
+        for (field, value) in &self.profile.body {
+            body[field] = value.clone();
+        }
         let mut request = self.client.post(&url).json(&body);
         for (name, value) in &self.profile.headers {
             request = request.header(name, value);
@@ -407,7 +412,10 @@ mod tests {
             json!({"choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "get_indicators", "arguments": "{\"tickers\":[\"SBER\"],\"indicators\":[\"rsi_14\"]}"}}]}}]}),
             json!({"choices": [{"message": {"role": "assistant", "content": "{\"weights\":[{\"ticker\":\"SBER\",\"weight_percent\":10}],\"rationale\":\"x\"}"}}]}),
         ]).await;
-        let profile = profile(Provider::Openai, &url);
+        let mut profile = profile(Provider::Openai, &url);
+        profile
+            .body
+            .insert("reasoning_effort".into(), json!("none"));
         let mut chat = Chat::new("local".into(), &profile, "system".into(), meter()).unwrap();
         chat.user("решение");
         let turn = chat.step(&tools(true), None).await.unwrap();
@@ -437,6 +445,10 @@ mod tests {
                 first["max_tokens"].as_u64()
             ),
             (Some("system"), Some("function"), Some(4096))
+        );
+        assert_eq!(
+            first["reasoning_effort"], "none",
+            "extra fields of the profile"
         );
         let messages = &seen[1].1["messages"];
         assert_eq!(

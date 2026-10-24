@@ -23,6 +23,10 @@
 
 #[path = "support/ai/mod.rs"]
 mod ai;
+#[path = "support/backtest.rs"]
+mod backtest;
+#[path = "support/candle_cache.rs"]
+mod candle_cache;
 #[path = "support/cleanup.rs"]
 mod cleanup;
 #[path = "support/control.rs"]
@@ -33,13 +37,33 @@ mod documents;
 mod history;
 #[path = "support/instruments.rs"]
 mod instruments;
+#[path = "support/reference.rs"]
+mod reference;
 #[path = "support/resilience.rs"]
 mod resilience;
+#[path = "support/rules.rs"]
+mod rules;
+#[path = "support/schedule.rs"]
+mod schedule;
+#[path = "support/spread.rs"]
+mod spread;
+#[path = "support/tls.rs"]
+mod tls;
 #[path = "support/venue.rs"]
 mod venue;
+#[path = "support/warmup.rs"]
+mod warmup;
+
+use reference::absorb_reference;
+use schedule::{
+    ScheduledTrigger, current_moex_session_date, load_schedule_triggers, session_windows,
+    take_due_triggers,
+};
+use warmup::{candle_event, catch_up_warmup, warm_up};
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration as StdDuration,
@@ -54,20 +78,18 @@ use tinkoff_rs::{
     Error, Result,
     broker::{MarketData, Portfolio},
     domain::{
-        AccountId, Candle, CandleHistoryRequest, CandleInterval, InstrumentId, MarketDataEvent,
-        Money, PortfolioSnapshot, Price, StrategyId, datetime_to_timestamp, timestamp_to_datetime,
+        AccountId, CandleHistoryRequest, CandleInterval, InstrumentId, MarketDataEvent, Money,
+        PortfolioSnapshot, Price, StrategyId, datetime_to_timestamp,
     },
     engine::{
-        AccountRiskState, BatchExecutionOutcome, BatchExecutor, DataRequirement, DividendEvent,
-        EventPhase, InstrumentFundamentals, InstrumentInfo, InstrumentKind, PlanningContext,
-        PortfolioEngine, PortfolioStrategy, ReferenceData, ReferenceRequirement, RiskAnchor,
-        RiskConfig, RiskManager, RiskMode, RiskObservation, ScheduleAnchor, ScheduleEvent,
-        ScheduleRequirement, StrategyEvent, StrategyEventKind,
+        AccountRiskState, BatchExecutionOutcome, BatchExecutor, DataRequirement, EventPhase,
+        InstrumentInfo, InstrumentKind, PlanningContext, PortfolioEngine, PortfolioStrategy,
+        RiskAnchor, RiskConfig, RiskManager, RiskMode, RiskObservation, ScheduleAnchor,
+        ScheduleEvent, ScheduleRequirement, StrategyEvent, StrategyEventKind, SubmissionGuard,
     },
     proto::{
-        GetAssetFundamentalsRequest, GetDividendsRequest, GetOperationsByCursorRequest,
-        InstrumentIdType, InstrumentRequest, OperationState, OperationType, RealExchange,
-        TradingSchedulesRequest,
+        GetOperationsByCursorRequest, InstrumentIdType, InstrumentRequest, OperationState,
+        OperationType, RealExchange,
     },
     storage::{PostgresStorage, RuntimeLease, Storage},
     strategies::{BuiltinStrategySpec, WeightedEnsembleStrategy, WeightedStrategySpec},
@@ -176,6 +198,33 @@ enum Command {
         #[arg(long, default_value_t = 120)]
         days: i64,
     },
+    /// Проверить ценовые стратегии конфига на истории: те же стратегии, planner
+    /// лотов и risk-лимиты, исполнение по цене открытия с проскальзыванием и
+    /// комиссией. Только чтение через Sandbox (`TINKOFF_TOKEN`); с `DATABASE_URL`
+    /// история берётся из общего кэша свечей, комиссия — из ставок контура.
+    Backtest {
+        /// Первый торговый день (YYYY-MM-DD); прогрев берётся раньше.
+        #[arg(long)]
+        from: NaiveDate,
+        /// Последний день; по умолчанию вчера.
+        #[arg(long)]
+        to: Option<NaiveDate>,
+        /// Проскальзывание, базисные пункты цены.
+        #[arg(long, default_value = "5")]
+        slippage_bps: Decimal,
+        /// Комиссия, % объёма сделки, вместо ставок контура.
+        #[arg(long)]
+        commission_percent: Option<Decimal>,
+        /// Деньги на счёте в начале; по умолчанию `risk.budget_rub`.
+        #[arg(long)]
+        capital: Option<Decimal>,
+        /// UID ориентира «купить и держать» для сравнения.
+        #[arg(long)]
+        benchmark: Option<String>,
+        /// Записать капитал на закрытии каждой сессии в CSV.
+        #[arg(long)]
+        curve: Option<PathBuf>,
+    },
 }
 
 /// Роль инструмента в universe. Значение сохраняется в конфигурации стратегии,
@@ -226,6 +275,79 @@ struct BotConfig {
     universe: Vec<UniverseEntry>,
     /// Одна или несколько встроенных стратегий и их относительные веса.
     strategies: Vec<WeightedStrategySpec>,
+    /// Защита рыночных заявок от широкого спреда и тонкого стакана.
+    #[serde(default)]
+    execution: ExecutionConfig,
+}
+
+/// Таблица `[execution]`: проверка стакана перед рыночной заявкой (см. [`spread`]).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionConfig {
+    /// Насколько средняя цена исполнения заявки может быть хуже середины спреда,
+    /// %. Без значения: 0,5 на реальном счёте, выключено в песочнице; `"0"`
+    /// выключает проверку.
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    max_spread_percent: Option<Decimal>,
+    /// Сколько минут ждать нормального стакана (по умолчанию 30): потом
+    /// сокращения позиций исполняются, а новые позиции не открываются.
+    #[serde(default)]
+    spread_wait_minutes: Option<i64>,
+}
+
+/// Порог проверки стакана на реальном счёте, если он не задан, %.
+const DEFAULT_LIVE_SPREAD_PERCENT: Decimal = Decimal::from_parts(5, 0, 0, false, 1);
+/// Ожидание нормального стакана по умолчанию, минуты.
+const DEFAULT_SPREAD_WAIT_MINUTES: i64 = 30;
+
+impl ExecutionConfig {
+    /// Порог проверки стакана для контура, доля; `None` — проверка выключена.
+    fn spread_limit(&self, contour: Contour) -> Option<Decimal> {
+        let percent = match (self.max_spread_percent, contour) {
+            (Some(percent), _) => percent,
+            (None, Contour::Production) => DEFAULT_LIVE_SPREAD_PERCENT,
+            (None, Contour::Sandbox) => return None,
+        };
+        (percent > Decimal::ZERO).then(|| percent / Decimal::ONE_HUNDRED)
+    }
+
+    fn wait(&self) -> Duration {
+        Duration::minutes(
+            self.spread_wait_minutes
+                .unwrap_or(DEFAULT_SPREAD_WAIT_MINUTES),
+        )
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self
+            .max_spread_percent
+            .is_some_and(|percent| percent < Decimal::ZERO || percent > Decimal::from(20))
+        {
+            return Err(Error::Configuration(
+                "execution.max_spread_percent must be within 0..=20".to_owned(),
+            ));
+        }
+        if self
+            .spread_wait_minutes
+            .is_some_and(|minutes| !(1..=480).contains(&minutes))
+        {
+            return Err(Error::Configuration(
+                "execution.spread_wait_minutes must be within 1..=480".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Проверка стакана для executor-а, если она включена в контуре конфига.
+fn spread_guard(config: &BotConfig, api: &VenueApi) -> Option<Arc<dyn SubmissionGuard>> {
+    let limit = config.execution.spread_limit(config.contour)?;
+    let guard: Arc<dyn SubmissionGuard> = Arc::new(spread::SpreadGuard::new(
+        api.clone(),
+        limit,
+        config.execution.wait(),
+    ));
+    Some(guard)
 }
 
 /// Значение `app_name`, используемое при отсутствии одноимённого поля в TOML.
@@ -283,6 +405,7 @@ impl BotConfig {
             ));
         }
         self.risk.validate()?;
+        self.execution.validate()?;
         // На реальном счёте стопы не опциональны: без них риск ограничен лишь бюджетом.
         if self.contour == Contour::Production
             && (self.risk.daily_loss_percent.is_none() || self.risk.max_drawdown_percent.is_none())
@@ -417,6 +540,47 @@ async fn dispatch() -> Result<()> {
         Command::AiPreview => {
             let (config, ids) = BotConfig::load(&cli.config)?;
             ai_preview(&config, &ids).await
+        }
+        Command::Backtest {
+            from,
+            to,
+            slippage_bps,
+            commission_percent,
+            capital,
+            benchmark,
+            curve,
+        } => {
+            let (config, ids) = BotConfig::load(&cli.config)?;
+            let report = backtest::run(
+                &config,
+                &ids,
+                backtest::Options {
+                    from,
+                    to,
+                    slippage_bps,
+                    commission_percent,
+                    capital,
+                    benchmark,
+                },
+            )
+            .await?;
+            if let Some(path) = curve {
+                let mut csv = String::from("date,equity\n");
+                for (day, equity) in &report.curve {
+                    let _ = writeln!(csv, "{day},{equity}");
+                }
+                std::fs::write(&path, csv).map_err(|error| {
+                    Error::Configuration(format!("cannot write {}: {error}", path.display()))
+                })?;
+            }
+            // Одна строка JSON: её разбирает супервизор стенда (`jq` делает её читаемой).
+            println!(
+                "{}",
+                serde_json::to_string(&report).map_err(|error| {
+                    Error::Storage(format!("cannot serialize the report: {error}"))
+                })?
+            );
+            Ok(())
         }
         Command::Inspect { id, days } => {
             let (api, broker) = venue::connect(Contour::Sandbox, DEFAULT_APP_NAME).await?;
@@ -643,6 +807,8 @@ async fn start_session(
         venue::ensure_not_halted(&storage, config.contour).await?;
     }
     let (api, broker) = connect_venue(config).await?;
+    // История из общего кэша базы: процессы не скачивают одно и то же у брокера.
+    broker.use_candle_cache(storage.clone());
     ensure_account_exists(&broker, &ids.account_id).await?;
 
     // Для engine ансамбль остаётся одной stateful PortfolioStrategy. Внутри него
@@ -761,13 +927,16 @@ async fn start_session(
 
     // Незавершённые durable batches восстанавливаются до новых сигналов. При risk
     // lock разрешены лишь сокращения/закрытия, но не новые позиции.
-    let executor = BatchExecutor::new(
+    let mut executor = BatchExecutor::new(
         ids.account_id.clone(),
         ids.strategy_id.clone(),
         broker.clone(),
         broker.clone(),
         storage.clone(),
     );
+    if let Some(guard) = spread_guard(config, &api) {
+        executor = executor.with_guard(guard);
+    }
     // С момента следующего вызова executor способен обращаться к брокеру.
     // Heartbeat доказывает, что advisory lock не исчез во время долгого warmup.
     market_stream
@@ -1101,7 +1270,8 @@ struct LiveRuntime {
     ai_jobs: Vec<ai::AiJob>,
     /// Пересмотры по расписанию (компонента, время), по которым решение уже получено.
     ai_done: HashSet<(usize, DateTime<Utc>)>,
-    ai_failures: HashMap<DateTime<Utc>, u32>,
+    /// Неудачные попытки решения: (компонента, пересмотр) → число.
+    ai_failures: HashMap<(usize, DateTime<Utc>), u32>,
     /// Сторож внеочередных решений: скачки цен и всплески новостей.
     ai_watch: ai::Watch,
     /// Комиссии контура и порог минимальной сделки; обновляются на открытии сессии.
@@ -1249,7 +1419,7 @@ impl LiveRuntime {
                 }
                 self.ai_done.insert((index, scheduled_at));
             } else {
-                let failures = self.ai_failures.entry(scheduled_at).or_default();
+                let failures = self.ai_failures.entry((index, scheduled_at)).or_default();
                 *failures += 1;
                 if *failures < AI_ATTEMPTS {
                     ready = false;
@@ -2058,16 +2228,7 @@ fn share_only_instruments(config: &BotConfig, ids: &RuntimeIds) -> HashSet<Instr
     config
         .strategies
         .iter()
-        .filter(|component| {
-            matches!(
-                component.strategy.kind(),
-                "value-composite"
-                    | "quality-profitability"
-                    | "value-momentum"
-                    | "multi-factor"
-                    | "dividend-month"
-            )
-        })
+        .filter(|component| rules::SHARE_ONLY_KINDS.contains(&component.strategy.kind()))
         .flat_map(|component| {
             component
                 .instruments
@@ -2177,584 +2338,6 @@ async fn ai_preview(config: &BotConfig, ids: &RuntimeIds) -> Result<()> {
     }
     println!("{}", serde_json::json!({"previews": out}));
     failed.map_or(Ok(()), Err)
-}
-
-/// Загружает минимальную историю закрытых свечей и прогревает состояние стратегии.
-///
-/// Свечи сортируются глобально по времени, чтобы многомерные стратегии увидели их
-/// в причинном порядке. `PlanningContext = None` и `EventPhase::Warmup` запрещают
-/// планирование/исполнение заявок во время воспроизведения истории.
-async fn warm_up(
-    engine: &PortfolioEngine<PostgresStorage>,
-    broker: &VenueBroker,
-    requirements: &[DataRequirement],
-    cutoff: DateTime<Utc>,
-    storage: &PostgresStorage,
-    strategy_id: &StrategyId,
-) -> Result<HashMap<InstrumentId, Price>> {
-    // Each event marker and strategy state were committed atomically. Replaying
-    // known warmup events after restore only serializes the full state repeatedly.
-    let processed: HashSet<String> = sqlx::query_scalar::<_, String>(
-        "SELECT event_id FROM processed_events WHERE strategy_id=$1 AND event_id LIKE 'candle:%'",
-    )
-    .bind(strategy_id.as_str())
-    .fetch_all(storage.pool())
-    .await?
-    .into_iter()
-    .collect();
-    let mut candles = Vec::new();
-    for requirement in requirements {
-        if requirement.warmup_bars == 0 || requirement.warmup_bars > 2_500 {
-            return Err(Error::Configuration(format!(
-                "warmup for `{}` must contain 1..=2500 bars",
-                requirement.instrument_id
-            )));
-        }
-        let mut received = history::load(
-            broker,
-            CandleHistoryRequest {
-                instrument_id: requirement.instrument_id.clone(),
-                interval: requirement.interval,
-                from: cutoff - warmup_span(requirement.interval, requirement.warmup_bars)?,
-                to: cutoff,
-                limit: None,
-            },
-            Some(requirement.warmup_bars),
-        )
-        .await?;
-        received.retain(|candle| candle.complete);
-        received.sort_by_key(|candle| candle.time);
-        if received.len() < requirement.warmup_bars {
-            return Err(Error::Configuration(format!(
-                "instrument `{}` returned {} complete {:?} candles, but {} are required",
-                requirement.instrument_id,
-                received.len(),
-                requirement.interval,
-                requirement.warmup_bars
-            )));
-        }
-        // API может вернуть небольшой запас. Стратегии нужны ровно последние N
-        // завершённых баров, поэтому более старую часть отбрасываем.
-        let keep_from = received.len() - requirement.warmup_bars;
-        candles.extend(received.drain(keep_from..));
-    }
-    // При одинаковом timestamp UID задаёт стабильный порядок воспроизведения.
-    candles.sort_by(|left, right| {
-        left.time.cmp(&right.time).then_with(|| {
-            left.instrument_id
-                .as_str()
-                .cmp(right.instrument_id.as_str())
-        })
-    });
-    let mut latest_prices = HashMap::new();
-    let mut events = Vec::new();
-    for candle in candles {
-        latest_prices.insert(candle.instrument_id.clone(), candle.close);
-        let event = candle_event(candle, EventPhase::Warmup);
-        if !processed.contains(&event.id) {
-            events.push(event);
-        }
-    }
-    let total = events.len();
-    for (index, chunk) in events.chunks(250).enumerate() {
-        if !engine.process_warmup_batch(chunk).await? {
-            return Err(Error::Storage(
-                "warmup checkpoint conflicted with another event writer".to_owned(),
-            ));
-        }
-        info!(
-            completed = ((index + 1) * 250).min(total),
-            total, "warmup progress"
-        );
-    }
-    Ok(latest_prices)
-}
-
-/// Дополняет warmup свечами, закрывшимися во время startup-последовательности.
-///
-/// Нижняя граница сдвинута на один интервал назад, потому что API индексирует
-/// свечу временем открытия: бар мог открыться до `from`, но закрыться после него.
-/// Повторы безопасны благодаря event ID, а `Warmup` не разрешает торговый target.
-async fn catch_up_warmup(
-    engine: &PortfolioEngine<PostgresStorage>,
-    broker: &VenueBroker,
-    requirements: &[DataRequirement],
-    from: DateTime<Utc>,
-    latest_prices: &mut HashMap<InstrumentId, Price>,
-) -> Result<()> {
-    let to = Utc::now();
-    let mut candles = Vec::new();
-    for requirement in requirements {
-        let mut received = history::load(
-            broker,
-            CandleHistoryRequest {
-                instrument_id: requirement.instrument_id.clone(),
-                interval: requirement.interval,
-                from: from - candle_duration(requirement.interval),
-                to,
-                limit: None,
-            },
-            None,
-        )
-        .await?;
-        received.retain(|candle| {
-            candle.complete
-                // `time` — начало бара. Для daily/monthly номинальная длина
-                // интервала не совпадает с фактическим закрытием биржи, поэтому
-                // authoritative флаг `complete` определяет верхнюю границу.
-                // Условие ниже нужно лишь для короткого пересечения с cutoff;
-                // лишний старый бар безвреден благодаря event-id дедупликации.
-                && candle.time + candle_duration(candle.interval) > from
-                && candle.time <= to
-        });
-        candles.extend(received);
-    }
-    candles.sort_by(|left, right| {
-        left.time.cmp(&right.time).then_with(|| {
-            left.instrument_id
-                .as_str()
-                .cmp(right.instrument_id.as_str())
-        })
-    });
-    candles.dedup_by(|left, right| {
-        left.time == right.time
-            && left.interval == right.interval
-            && left.instrument_id == right.instrument_id
-    });
-    for candle in candles {
-        latest_prices.insert(candle.instrument_id.clone(), candle.close);
-        engine
-            .process_event(&candle_event(candle, EventPhase::Warmup), None)
-            .await?;
-    }
-    Ok(())
-}
-
-/// Оценивает календарное окно, достаточное для получения `bars` торговых свечей.
-///
-/// Множители больше длины самого интервала оставляют запас на ночь, выходные и
-/// праздники MOEX. Это только границы запроса; после ответа берутся ровно последние
-/// завершённые бары, поэтому запас не меняет вычисляемый сигнал.
-fn warmup_span(interval: CandleInterval, bars: usize) -> Result<Duration> {
-    let bars = i64::try_from(bars)
-        .map_err(|_| Error::Configuration("warmup bar count is too large".to_owned()))?;
-    let duration = match interval {
-        CandleInterval::OneMonth => Duration::days(bars.saturating_mul(35)),
-        CandleInterval::OneWeek => Duration::days(bars.saturating_mul(10)),
-        CandleInterval::OneDay => Duration::days(bars.saturating_mul(3).saturating_add(14)),
-        CandleInterval::FourHours => Duration::hours(bars.saturating_mul(16)),
-        CandleInterval::TwoHours => Duration::hours(bars.saturating_mul(8)),
-        CandleInterval::OneHour => Duration::hours(bars.saturating_mul(4)),
-        CandleInterval::ThirtyMinutes => Duration::minutes(bars.saturating_mul(30 * 8)),
-        CandleInterval::FifteenMinutes => Duration::minutes(bars.saturating_mul(15 * 8)),
-        CandleInterval::TenMinutes => Duration::minutes(bars.saturating_mul(10 * 8)),
-        CandleInterval::FiveMinutes => Duration::minutes(bars.saturating_mul(5 * 8)),
-        CandleInterval::ThreeMinutes => Duration::minutes(bars.saturating_mul(3 * 8)),
-        CandleInterval::TwoMinutes => Duration::minutes(bars.saturating_mul(2 * 8)),
-        CandleInterval::OneMinute => Duration::minutes(bars.saturating_mul(8)),
-        CandleInterval::ThirtySeconds => Duration::seconds(bars.saturating_mul(30 * 8)),
-        CandleInterval::TenSeconds => Duration::seconds(bars.saturating_mul(10 * 8)),
-        CandleInterval::FiveSeconds => Duration::seconds(bars.saturating_mul(5 * 8)),
-    };
-    Ok(duration)
-}
-
-/// Оборачивает свечу в идемпотентное событие стратегии.
-///
-/// `candle.time` обозначает начало интервала, поэтому `occurred_at` сдвигается к
-/// номинальному закрытию. Дневная свеча может стать complete до `open + 24h`,
-/// поэтому будущее номинальное время ограничивается фактом её получения.
-fn candle_event(candle: Candle, phase: EventPhase) -> StrategyEvent {
-    let interval = candle_interval_key(candle.interval);
-    let occurred_at = (candle.time + candle_duration(candle.interval)).min(Utc::now());
-    StrategyEvent {
-        id: format!(
-            "candle:{}:{interval}:{}",
-            candle.instrument_id,
-            candle.time.to_rfc3339()
-        ),
-        phase,
-        occurred_at,
-        payload: StrategyEventKind::Candle(candle),
-    }
-}
-
-/// Возвращает номинальную длительность свечи для вычисления времени её закрытия.
-const fn candle_duration(interval: CandleInterval) -> Duration {
-    match interval {
-        CandleInterval::FiveSeconds => Duration::seconds(5),
-        CandleInterval::TenSeconds => Duration::seconds(10),
-        CandleInterval::ThirtySeconds => Duration::seconds(30),
-        CandleInterval::OneMinute => Duration::minutes(1),
-        CandleInterval::TwoMinutes => Duration::minutes(2),
-        CandleInterval::ThreeMinutes => Duration::minutes(3),
-        CandleInterval::FiveMinutes => Duration::minutes(5),
-        CandleInterval::TenMinutes => Duration::minutes(10),
-        CandleInterval::FifteenMinutes => Duration::minutes(15),
-        CandleInterval::ThirtyMinutes => Duration::minutes(30),
-        CandleInterval::OneHour => Duration::hours(1),
-        CandleInterval::TwoHours => Duration::hours(2),
-        CandleInterval::FourHours => Duration::hours(4),
-        CandleInterval::OneDay => Duration::days(1),
-        CandleInterval::OneWeek => Duration::weeks(1),
-        CandleInterval::OneMonth => Duration::days(31),
-    }
-}
-
-/// Стабильное короткое имя интервала, входящее в идемпотентный event ID.
-const fn candle_interval_key(interval: CandleInterval) -> &'static str {
-    match interval {
-        CandleInterval::OneMinute => "1m",
-        CandleInterval::FiveMinutes => "5m",
-        CandleInterval::FifteenMinutes => "15m",
-        CandleInterval::OneHour => "1h",
-        CandleInterval::OneDay => "1d",
-        CandleInterval::TwoMinutes => "2m",
-        CandleInterval::ThreeMinutes => "3m",
-        CandleInterval::TenMinutes => "10m",
-        CandleInterval::ThirtyMinutes => "30m",
-        CandleInterval::TwoHours => "2h",
-        CandleInterval::FourHours => "4h",
-        CandleInterval::OneWeek => "1w",
-        CandleInterval::OneMonth => "1mo",
-        CandleInterval::FiveSeconds => "5s",
-        CandleInterval::TenSeconds => "10s",
-        CandleInterval::ThirtySeconds => "30s",
-    }
-}
-
-/// Загружает справочные данные, если они нужны стратегии, и сохраняет их в state.
-///
-/// Событие подаётся в фазе Warmup: стратегия обновляет снимок, но не может
-/// выставить заявку. ID включает дату, поэтому повтор в тот же день не дублируется.
-async fn absorb_reference(
-    api: &VenueApi,
-    engine: &PortfolioEngine<PostgresStorage>,
-    universe: &[InstrumentId],
-    date: NaiveDate,
-) -> Result<()> {
-    let requirements = engine.reference_requirements().await;
-    if requirements.is_empty() {
-        return Ok(());
-    }
-    let reference = load_reference(api, universe, &requirements).await?;
-    let (fundamentals, dividends) = (reference.fundamentals.len(), reference.dividends.len());
-    let event = StrategyEvent {
-        id: format!("reference:{date}"),
-        phase: EventPhase::Warmup,
-        occurred_at: reference.observed_at,
-        payload: StrategyEventKind::Reference(reference),
-    };
-    let outcome = engine.process_event(&event, None).await?;
-    if !outcome.duplicate {
-        info!(fundamentals, dividends, "reference data loaded");
-    }
-    Ok(())
-}
-
-/// T-Invest кодирует отсутствующий показатель нулём: такой ноль не является данными.
-fn reported(value: f64) -> Option<Decimal> {
-    (value.is_finite() && value != 0.0)
-        .then(|| Decimal::try_from(value).ok())
-        .flatten()
-        .map(|value| value.round_dp(6))
-}
-
-async fn load_reference(
-    api: &VenueApi,
-    universe: &[InstrumentId],
-    requirements: &[ReferenceRequirement],
-) -> Result<ReferenceData> {
-    let now = Utc::now();
-    let mut reference = ReferenceData {
-        observed_at: now,
-        ..ReferenceData::default()
-    };
-    if requirements.contains(&ReferenceRequirement::Fundamentals) {
-        // Показатели привязаны к активу, а не к торгуемому UID.
-        let mut assets = Vec::with_capacity(universe.len());
-        for instrument_id in universe {
-            let share = api
-                .instruments()
-                .share_by(InstrumentRequest {
-                    id_type: InstrumentIdType::Uid as i32,
-                    class_code: None,
-                    id: instrument_id.to_string(),
-                })
-                .await?
-                .into_inner()
-                .instrument
-                .ok_or_else(|| {
-                    Error::Configuration(format!("share `{instrument_id}` not found"))
-                })?;
-            assets.push((instrument_id.clone(), share.asset_uid));
-        }
-        let response = api
-            .instruments()
-            .get_asset_fundamentals(GetAssetFundamentalsRequest {
-                assets: assets.iter().map(|(_, asset)| asset.clone()).collect(),
-            })
-            .await?
-            .into_inner();
-        for row in response.fundamentals {
-            let Some((instrument_id, _)) = assets.iter().find(|(_, asset)| *asset == row.asset_uid)
-            else {
-                continue;
-            };
-            reference.fundamentals.push(InstrumentFundamentals {
-                instrument_id: instrument_id.clone(),
-                price_to_book: reported(row.price_to_book_ttm),
-                price_to_earnings: reported(row.pe_ratio_ttm),
-                ev_to_ebitda: reported(row.ev_to_ebitda_mrq),
-                return_on_equity: reported(row.roe),
-                return_on_assets: reported(row.roa),
-                net_margin: reported(row.net_margin_mrq),
-                debt_to_equity: reported(row.total_debt_to_equity_mrq),
-            });
-        }
-    }
-    if requirements.contains(&ReferenceRequirement::Dividends) {
-        for instrument_id in universe {
-            let response = api
-                .instruments()
-                .get_dividends(GetDividendsRequest {
-                    instrument_id: instrument_id.to_string(),
-                    from: Some(datetime_to_timestamp(now - Duration::days(7))),
-                    to: Some(datetime_to_timestamp(now + Duration::days(200))),
-                    ..GetDividendsRequest::default()
-                })
-                .await?
-                .into_inner();
-            for dividend in response.dividends {
-                let Some(last_buy) = dividend
-                    .last_buy_date
-                    .map(timestamp_to_datetime)
-                    .transpose()?
-                else {
-                    continue;
-                };
-                reference.dividends.push(DividendEvent {
-                    instrument_id: instrument_id.clone(),
-                    last_buy_date: last_buy.date_naive(),
-                    dividend_net: dividend
-                        .dividend_net
-                        .map(Money::from_proto)
-                        .transpose()?
-                        .map(|money| money.amount.0),
-                });
-            }
-        }
-    }
-    Ok(reference)
-}
-
-/// Одно рассчитанное срабатывание относительно официальной сессии MOEX.
-#[derive(Clone)]
-struct ScheduledTrigger {
-    anchor: ScheduleAnchor,
-    session_date: NaiveDate,
-    at: DateTime<Utc>,
-    offset_seconds: i64,
-    /// Конец основной сессии из официального расписания.
-    session_end: Option<DateTime<Utc>>,
-}
-
-impl ScheduledTrigger {
-    /// До какого момента повторять отложенное решение. Повторяется только
-    /// основное открытие сессии: offset-события intraday-стратегий привязаны к
-    /// конкретному времени и после него теряют смысл.
-    fn retry_until(&self) -> Option<DateTime<Utc>> {
-        (self.anchor == ScheduleAnchor::SessionOpen && self.offset_seconds == 0)
-            .then_some(self.session_end?)
-            .map(|end| end - Duration::minutes(OPEN_RETRY_MARGIN_MINUTES))
-    }
-
-    /// Строит стабильный ID, чтобы одно расписание нельзя было исполнить дважды.
-    fn id(&self) -> String {
-        format!(
-            "schedule:{:?}:{}:{}",
-            self.anchor,
-            self.session_date,
-            self.at.to_rfc3339()
-        )
-    }
-
-    /// Преобразует внутренний trigger в live-событие для стратегии и risk manager.
-    fn event(self) -> StrategyEvent {
-        let id = self.id();
-        StrategyEvent {
-            id,
-            phase: EventPhase::Live,
-            occurred_at: self.at,
-            payload: StrategyEventKind::Schedule(ScheduleEvent {
-                anchor: self.anchor,
-                session_date: self.session_date,
-                scheduled_at: self.at,
-            }),
-        }
-    }
-}
-
-/// Определяет последнюю уже начавшуюся официальную торговую сессию MOEX.
-///
-/// Простая UTC-дата неверна ночью, в выходные и на специальных сессиях. Risk
-/// manager использует эту дату до первой заявки, поэтому после restart дневной
-/// stop не может случайно унаследовать вчерашнюю базу.
-async fn trading_schedules(
-    api: &VenueApi,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> Result<tinkoff_rs::proto::TradingSchedulesResponse> {
-    let mut response = tinkoff_rs::proto::TradingSchedulesResponse::default();
-    let mut cursor = from;
-    while cursor < to {
-        // The API counts calendar dates inclusively, so use a margin below fourteen days.
-        let end = (cursor + Duration::days(12)).min(to);
-        let page = api
-            .instruments()
-            .trading_schedules(TradingSchedulesRequest {
-                exchange: Some("MOEX".to_owned()),
-                from: Some(datetime_to_timestamp(cursor)),
-                to: Some(datetime_to_timestamp(end)),
-            })
-            .await?
-            .into_inner();
-        response.exchanges.extend(page.exchanges);
-        cursor = end;
-    }
-    Ok(response)
-}
-
-async fn current_moex_session_date(
-    api: &VenueApi,
-    now: DateTime<Utc>,
-    previous: Option<NaiveDate>,
-) -> Result<NaiveDate> {
-    // TradingSchedules rejects historical `from` dates. The durable risk session
-    // is the authority across nights/weekends; a new flat account uses its next session.
-    let response = trading_schedules(api, now, now + Duration::days(12)).await?;
-    session_date_from_schedule(&response, now, previous)
-}
-
-fn session_date_from_schedule(
-    response: &tinkoff_rs::proto::TradingSchedulesResponse,
-    now: DateTime<Utc>,
-    previous: Option<NaiveDate>,
-) -> Result<NaiveDate> {
-    let mut sessions = Vec::new();
-    for exchange in &response.exchanges {
-        if !exchange.exchange.to_ascii_lowercase().contains("moex") {
-            continue;
-        }
-        for day in exchange.days.iter().filter(|d| d.is_trading_day) {
-            if let Some(start) = day.start_time {
-                let start = timestamp_to_datetime(start)?;
-                let date = day
-                    .date
-                    .map(timestamp_to_datetime)
-                    .transpose()?
-                    .map_or(start.date_naive(), |d| d.date_naive());
-                sessions.push((start, date));
-            }
-        }
-    }
-    sessions.sort_unstable();
-    sessions
-        .iter()
-        .rev()
-        .find(|(start, _)| *start <= now)
-        .map(|(_, date)| *date)
-        .or(previous)
-        .or_else(|| sessions.first().map(|(_, date)| *date))
-        .ok_or_else(|| Error::Configuration("MOEX schedule contains no usable session".to_owned()))
-}
-
-/// Загружает официальное расписание MOEX и разворачивает требования стратегии
-/// в абсолютные UTC-моменты на ближайшие две недели.
-///
-/// Время берётся из ответа биржевого календаря, а не вычисляется фиксированным
-/// московским часом: так учитываются выходные, сокращённые дни и особые сессии.
-async fn load_schedule_triggers(
-    api: &VenueApi,
-    requirements: &[ScheduleRequirement],
-    now: DateTime<Utc>,
-) -> Result<Vec<ScheduledTrigger>> {
-    if requirements.is_empty() {
-        return Ok(Vec::new());
-    }
-    let response = trading_schedules(api, now, now + Duration::days(12)).await?;
-    let mut triggers = Vec::new();
-    for exchange in response.exchanges {
-        if !exchange.exchange.to_ascii_lowercase().contains("moex") {
-            continue;
-        }
-        for day in exchange.days.into_iter().filter(|day| day.is_trading_day) {
-            let Some(date) = day
-                .date
-                .or(day.start_time)
-                .map(timestamp_to_datetime)
-                .transpose()?
-                .map(|date| date.date_naive())
-            else {
-                continue;
-            };
-            for requirement in requirements {
-                // Offset применяется после выбора конкретного якоря: открытия,
-                // закрытия или начала аукциона закрытия этой сессии.
-                let timestamp = match requirement.anchor {
-                    ScheduleAnchor::SessionOpen => day.start_time,
-                    ScheduleAnchor::SessionClose => day.end_time,
-                    ScheduleAnchor::ClosingAuctionStart => day.closing_auction_start_time,
-                };
-                if let Some(timestamp) = timestamp {
-                    triggers.push(ScheduledTrigger {
-                        anchor: requirement.anchor,
-                        session_date: date,
-                        at: timestamp_to_datetime(timestamp)?
-                            + Duration::seconds(requirement.offset_seconds),
-                        offset_seconds: requirement.offset_seconds,
-                        session_end: day.end_time.map(timestamp_to_datetime).transpose()?,
-                    });
-                }
-            }
-        }
-    }
-    triggers.sort_by_key(|trigger| trigger.at);
-    Ok(triggers)
-}
-
-/// Окна основных сессий `(открытие, конец)` из официального расписания.
-fn session_windows(triggers: &[ScheduledTrigger]) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
-    triggers
-        .iter()
-        .filter(|t| t.anchor == ScheduleAnchor::SessionOpen && t.offset_seconds == 0)
-        .filter_map(|t| t.session_end.map(|end| (t.at, end)))
-        .collect()
-}
-
-/// Извлекает наступившие события без дубликатов: `(trigger, late)`.
-/// Будущие triggers остаются в векторе, обработанные удаляются через `retain`.
-///
-/// Событие старше двух минут (компьютер спал, процесс был занят) возвращается
-/// с `late = true`: оно не исполняется сразу, но учитывается стратегией, а
-/// решение открытия сессии ставится в очередь повтора до конца этой сессии.
-fn take_due_triggers(
-    triggers: &mut Vec<ScheduledTrigger>,
-    fired: &mut HashSet<String>,
-    now: DateTime<Utc>,
-) -> Vec<(ScheduledTrigger, bool)> {
-    let mut due = Vec::new();
-    triggers.retain(|trigger| {
-        if trigger.at > now {
-            return true;
-        }
-        let age = now.signed_duration_since(trigger.at).num_seconds();
-        if fired.insert(trigger.id()) {
-            due.push((trigger.clone(), age > SCHEDULE_GRACE_SECONDS));
-        }
-        false
-    });
-    due
 }
 
 /// Суммирует внешние денежные потоки с начала risk epoch.
@@ -2994,15 +2577,15 @@ mod campaign_tests {
             }],
         };
         assert_eq!(
-            super::session_date_from_schedule(&response, now, Some(previous)).unwrap(),
+            super::schedule::session_date_from_schedule(&response, now, Some(previous)).unwrap(),
             previous
         );
         assert_eq!(
-            super::session_date_from_schedule(&response, now, None).unwrap(),
+            super::schedule::session_date_from_schedule(&response, now, None).unwrap(),
             opening.date_naive()
         );
         assert_eq!(
-            super::session_date_from_schedule(
+            super::schedule::session_date_from_schedule(
                 &response,
                 opening + Duration::seconds(1),
                 Some(previous)
@@ -3011,8 +2594,60 @@ mod campaign_tests {
             opening.date_naive()
         );
         assert!(
-            super::session_date_from_schedule(&TradingSchedulesResponse::default(), now, None)
-                .is_err()
+            super::schedule::session_date_from_schedule(
+                &TradingSchedulesResponse::default(),
+                now,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_order_book_check_is_on_for_real_accounts_and_opt_in_for_the_sandbox() {
+        use chrono::Duration;
+        use rust_decimal::Decimal;
+
+        use super::{Contour, ExecutionConfig};
+        let parse = |text: &str| -> ExecutionConfig { toml::from_str(text).unwrap() };
+        let default = parse("");
+        assert_eq!(
+            default.spread_limit(Contour::Production),
+            Some(Decimal::new(5, 3)),
+            "0.5% on a real account"
+        );
+        assert_eq!(default.spread_limit(Contour::Sandbox), None);
+        assert_eq!(default.wait(), Duration::minutes(30));
+        let custom = parse("max_spread_percent = \"1.2\"\nspread_wait_minutes = 10");
+        assert_eq!(
+            custom.spread_limit(Contour::Sandbox),
+            Some(Decimal::new(12, 3))
+        );
+        assert_eq!(custom.wait(), Duration::minutes(10));
+        assert_eq!(
+            parse("max_spread_percent = \"0\"").spread_limit(Contour::Production),
+            None
+        );
+        assert!(parse("max_spread_percent = \"25\"").validate().is_err());
+        assert!(parse("spread_wait_minutes = 0").validate().is_err());
+        assert!(
+            toml::from_str::<ExecutionConfig>("max_spread = \"1\"").is_err(),
+            "typos are rejected"
+        );
+    }
+
+    #[test]
+    fn schedule_requests_never_start_before_the_moscow_date() {
+        let at = |text: &str| chrono::DateTime::parse_from_rfc3339(text).unwrap().to_utc();
+        // 02:55 МСК 23 октября: UTC-дата ещё 22-е, брокер такой `from` отклоняет.
+        assert_eq!(
+            super::schedule::schedule_start(at("2026-10-22T23:55:47Z")),
+            at("2026-10-23T00:00:00Z")
+        );
+        // Днём московская и UTC-даты совпадают: начало запроса не меняется.
+        assert_eq!(
+            super::schedule::schedule_start(at("2026-10-23T10:00:00Z")),
+            at("2026-10-23T10:00:00Z")
         );
     }
 

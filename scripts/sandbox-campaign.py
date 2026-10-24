@@ -31,6 +31,17 @@ ROOT = Path(__file__).resolve().parents[1]
 _control_spec = importlib.util.spec_from_file_location("campaign_control", ROOT / "scripts/campaign_control.py")
 control_plane = importlib.util.module_from_spec(_control_spec)
 _control_spec.loader.exec_module(control_plane)
+_offsite_spec = importlib.util.spec_from_file_location("offsite", ROOT / "scripts/offsite.py")
+offsite = importlib.util.module_from_spec(_offsite_spec)
+_offsite_spec.loader.exec_module(offsite)
+_notify_spec = importlib.util.spec_from_file_location("notify", ROOT / "scripts/notify.py")
+notify = importlib.util.module_from_spec(_notify_spec)
+_notify_spec.loader.exec_module(notify)
+# Telegram notifications; without the settings file nothing is sent.
+NOTIFY_CONFIG = Path(os.environ.get("NOTIFY_CONFIG", "/run/notify/telegram.env"))
+# Encrypted copies of the database in an S3 bucket; without the file they are off.
+OFFSITE_CONFIG = Path(os.environ.get("OFFSITE_CONFIG", "/run/backup/s3.env"))
+OFFSITE_SECONDS = 3600
 WORK = Path(os.environ.get("CAMPAIGN_WORK_DIR", ROOT / "target" / "sandbox-campaign"))
 BINARY = Path(os.environ.get("TINKOFF_BOT_BINARY", ROOT / "target" / "debug" / "tinkoff-bot"))
 UTC = dt.timezone.utc
@@ -500,13 +511,18 @@ def rub_value(money):
     return int(money.get("units", "0") or 0) + int(money.get("nano", 0) or 0) / 1_000_000_000
 
 
+def account_value(portfolio):
+    """Portfolio total without the futures notional T-Invest includes in it."""
+    return rub_value(portfolio.get("totalAmountPortfolio", {})) - rub_value(portfolio.get("totalAmountFutures") or {})
+
+
 def initialize_accounts(state, api):
     # Balance inspection makes resuming an ambiguous pay-in safe: never repeat a credited deposit.
     adopted = state.get("adopted_accounts", {})
     for case in state["cases"].values():
         if not case.get("funded"):
             portfolio = api.call("SandboxService/GetSandboxPortfolio", {"accountId": case["account_id"], "currency": "RUB"})
-            value = rub_value(portfolio.get("totalAmountPortfolio", {}))
+            value = account_value(portfolio)
             if case["account_id"] in adopted:
                 # Прежний остаток сохраняется; недостающее до бюджета пополняется один раз.
                 if value < CAMPAIGN_BUDGET_RUB:
@@ -765,6 +781,20 @@ LIVE_READS = {"operations": "OperationsService/GetOperationsByCursor", "portfoli
               "orders": "OrdersService/GetOrders"}
 
 
+TRADE_CHECK_SECONDS = 15
+# The broker read of all accounts takes dozens of requests: at most once a minute.
+TRADE_AUDIT_SECONDS = 60
+
+
+def latest_trade_activity(state):
+    """Time of the latest order change or fill in the database; None when unknown."""
+    try:
+        return run_sql(state, "SELECT coalesce(greatest((SELECT max(updated_at) FROM orders),"
+                              "(SELECT max(executed_at) FROM fills))::text,'')").strip() or None
+    except (RuntimeError, subprocess.SubprocessError, OSError):
+        return None
+
+
 def audit_accounts(state, api):
     audit = {"observed_at": now().isoformat(), "accounts": {}}
     accounts = {}
@@ -868,9 +898,16 @@ RETENTION_SQL = """WITH events AS (
         AND date_trunc(CASE WHEN p.observed_at < now() - interval '365 days' THEN 'day' ELSE 'hour' END, q.observed_at)
           = date_trunc(CASE WHEN p.observed_at < now() - interval '365 days' THEN 'day' ELSE 'hour' END, p.observed_at))
     RETURNING 1),
-  usage AS (DELETE FROM ai_usage WHERE at < now() - interval '400 days' RETURNING 1)
+  usage AS (DELETE FROM ai_usage WHERE at < now() - interval '400 days' RETURNING 1),
+  -- Intraday candles of the history cache: 120 days are enough for every warmup;
+  -- hourly and daily candles stay. The cache forgets the dropped ranges too.
+  intraday AS (DELETE FROM candles WHERE interval IN ('1m','2m','3m','5m','10m','15m','30m')
+    AND open_time < now() - interval '120 days' RETURNING 1),
+  coverage AS (DELETE FROM candle_coverage WHERE interval IN ('1m','2m','3m','5m','10m','15m','30m')
+    AND from_time < now() - interval '120 days' RETURNING 1)
 SELECT json_build_object('risk_check_events', (SELECT count(*) FROM events), 'performance_samples', (SELECT count(*) FROM samples),
-  'ai_usage', (SELECT count(*) FROM usage))"""
+  'ai_usage', (SELECT count(*) FROM usage), 'intraday_candles', (SELECT count(*) FROM intraday),
+  'candle_coverage', (SELECT count(*) FROM coverage))"""
 # Text logs of runtimes and services: the newest LOG_KEEP_BYTES stay in `<name>.1`.
 LOG_LIMIT_BYTES = 50 * 1024 * 1024
 LOG_KEEP_BYTES = 10 * 1024 * 1024
@@ -931,6 +968,30 @@ def supervise_collector(state, desired, stopping):
         child = subprocess.Popen([str(BINARY), "collect"], env=environment(state, None), stdout=log,
                                  stderr=subprocess.STDOUT, start_new_session=True)
     record.update(pid=child.pid, started=now().isoformat(), state="running", exited_at=None)
+
+
+def notifications(state):
+    """Telegram messages about new events; a failure is logged and retried next minute."""
+    try:
+        config = notify.load_config(NOTIFY_CONFIG)
+        if config:
+            notify.tick(SimpleNamespace(run_sql=run_sql), state, WORK, config)
+    except (RuntimeError, ValueError, OSError, KeyError) as error:
+        print("notifications were not sent:", str(error)[:300], flush=True)
+
+
+def offsite_copies():
+    """Uploads new database dumps to the bucket; a broken setting is reported in the
+    dashboard (backups/offsite.json), never raised into the supervisor loop."""
+    backups = WORK / "backups"
+    try:
+        config = offsite.load_config(OFFSITE_CONFIG)
+    except ValueError as error:
+        backups.mkdir(exist_ok=True)
+        (backups / "offsite.json").write_text(json.dumps({"ok": False, "at": now().isoformat(), "error": str(error)}))
+        return
+    if config and backups.exists():
+        offsite.sync(backups, config, now())
 
 
 def maintenance_due(state, current):
@@ -1149,8 +1210,18 @@ def supervise_tick(state, api, clocks):
             # Retry in five minutes instead of an hour; the last known days stay in use.
             clocks["calendar"] = time.monotonic() - 3300
             supervisor_log("calendar refresh failed; using the last known days: " + str(error))
-    if time.monotonic() - clocks["audit"] > 300:
+    # New orders and fills refresh the accounts the dashboard shows within a minute;
+    # without trading the full read stays every five minutes.
+    if time.monotonic() - clocks.get("trades", float("inf")) > TRADE_CHECK_SECONDS:
+        clocks["trades"] = time.monotonic()
+        mark = latest_trade_activity(state)
+        if mark and clocks.get("trade_mark") not in (None, mark):
+            clocks["audit_wanted"] = True
+        clocks["trade_mark"] = mark or clocks.get("trade_mark")
+    since_audit = time.monotonic() - clocks["audit"]
+    if since_audit > 300 or (clocks.get("audit_wanted") and since_audit > TRADE_AUDIT_SECONDS):
         clocks["audit"] = time.monotonic()
+        clocks["audit_wanted"] = False
         audit_accounts(state, api)
     # A pass without these clocks (tests, one-off ticks) skips disk and upkeep work.
     if time.monotonic() - clocks.get("disk", float("inf")) > DISK_CHECK_SECONDS:
@@ -1164,6 +1235,12 @@ def supervise_tick(state, api, clocks):
         except (RuntimeError, ValueError, KeyError, OSError) as error:
             print("commission rates or the USD/RUB rate were not refreshed:", str(error)[:300], flush=True)
             clocks["commissions"] = time.monotonic() - COMMISSIONS_SECONDS + 600
+    if time.monotonic() - clocks.get("notify", float("inf")) > 60:
+        clocks["notify"] = time.monotonic()
+        notifications(state)
+    if time.monotonic() - clocks.get("offsite", float("inf")) > OFFSITE_SECONDS:
+        clocks["offsite"] = time.monotonic()
+        offsite_copies()
     if time.monotonic() - clocks.get("maintenance", float("inf")) > 60:
         clocks["maintenance"] = time.monotonic()
         if maintenance_due(state, now()):
@@ -1190,7 +1267,7 @@ def supervise():
     sleeper = subprocess.Popen(["/usr/bin/caffeinate", "-ims", "-w", str(os.getpid())]) if sys.platform == "darwin" else None
     # -inf: the first pass reports immediately even right after a VM boot (small monotonic clock).
     clocks = {"report": float("-inf"), "audit": float("-inf"), "calendar": float("-inf"), "disk": float("-inf"), "maintenance": float("-inf"), "collector": 0,
-              "commissions": float("-inf")}
+              "commissions": float("-inf"), "offsite": float("-inf"), "notify": float("-inf"), "trades": float("-inf")}
     api = API()
     control_plane.initialize(SimpleNamespace(**globals()), state)
     signal.signal(signal.SIGTERM, lambda *_: (WORK / "STOP").touch())
